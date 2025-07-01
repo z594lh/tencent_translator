@@ -41,6 +41,7 @@
     <div class="result-box" id="result-box">
       翻译结果将显示在这里...
     </div>
+    <div id="lang-info" style="margin-top: 10px; font-size: 0.9em; color: #666;"></div>
   </div>
 </div>
 
@@ -112,6 +113,18 @@ function doTranslate() {
       if (target === 'en') {
         target = 'zh';
       }
+    }
+  }
+  targetSelect.value = target;
+  const infoBox = document.getElementById('lang-info');
+
+  if (infoBox) {
+    if (isChineseDominant(input) && target === 'en') {
+      infoBox.innerText = "检测到中文内容较多，已自动将目标语言设为英文";
+    } else if (isEnglishDominant(input) && target === 'zh') {
+      infoBox.innerText = "检测到英文内容较多，已自动将目标语言设为中文";
+    } else {
+      infoBox.innerText = "";
     }
   }
 
