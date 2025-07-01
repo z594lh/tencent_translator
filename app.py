@@ -16,7 +16,7 @@ def index():
         CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
         config = configparser.ConfigParser()
         config.read(CONFIG_PATH, encoding="utf-8")
-        author_link = config.get("TencentCloud", "zhongyuwen_url")
+        author_link = config.get("TencentCloud", "url")
     except Exception as e:
         author_link = "#"  # 默认值
 

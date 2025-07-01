@@ -12,7 +12,7 @@
   <h1>🌐 腾讯云在线翻译器</h1>
 
   <div class="translator-box">
-    <textarea id="input-text" placeholder="在此输入要翻译的内容..."></textarea>
+    <textarea id="input-text" onkeydown="handleKeydown(event)" placeholder="在此输入要翻译的内容..."></textarea>
     
     <div class="controls">
       <select id="source-lang">
@@ -48,14 +48,71 @@
     <p>Powered by <a href="{{ author_link }}" target="_blank">zhongyw</a></p>
 </footer>
 <script>
+
+
+function handleKeydown(event) {
+  const textarea = event.target;
+
+  // Shift + Enter → 插入换行
+  if (event.key === 'Enter' && event.shiftKey) {
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    textarea.setRangeText('\n', start, end, 'end');
+    event.preventDefault();
+  }
+
+  // 单独 Enter → 触发翻译
+  else if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    doTranslate();
+  }
+}
+
+
+// 判断是否中文主导
+function isChineseDominant(text, threshold = 0.5) {
+  const chineseChars = text.match(/[\u4e00-\u9fa5]/g) || [];
+  const totalChars = text.replace(/\s+/g, '').length;
+  if (totalChars === 0) return false;
+  return chineseChars.length / totalChars >= threshold;
+}
+
+// 判断是否英文主导（粗略判断非中文字符比例）
+function isEnglishDominant(text, threshold = 0.7) {
+  const englishChars = text.replace(/[\u4e00-\u9fa5\s]+/g, '').length;
+  const totalChars = text.replace(/\s+/g, '').length;
+  if (totalChars === 0) return false;
+  return englishChars / totalChars >= threshold;
+}
+
 function doTranslate() {
   const input = document.getElementById("input-text").value.trim();
-  const source = document.getElementById("source-lang").value;
-  const target = document.getElementById("target-lang").value;
+
+
+  const sourceSelect = document.getElementById("source-lang");
+  const targetSelect = document.getElementById("target-lang");
 
   if (!input) {
     alert("请输入要翻译的内容");
     return;
+  }
+
+  const source = sourceSelect.value;
+  let target = targetSelect.value;
+
+  // 自动根据文本内容调整目标语言
+  if (source === 'auto') {
+    if (isChineseDominant(input)) {
+      // 中文主导，且目标语言是中文，则默认翻译成英文
+      if (target === 'zh') {
+        target = 'en';
+      }
+    } else if (isEnglishDominant(input)) {
+      // 英文主导，且目标语言是英文，则默认翻译成中文
+      if (target === 'en') {
+        target = 'zh';
+      }
+    }
   }
 
   fetch("/translate", {
