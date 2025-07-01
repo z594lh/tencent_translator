@@ -4,7 +4,7 @@ import os
 import configparser
 
 # 导入你的翻译模块
-from translator import translate, translate_html_with_structure, tencent_client
+from translator import translate, translate_image, translate_html_with_structure, tencent_client
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
@@ -40,6 +40,35 @@ def api_translate():
         "source": source,
         "target": target
     })
+
+@app.route('/translate-image', methods=['POST'])
+def api_translate_image():
+    data = request.get_json()
+    image_b64 = data.get('image', '')
+    source = data.get('source', 'auto')
+    target = data.get('target', 'zh')
+
+    if not image_b64:
+        return jsonify({"error": "No image provided"}), 400
+
+    try:
+        # 调用 translate_image，传入 base64 数据
+        result = translate_image(
+            image_data=image_b64,
+            from_lang=source,
+            to_lang=target,
+            client=tencent_client
+        )
+        return jsonify({
+            "original": '',
+            "translated": result,
+            "source": source,
+            "target": target
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

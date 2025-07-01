@@ -8,6 +8,7 @@ from tencentcloud.tmt.v20180321 import tmt_client, models
 import time
 import configparser
 import os
+import uuid
 
 
 # 获取当前脚本所在目录
@@ -58,6 +59,48 @@ def translate(text, from_lang='auto', to_lang='zh', client=None):
         print("翻译失败：", e)
         return text  # 返回原文本作为 fallback
 
+
+def translate_image(image_data, from_lang='auto', to_lang='zh', client=None):
+    if not image_data or not client:
+        return []
+
+    try:
+        req = models.ImageTranslateRequest()
+        params = {
+            "SessionUuid": str(uuid.uuid4()),
+            "ProjectId": 0,
+            "Scene": "doc",
+            "Source": from_lang,
+            "Target": to_lang,
+            "Data": image_data  # base64 encoded string
+        }
+        req.from_json_string(json.dumps(params))
+        resp = client.ImageTranslate(req)
+        time.sleep(0.2)  # 控制频率，防止触发限流
+
+        # 解析响应
+        result_text = ""
+        original_texts = []
+        translated_texts = []
+
+        for item in resp.ImageRecord.Value:
+            original_texts.append(item.SourceText)
+            translated_texts.append(item.TargetText)
+
+        # 最终拼接成结构化文本
+        result_text = "原文：<br/>"
+        result_text += "<br/>".join(f"- {text}" for text in original_texts)
+        result_text += "<br/><br/>译文：<br/>"
+        result_text += "<br/>".join(f"- {text}" for text in translated_texts)
+
+        return result_text
+
+    except Exception as e:
+        print("图片翻译失败：", e)
+        return []
+
+
+
 # 新增函数：逐句翻译 HTML 内容并还原结构
 def translate_html_with_structure(html, client=None, source='en', target='ms'):
     if not html:
@@ -90,5 +133,7 @@ except Exception as e:
 
 # ================== 示例调用 ==================
 if __name__ == "__main__":
-    rst = translate('good', from_lang='auto', to_lang='zh', client=tencent_client);
+    # rst = translate('good', from_lang='auto', to_lang='zh', client=tencent_client);
+    img_data = ""
+    rst = translate_image(img_data, from_lang='auto', to_lang='zh', client=tencent_client);
     print(rst)
