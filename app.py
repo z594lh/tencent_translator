@@ -5,6 +5,7 @@ import configparser
 
 # 导入你的翻译模块
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
+from geminiAI import generate_ai_response,get_translation_prompt,generate_ai_img_response
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
@@ -68,6 +69,51 @@ def api_translate_image():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/translate-ai', methods=['POST'])
+def api_translate_ai():
+    data = request.get_json()
+    text = data.get('text', '')
+    source = data.get('source', 'auto')
+    target = data.get('target', 'zh')
+
+    additional_txt = get_translation_prompt(target)
+    text = additional_txt + text;
+
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+
+    # 调用你的翻译函数
+    result = generate_ai_response(contents=text)
+    return jsonify({
+        "original": text,
+        "translated": result,
+        "source": source,
+        "target": target
+        })
+
+
+@app.route('/translate-ai-image', methods=['POST'])
+def api_translate_ai_image():
+    data = request.get_json()
+    image_b64 = data.get('image', '')
+    source = data.get('source', 'auto')
+    target = data.get('target', 'zh')
+
+    if not image_b64:
+        return jsonify({"error": "No image provided"}), 400
+
+    prompt_text = get_translation_prompt(target)
+
+
+    # 调用你的翻译函数
+    result = generate_ai_img_response(image_base64=image_b64,prompt_text=prompt_text)
+    return jsonify({
+        "original": '',
+        "translated": result,
+        "source": source,
+        "target": target
+        })
 
 
 if __name__ == '__main__':

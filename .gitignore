@@ -9,3 +9,4 @@ __pycache__/
 
 # 忽略配置文件中的敏感信息
 config.ini
+.env

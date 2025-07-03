@@ -32,7 +32,8 @@
       <option value="ja">日语</option>
       <option value="ko">韩语</option>
     </select>
-    <button onclick="doTranslate()">翻译</button>
+    <button onclick="doTranslate('machine')">机器翻译</button>
+    <button onclick="doTranslate('ai')">AI翻译</button>
     <button onclick="clearInput()" style="background: #ccc;">清除</button>
   </div>
 
@@ -109,13 +110,18 @@ function isEnglishDominant(text, threshold = 0.7) {
 
 
 // 执行翻译
-function doTranslate() {
+function doTranslate(type) {
   const inputText = document.getElementById("input-text").value.trim();
+  const loadingOverlay = document.getElementById("loading-overlay");
 
   if (!inputText && !currentContent) {
     alert("请输入文字或粘贴图片");
     return;
   }
+
+
+  // 显示加载动画
+  loadingOverlay.style.display = "flex";
 
   const sourceSelect = document.getElementById("source-lang");
   const targetSelect = document.getElementById("target-lang");
@@ -152,7 +158,17 @@ function doTranslate() {
 
   }
 
-  const url = isImage ? "/translate-image" : "/translate";
+
+  // 根据 type 和 isImage 构建 URL
+  let url = '';
+  if (type === 'ai') {
+    // AI 翻译
+    url = isImage ? "/translate-ai-image" : "/translate-ai";
+  } else {
+    // 默认是机器翻译，不管 type 是 undefined 还是其他无效值
+    url = isImage ? "/translate-image" : "/translate";
+  }
+
 
   fetch(url, {
     method: "POST",
@@ -167,9 +183,18 @@ function doTranslate() {
   .catch(err => {
     console.error(err);
     alert("翻译失败，请查看控制台错误信息");
+  })
+  .finally(() => {
+    // 不管成功还是失败，都隐藏 loading
+    loadingOverlay.style.display = "none";
   });
+
 }
 </script>
 
 </body>
+<!-- 加载遮罩 -->
+<div id="loading-overlay" class="loading-overlay">
+  <div class="loading-spinner"></div>
+</div>
 </html>
