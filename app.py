@@ -1,5 +1,6 @@
 # app.py
 from flask import Flask, render_template, request, jsonify
+from datetime import datetime
 import os
 import configparser
 
@@ -7,7 +8,40 @@ import configparser
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
 from geminiAI import generate_ai_response,get_translation_prompt,generate_ai_img_response
 
+# 确保 log 目录存在，并生成当天的日志文件路径
+LOG_DIR = 'log'
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
 app = Flask(__name__, template_folder='templates', static_folder='static')
+
+
+
+@app.before_request
+def log_request():
+    pass  # 只用于触发 after_request
+
+@app.after_request
+def log_response(response):
+    ip = request.remote_addr
+    route = request.endpoint or 'N/A'
+    method = request.method
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 按天生成日志文件名：log/access-2025-07-03.log
+    log_file = os.path.join(LOG_DIR, f"access-{date_str}.log")
+
+    log_line = f"{time_str} - {ip} - {method} {route}\n"
+
+    # 写入日志文件
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(log_line)
+
+    return response
+
+
 
 @app.route('/')
 def index():
