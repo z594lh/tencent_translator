@@ -23,7 +23,7 @@ def log_request():
 
 @app.after_request
 def log_response(response):
-    ip = request.remote_addr
+    ip = request.headers.get('X-Forwarded-For', request.access_route[0] if request.access_route else request.remote_addr)
     route = request.endpoint or 'N/A'
     method = request.method
     now = datetime.now()
