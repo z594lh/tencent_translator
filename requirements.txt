@@ -5,3 +5,4 @@ tencentcloud-sdk-python>=3.0.0
 Flask>=2.0.0
 python-dotenv
 google-genai
+flask-cors

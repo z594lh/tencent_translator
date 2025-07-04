@@ -1,5 +1,6 @@
 # app.py
 from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
 from datetime import datetime
 import os
 import configparser
@@ -14,6 +15,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
+CORS(app)
 
 
 
@@ -42,9 +44,7 @@ def log_response(response):
     return response
 
 
-
-@app.route('/')
-def index():
+def getConfigUrl():
     # 从配置中读取链接
     try:
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,10 +54,24 @@ def index():
         author_link = config.get("TencentCloud", "url")
     except Exception as e:
         author_link = "#"  # 默认值
+    
+    return author_link;
 
-    return render_template('index.html', author_link=author_link)
 
-@app.route('/translate', methods=['POST'])
+@app.route('/')
+def index():
+    return render_template('index.html', author_link=getConfigUrl())
+
+
+@app.route('/api/config', methods=['GET'])
+def get_config():
+    return jsonify({
+        'author_link': getConfigUrl()
+    })
+
+
+
+@app.route('/api/translate', methods=['POST'])
 def api_translate():
     data = request.get_json()
     text = data.get('text', '')
@@ -76,7 +90,7 @@ def api_translate():
         "target": target
     })
 
-@app.route('/translate-image', methods=['POST'])
+@app.route('/api/translate-image', methods=['POST'])
 def api_translate_image():
     data = request.get_json()
     image_b64 = data.get('image', '')
@@ -104,7 +118,7 @@ def api_translate_image():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/translate-ai', methods=['POST'])
+@app.route('/api/translate-ai', methods=['POST'])
 def api_translate_ai():
     data = request.get_json()
     text = data.get('text', '')
@@ -127,7 +141,7 @@ def api_translate_ai():
         })
 
 
-@app.route('/translate-ai-image', methods=['POST'])
+@app.route('/api/translate-ai-image', methods=['POST'])
 def api_translate_ai_image():
     data = request.get_json()
     image_b64 = data.get('image', '')

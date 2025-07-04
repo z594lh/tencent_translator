@@ -163,10 +163,10 @@ function doTranslate(type) {
   let url = '';
   if (type === 'ai') {
     // AI 翻译
-    url = isImage ? "/translate-ai-image" : "/translate-ai";
+    url = isImage ? "/api/translate-ai-image" : "/api/translate-ai";
   } else {
     // 默认是机器翻译，不管 type 是 undefined 还是其他无效值
-    url = isImage ? "/translate-image" : "/translate";
+    url = isImage ? "/api/translate-image" : "/api/translate";
   }
 
 
