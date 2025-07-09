@@ -4,6 +4,7 @@ from flask_cors import CORS
 from datetime import datetime
 import os
 import configparser
+from video import video_bp
 
 # 导入你的翻译模块
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
@@ -162,6 +163,10 @@ def api_translate_ai_image():
         "source": source,
         "target": target
         })
+
+
+# 注册视频相关路由
+app.register_blueprint(video_bp)
 
 
 if __name__ == '__main__':

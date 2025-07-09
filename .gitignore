@@ -14,3 +14,5 @@ config.ini
 
 # 忽略日志文件
 /log/
+
+videos/
