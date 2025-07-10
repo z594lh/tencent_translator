@@ -35,7 +35,6 @@ def get_file_metadata(file_path):
 
 @video_bp.route('/api/upload-video', methods=['POST'])
 def upload_video():
-    """上传视频文件"""
     if 'file' not in request.files:
         return jsonify({"error": "未上传文件"}), 400
 
@@ -46,13 +45,18 @@ def upload_video():
     if not is_supported_video(file.filename):
         return jsonify({"error": "不支持的视频格式"}), 400
 
-    # 生成唯一文件名
     file_ext = os.path.splitext(file.filename)[1]
     unique_filename = f"{uuid.uuid4().hex}{file_ext}"
     file_path = os.path.join(VIDEO_FOLDER, unique_filename)
 
     try:
-        file.save(file_path)
+        chunk_size = 1024 * 1024  # 1MB
+        with open(file_path, 'wb') as f:
+            while True:
+                chunk = file.stream.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
         return jsonify({
             "message": "上传成功",
             "filename": unique_filename
