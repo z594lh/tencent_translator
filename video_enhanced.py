@@ -9,6 +9,7 @@ import json
 import hashlib
 import threading
 import subprocess
+import mimetypes
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
@@ -510,7 +511,7 @@ def list_videos():
 @video_bp.route('/api/video-detail/<path:filename>')
 @video_bp.route('/api/video-detail/transcoded/<path:filename>')
 def serve_video(filename):
-    """流式传输视频文件（支持硬件解码优化）"""
+    """流式传输视频文件（支持HTTP Range请求）"""
     try:
         # 确定文件路径
         if 'transcoded' in request.path:
@@ -521,9 +522,57 @@ def serve_video(filename):
         if not file_path.exists():
             abort(404, description="视频文件不存在")
         
-        # 直接提供文件服务
-        directory = str(file_path.parent)
-        return send_from_directory(directory, file_path.name)
+        # 获取文件信息
+        file_size = file_path.stat().st_size
+        
+        # 处理Range请求（支持分片播放）
+        range_header = request.headers.get('Range', None)
+        
+        if range_header:
+            # 解析Range头
+            byte_range = range_header.replace('bytes=', '').split('-')
+            start = int(byte_range[0]) if byte_range[0] else 0
+            end = int(byte_range[1]) if byte_range[1] and byte_range[1] != '' else file_size - 1
+            
+            if start >= file_size or end >= file_size or start > end:
+                abort(416, description="请求的范围无效")
+            
+            # 计算范围
+            length = end - start + 1
+            
+            # 读取指定范围的数据
+            def generate():
+                with open(file_path, 'rb') as f:
+                    f.seek(start)
+                    remaining = length
+                    chunk_size = 8192
+                    while remaining > 0:
+                        chunk = f.read(min(chunk_size, remaining))
+                        if not chunk:
+                            break
+                        yield chunk
+                        remaining -= len(chunk)
+            
+            # 设置响应头
+            response = Response(
+                generate(),
+                206,
+                mimetype=mimetypes.guess_type(str(file_path))[0] or 'application/octet-stream',
+                direct_passthrough=True
+            )
+            response.headers.add('Content-Range', f'bytes {start}-{end}/{file_size}')
+            response.headers.add('Accept-Ranges', 'bytes')
+            response.headers.add('Content-Length', str(length))
+            
+            return response
+        else:
+            # 正常发送整个文件
+            return send_from_directory(
+                str(file_path.parent), 
+                file_path.name,
+                as_attachment=False,
+                conditional=True
+            )
         
     except Exception as e:
         logger.error(f"视频服务错误: {e}")
