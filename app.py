@@ -5,6 +5,7 @@ from datetime import datetime
 import os
 import configparser
 from video_enhanced import video_bp
+from jellyfin import get_stream_url
 
 # 导入你的翻译模块
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
@@ -68,6 +69,12 @@ def index():
 def upload_page():
     """上传页面路由"""
     return render_template('upload.html', author_link=getConfigUrl())
+
+
+@app.route('/jellyfin')
+def jellyfin_page():
+    video_url = request.args.get('url', '')
+    return render_template('jellyfin.html', video_url=video_url)
 
 
 @app.route('/api/config', methods=['GET'])
@@ -169,6 +176,20 @@ def api_translate_ai_image():
         "source": source,
         "target": target
         })
+
+
+@app.route('/api/jellyfin/stream_url')
+def api_jellyfin_stream_url():
+    import re
+    itemid_raw = request.args.get('itemid', '')
+    # 支持直接传id或url，自动提取32位itemid
+    m = re.search(r'([a-fA-F0-9]{32})', itemid_raw)
+    itemid = m.group(1) if m else itemid_raw.strip()
+    try:
+        url = get_stream_url(itemid)
+        return jsonify({'url': url})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
 
 
 # 注册视频相关路由

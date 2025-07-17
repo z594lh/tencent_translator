@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Jellyfin 直链生成</title>
+    <style>
+        body {
+            background: #f5f7fa;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Segoe UI', 'Arial', sans-serif;
+        }
+        .container {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.10);
+            padding: 40px 32px 32px 32px;
+            min-width: 350px;
+            max-width: 90vw;
+        }
+        h2 {
+            text-align: center;
+            color: #2d5be3;
+            margin-bottom: 28px;
+        }
+        .input-row {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1px solid #d0d7de;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border 0.2s;
+        }
+        input[type="text"]:focus {
+            border: 1.5px solid #2d5be3;
+            outline: none;
+        }
+        button {
+            background: linear-gradient(90deg, #2d5be3 60%, #4f8cff 100%);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 22px;
+            font-size: 16px;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(45,91,227,0.08);
+            transition: background 0.2s, transform 0.1s;
+        }
+        button:hover {
+            background: linear-gradient(90deg, #1a3e9a 60%, #2d5be3 100%);
+            transform: translateY(-2px) scale(1.03);
+        }
+        .label {
+            font-size: 15px;
+            color: #555;
+            margin-bottom: 6px;
+        }
+        @media (max-width: 600px) {
+            .container { padding: 18px 6vw; min-width: unset; }
+            .input-row { flex-direction: column; gap: 8px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>Jellyfin 直链生成</h2>
+    <div class="label">输入 itemid 或下载链接：</div>
+    <div class="input-row">
+        <input type="text" id="itemid" placeholder="输入 itemid 或下载链接">
+        <button onclick="getDirectUrl()">生成直链</button>
+    </div>
+    <div class="label">直链：</div>
+    <div class="input-row">
+        <input type="text" id="directUrl" placeholder="直链将显示在这里">
+        <button onclick="copyUrl()">复制</button>
+    </div>
+</div>
+<script>
+async function getDirectUrl() {
+    const itemid = document.getElementById('itemid').value.trim();
+    if (!itemid) {
+        alert('请输入 itemid');
+        return;
+    }
+    try {
+        const resp = await fetch(`/api/jellyfin/stream_url?itemid=${encodeURIComponent(itemid)}`);
+        const data = await resp.json();
+        if (data.url) {
+            document.getElementById('directUrl').value = data.url;
+        } else {
+            document.getElementById('directUrl').value = '';
+            alert(data.error || '未获取到直链');
+        }
+    } catch (e) {
+        alert('请求失败: ' + e);
+    }
+}
+function copyUrl() {
+    const url = document.getElementById('directUrl').value;
+    if (!url) {
+        alert('没有可复制的直链');
+        return;
+    }
+    navigator.clipboard.writeText(url).then(() => {
+        alert('已复制到剪贴板');
+    });
+}
+</script>
+</body>
+</html>
