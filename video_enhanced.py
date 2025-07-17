@@ -20,9 +20,24 @@ import av
 from flask import Blueprint, jsonify, request, send_from_directory, abort, Response
 from werkzeug.utils import secure_filename
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+
+# 配置日志，按日期写入log/xxx.log
+from logging.handlers import TimedRotatingFileHandler
+LOG_DIR = Path(__file__).parent / 'log'
+LOG_DIR.mkdir(exist_ok=True)
+# 日志文件名格式为 video_YYYY-MM-DD.log
+today_str = datetime.now().strftime('%Y-%m-%d')
+log_file_path = LOG_DIR / f"video_{today_str}.log"
+file_handler = logging.FileHandler(str(log_file_path), encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('[%(asctime)s] %(levelname)s %(message)s')
+file_handler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+# 避免重复添加handler
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == str(log_file_path) for h in logger.handlers):
+    logger.addHandler(file_handler)
 
 video_bp = Blueprint('video', __name__)
 
