@@ -199,9 +199,13 @@ class VideoProcessor:
                     if output_path.exists() and output_path.stat().st_size > 0:
                         logger.info(f"硬件加速转码成功: {input_path} -> {output_path}")
                         return True
-                        
-                except Exception as e:
+                except ffmpeg.Error as e:
                     logger.warning(f"硬件加速转码失败: {e}，回退到软件编码")
+                    # logger.error(f"ffmpeg stderr: {e.stderr.decode('utf-8', errors='ignore') if hasattr(e, 'stderr') and e.stderr else e}")
+                    if output_path.exists():
+                        output_path.unlink()
+                except Exception as e:
+                    logger.warning(f"硬件加速转码失败: {e}，回退到软件编码 (非ffmpeg.Error)")
                     if output_path.exists():
                         output_path.unlink()
             
