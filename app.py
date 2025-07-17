@@ -4,7 +4,7 @@ from flask_cors import CORS
 from datetime import datetime
 import os
 import configparser
-from video import video_bp
+from video_enhanced import video_bp
 
 # 导入你的翻译模块
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
@@ -56,12 +56,18 @@ def getConfigUrl():
     except Exception as e:
         author_link = "#"  # 默认值
     
-    return author_link;
+    return author_link
 
 
 @app.route('/')
 def index():
     return render_template('index.html', author_link=getConfigUrl())
+
+
+@app.route('/upload')
+def upload_page():
+    """上传页面路由"""
+    return render_template('upload.html', author_link=getConfigUrl())
 
 
 @app.route('/api/config', methods=['GET'])

@@ -6,3 +6,7 @@ Flask>=2.0.0
 python-dotenv
 google-genai
 flask-cors
+ffmpeg-python>=0.2.0
+av>=10.0.0
+numpy>=1.21.0
+werkzeug>=2.0.0
