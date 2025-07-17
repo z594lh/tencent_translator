@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 import logging
+import shutil
 
 import ffmpeg
 import av
@@ -73,6 +74,12 @@ TRANSCODE_CONFIG = {
 upload_status: Dict[str, Dict] = {}
 status_lock = threading.Lock()
 
+
+# 兼容虚拟环境下ffmpeg/ffprobe找不到的问题
+FFMPEG_PATH = shutil.which('ffmpeg')
+FFPROBE_PATH = shutil.which('ffprobe')
+
+# ffmpeg-python的input/output/probe都不要传cmd参数，只在run时传cmd
 
 class VideoProcessor:
     """视频处理类，支持硬件加速"""
@@ -178,7 +185,6 @@ class VideoProcessor:
                     # 尝试QSV硬件加速
                     encoder = TRANSCODE_CONFIG[codec]['codec']
                     logger.info(f"尝试使用硬件加速编码器: {encoder}")
-                    
                     stream = ffmpeg.input(str(input_path))
                     stream = ffmpeg.output(
                         stream,
@@ -218,9 +224,15 @@ class VideoProcessor:
                 movflags='faststart',
                 **{'threads': 0}
             )
-            
             # 执行转码
-            ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            try:
+                if FFMPEG_PATH:
+                    ffmpeg.run(stream, overwrite_output=True, quiet=True, cmd=FFMPEG_PATH)
+                else:
+                    ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            except ffmpeg.Error as e:
+                logger.error(f"ffmpeg stderr: {e.stderr.decode('utf-8', errors='ignore') if hasattr(e, 'stderr') and e.stderr else e}")
+                raise
             
             # 检查输出文件
             if output_path.exists() and output_path.stat().st_size > 0:
