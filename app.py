@@ -3,9 +3,9 @@ from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from datetime import datetime
 import os
-import configparser
 from video_enhanced import video_bp
 from jellyfin import get_stream_url
+from config import config
 
 # 导入你的翻译模块
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
@@ -48,16 +48,7 @@ def log_response(response):
 
 def getConfigUrl():
     # 从配置中读取链接
-    try:
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
-        config = configparser.ConfigParser()
-        config.read(CONFIG_PATH, encoding="utf-8")
-        author_link = config.get("TencentCloud", "url")
-    except Exception as e:
-        author_link = "#"  # 默认值
-    
-    return author_link
+    return config.get_tencent_url()
 
 
 @app.route('/')

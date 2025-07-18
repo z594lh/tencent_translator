@@ -1,16 +1,11 @@
 import requests
-import os
-import configparser
+from config import config
 
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
-config = configparser.ConfigParser()
-config.read(CONFIG_PATH, encoding="utf-8")
-# 配置部分，请根据实际情况修改
-JELLYFIN_URL = config.get("JellyFin", "jellyfin_url")
-ADMIN_USERNAME = config.get("JellyFin", "username")
-ADMIN_PASSWORD = config.get("JellyFin", "password")
+# 获取Jellyfin配置
+jellyfin_config = config.get_jellyfin_config()
+JELLYFIN_URL = jellyfin_config['url']
+ADMIN_USERNAME = jellyfin_config['username']
+ADMIN_PASSWORD = jellyfin_config['password']
 
 def get_access_token():
     auth_url = f"{JELLYFIN_URL}/Users/AuthenticateByName"
