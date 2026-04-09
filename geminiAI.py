@@ -139,7 +139,7 @@ def save_image_locally(image_bytes):
     
     # --- 拼接完整 URL ---
     try:
-        base_url = request.host_url.rstrip('/') 
+        base_url = os.getenv("BASE_URL") 
         return f"{base_url}/static/output/{filename}"
     except Exception:
         return f"/static/output/{filename}"

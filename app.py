@@ -248,7 +248,7 @@ def get_gallery():
         page_size = int(request.args.get('page_size', 20))
         
         output_dir = os.path.join('static', 'output')
-        base_url = request.host_url.rstrip('/') # 建议从配置读取
+        base_url = os.getenv("BASE_URL")
 
         if not os.path.exists(output_dir):
             return jsonify({"images": [], "total": 0})
@@ -326,7 +326,7 @@ def chat_image_test_endpoint():
         # --- 2. 配置本地路径与域名 ---
         output_dir = os.path.join('static', 'output')
         # 💡 这里加上你的后端完整地址
-        base_url = request.host_url.rstrip('/') 
+        base_url = os.getenv("BASE_URL")
         
         if not os.path.exists(output_dir):
             return jsonify({"error": "static/output 文件夹不存在"}), 500
