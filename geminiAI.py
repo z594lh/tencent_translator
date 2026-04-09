@@ -159,20 +159,19 @@ def generate_ai_images_service(
     
     # 1. 查找或创建会话历史
     if session_id and session_id in SESSIONS_POOL:
-        current_history = SESSIONS_POOL[session_id]
+        # 使用 list() 浅拷贝一份历史记录，确保循环内的请求不会相互污染
+        initial_history = list(SESSIONS_POOL[session_id])
     else:
-        current_history = []
+        initial_history = []
         session_id = str(uuid.uuid4())[:8]
 
     # --- 2. 提示词增强逻辑 (Prompt Engineering) ---
-    # 映射前端传来的 720, 1080, 1440 参数
     quality_map = {
         "720": "标准高清 (720p resolution, clear details)",
         "1080": "全高清 (1080p Full HD, sharp textures, high-quality rendering)",
         "1440": "超清 (2K/1440p resolution, ultra-detailed, cinematic lighting, masterpiece)"
     }
     
-    # 构造技术指令块
     tech_requirements = (
         f"\n\n---\n"
         f"[技术规格/Technical Requirements]:\n"
@@ -181,11 +180,11 @@ def generate_ai_images_service(
         f"- 请严格按照此比例和质量要求生成图像。"
     )
     
-    # 拼接最终发送给 AI 的 Prompt
     final_message = f"{message}{tech_requirements}"
     # --------------------------------------------
 
     result_urls = []
+    last_response_content = None # 用于记录最后一次成功的回复内容
 
     try:
         # 构造当前输入的 Parts
@@ -194,24 +193,20 @@ def generate_ai_images_service(
             img_bytes = base64.b64decode(image_b64)
             current_parts.append(types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg'))
         
-        # 使用增强后的 final_message
         current_parts.append(types.Part.from_text(text=final_message))
 
         # 循环生成指定数量的图片
         for i in range(count):
+            # 每次请求都使用 initial_history，确保互不干扰
             chat = client.chats.create(
                 model=model_name,
-                history=current_history,
+                history=initial_history,
                 config=types.GenerateContentConfig(response_modalities=['TEXT', 'IMAGE'])
             )
             response = chat.send_message(current_parts)
             
-            # 只有第一张图的交互记录到历史中，避免历史记录过于臃肿
-            if i == 0:
-                user_content = types.Content(role="user", parts=current_parts)
-                model_content = response.candidates[0].content
-                current_history.append(user_content)
-                current_history.append(model_content)
+            # 记录最后一次成功的 content 供存入 session
+            last_response_content = response.candidates[0].content
 
             # 提取生成的图片数据
             for part in response.candidates[0].content.parts:
@@ -219,12 +214,19 @@ def generate_ai_images_service(
                     url = save_image_locally(part.inline_data.data)
                     result_urls.append(url)
 
-        # 回存到内存池
-        if len(SESSIONS_POOL) >= MAX_SESSIONS:
-            first_key = next(iter(SESSIONS_POOL))
-            SESSIONS_POOL.pop(first_key)
-        
-        SESSIONS_POOL[session_id] = current_history
+        # 3. 只有成功生成后，才更新 Session 历史
+        if last_response_content:
+            user_content = types.Content(role="user", parts=current_parts)
+            # 更新本地变量
+            initial_history.append(user_content)
+            initial_history.append(last_response_content)
+            
+            # 回存到内存池
+            if len(SESSIONS_POOL) >= MAX_SESSIONS and session_id not in SESSIONS_POOL:
+                first_key = next(iter(SESSIONS_POOL))
+                SESSIONS_POOL.pop(first_key)
+            
+            SESSIONS_POOL[session_id] = initial_history
 
         return {
             "images": result_urls,
@@ -233,7 +235,7 @@ def generate_ai_images_service(
         }
 
     except Exception as e:
-        print(f"Service Error: {str(e)}") # 打印日志方便调试
+        print(f"Service Error: {str(e)}")
         return {"error": str(e)}
 
 
