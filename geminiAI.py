@@ -40,14 +40,24 @@ def get_translation_prompt(target='zh'):
     
 
 def setup_proxy_from_env():
-    """从 .env 文件中读取代理配置，并设置到 os.environ"""
+    """从 .env 文件中读取代理配置，有则设置，无则清除"""
     proxy_http = os.getenv("HTTP_PROXY")
     proxy_https = os.getenv("HTTPS_PROXY")
 
     if proxy_http:
         os.environ['http_proxy'] = proxy_http
+        os.environ['HTTP_PROXY'] = proxy_http
+    else:
+        # 如果 .env 没写，确保不使用系统可能残留的代理设置
+        os.environ.pop('http_proxy', None)
+        os.environ.pop('HTTP_PROXY', None)
+
     if proxy_https:
         os.environ['https_proxy'] = proxy_https
+        os.environ['HTTPS_PROXY'] = proxy_https
+    else:
+        os.environ.pop('https_proxy', None)
+        os.environ.pop('HTTPS_PROXY', None)
 
 
 def generate_ai_response(contents: str) -> str:
