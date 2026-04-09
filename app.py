@@ -8,6 +8,7 @@ import uuid
 from video_enhanced import video_bp
 from jellyfin import get_stream_url
 from config import config
+from dotenv import load_dotenv
 
 # 导入你的翻译模块
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
@@ -248,6 +249,7 @@ def get_gallery():
         page_size = int(request.args.get('page_size', 20))
         
         output_dir = os.path.join('static', 'output')
+        load_dotenv(override=True)
         base_url = os.getenv("BASE_URL")
 
         if not os.path.exists(output_dir):
@@ -326,6 +328,7 @@ def chat_image_test_endpoint():
         # --- 2. 配置本地路径与域名 ---
         output_dir = os.path.join('static', 'output')
         # 💡 这里加上你的后端完整地址
+        load_dotenv(override=True)
         base_url = os.getenv("BASE_URL")
         
         if not os.path.exists(output_dir):
