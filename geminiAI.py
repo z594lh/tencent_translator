@@ -1,17 +1,13 @@
 import os
 import uuid
+import json
+import io
+import pymysql
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import base64
 from flask import request
-
-
-# 内存会话池：{ session_id: [history_list] }
-SESSIONS_POOL = {}
-# 限制最大存储量，防止内存占用过高
-MAX_SESSIONS = 50
-
 
 
 def get_translation_prompt(target='zh'):
@@ -125,113 +121,385 @@ def generate_ai_img_response(image_base64: str, prompt_text: str) -> str:
         return response.text
     except Exception as e:
         return f"发生错误：{e}"
+    
+# --- AI生图部分 ---
+
 
 def save_image_locally(image_bytes):
+    """返回 (完整URL, 本地相对路径)"""
     output_dir = os.path.join('static', 'output')
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
     filename = f"{uuid.uuid4()}.jpg"
-    file_path = os.path.join(output_dir, filename)
+    relative_path = os.path.join(output_dir, filename) # static/output/xxx.jpg
     
-    with open(file_path, "wb") as f:
+    with open(relative_path, "wb") as f:
         f.write(image_bytes)
     
-    # --- 拼接完整 URL ---
+    # 构造 URL
     try:
         base_url = os.getenv("BASE_URL") 
-        return f"{base_url}/static/output/{filename}"
-    except Exception:
-        return f"/static/output/{filename}"
+        url = f"{base_url.rstrip('/')}/static/output/{filename}"
+    except:
+        url = f"/static/output/{filename}"
+        
+    return url, relative_path
+    
 
-def generate_ai_images_service(
-    message: str, 
-    session_id: str = None, 
-    image_b64: str = None, 
-    count: int = 1, 
+def get_db_connection():
+    return pymysql.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        user=os.getenv("DB_USER", "remote_user"),
+        password=os.getenv("DB_PASSWORD", "你的密码"), 
+        database=os.getenv("DB_NAME", "ai_image_project"),
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+def ensure_session_exists(cursor, session_id):
+    """确保父表 ai_sessions 中存在该 ID"""
+    check_sql = "SELECT id FROM ai_sessions WHERE id = %s"
+    cursor.execute(check_sql, (session_id,))
+    if not cursor.fetchone():
+        insert_session_sql = "INSERT INTO ai_sessions (id) VALUES (%s)"
+        cursor.execute(insert_session_sql, (session_id,))
+
+def save_image_to_db(image_id, session_id, url, local_path, prompt, history):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            ensure_session_exists(cursor, session_id)
+            
+            # 序列化历史记录 (保持你原来的强化版逻辑)
+            history_data = []
+            for h in history:
+                if hasattr(h, 'to_json'):
+                    history_data.append(json.loads(h.to_json()))
+                elif isinstance(h, dict):
+                    history_data.append(h)
+                else:
+                    try:
+                        history_data.append(json.loads(json.dumps(h, default=lambda o: o.__dict__)))
+                    except: continue 
+            
+            history_json = json.dumps(history_data)
+            
+            # 增加 local_path 字段的插入
+            sql = """INSERT INTO ai_images (id, session_id, image_url, local_path, prompt, history_snapshot) 
+                     VALUES (%s, %s, %s, %s, %s, %s)"""
+            cursor.execute(sql, (image_id, session_id, url, local_path, prompt, history_json))
+        conn.commit()
+        print(f"📖 数据库记录已同步: Image ID {image_id}")
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Database Error: {e}")
+    finally:
+        conn.close()
+
+def get_image_relative_path_by_id(image_id):
+    """根据 ID 从数据库获取图片的本地存储相对路径"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            sql = "SELECT local_path FROM ai_images WHERE id = %s"
+            cursor.execute(sql, (image_id,))
+            result = cursor.fetchone()
+            if result:
+                return result['local_path']
+            return None
+    finally:
+        conn.close()
+
+
+def edit_ai_images_service(
+    message: str,
+    session_id: str = None,
+    image_ids: list = None,
+    image_b64_list: list = None,
+    count: int = 1,
     model_name: str = "gemini-3.1-flash-image-preview",
     aspect_ratio: str = "1:1",
-    quality: str = "720"
+    quality: str = "2K"
 ) -> dict:
+    """
+    使用 Gemini 模型基于多张输入图片进行编辑/修改，生成新图片。
+    支持从数据库加载图片 (image_ids) 或直接传入 base64 图片 (image_b64_list)。
+
+    参数:
+        message (str): 提示词，描述如何修改/组合图片
+        session_id (str): 会话ID，用于保持上下文
+        image_ids (list): 数据库中的图片ID列表，如 ["img-001", "img-002"]
+        image_b64_list (list): base64编码的图片列表，如 ["base64str1", "base64str2"]
+        count (int): 生成图片数量
+        model_name (str): 使用的模型名称
+        aspect_ratio (str): 宽高比，可选 "1:1","1:4","1:8","2:3","3:2","3:4","4:1","4:3","4:5","5:4","8:1","9:16","16:9","21:9"
+        quality (str): 分辨率，可选 "512", "1K", "2K", "4K"
+
+    返回:
+        dict: 包含生成的图片URL、session_id等信息
+    """
     load_dotenv(override=True)
     setup_proxy_from_env()
     client = genai.Client()
-    
-    # 1. 查找或创建会话历史
-    if session_id and session_id in SESSIONS_POOL:
-        # 使用 list() 浅拷贝一份历史记录，确保循环内的请求不会相互污染
-        initial_history = list(SESSIONS_POOL[session_id])
-    else:
-        initial_history = []
+
+    # --- 1. 初始化 session_id ---
+    if not session_id:
         session_id = str(uuid.uuid4())[:8]
 
-    # --- 2. 提示词增强逻辑 (Prompt Engineering) ---
-    quality_map = {
-        "720": "标准高清 (720p resolution, clear details)",
-        "1080": "全高清 (1080p Full HD, sharp textures, high-quality rendering)",
-        "1440": "超清 (2K/1440p resolution, ultra-detailed, cinematic lighting, masterpiece)"
-    }
-    
-    tech_requirements = (
-        f"\n\n---\n"
-        f"[技术规格/Technical Requirements]:\n"
-        f"- 图像比例 (Aspect Ratio): {aspect_ratio}\n"
-        f"- 图像质量 (Quality): {quality_map.get(str(quality), 'Standard')}\n"
-        f"- 请严格按照此比例和质量要求生成图像。"
-    )
-    
-    final_message = f"{message}{tech_requirements}"
-    # --------------------------------------------
+    # --- 2. 收集所有输入图片作为 Part ---
+    image_parts = []
 
-    result_urls = []
-    last_response_content = None # 用于记录最后一次成功的回复内容
+    # a. 优先从数据库加载图片 (image_ids)
+    if image_ids:
+        for img_id in image_ids:
+            local_path = get_image_relative_path_by_id(img_id)
+            if local_path and os.path.exists(local_path):
+                try:
+                    with open(local_path, "rb") as f:
+                        image_parts.append(types.Part.from_bytes(
+                            data=f.read(),
+                            mime_type='image/jpeg'
+                        ))
+                    print(f"✅ 已加载历史图片: {local_path}")
+                except Exception as e:
+                    print(f"⚠️ 加载图片 {img_id} 失败: {e}")
+            else:
+                print(f"⚠️ 图片 {img_id} 不存在: {local_path}")
+
+    # b. 其次处理直接传入的 base64 图片
+    if image_b64_list:
+        for b64_str in image_b64_list:
+            try:
+                img_bytes = base64.b64decode(b64_str)
+                image_parts.append(types.Part.from_bytes(
+                    data=img_bytes,
+                    mime_type='image/jpeg'
+                ))
+                print(f"✅ 已加载 base64 图片")
+            except Exception as e:
+                print(f"⚠️ 解码 base64 图片失败: {e}")
+
+    if not image_parts:
+        return {"error": "没有可用的输入图片，请提供 image_ids 或 image_b64_list"}
+
+    # --- 3. 构造配置 ---
+    generation_config = types.GenerateContentConfig(
+        response_modalities=['TEXT', 'IMAGE'],
+        image_config=types.ImageConfig(
+            aspect_ratio=aspect_ratio,
+            image_size=quality
+        )
+    )
+
+    result_data = []
 
     try:
-        # 构造当前输入的 Parts
-        current_parts = []
-        if image_b64:
-            img_bytes = base64.b64decode(image_b64)
-            current_parts.append(types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg'))
-        
-        current_parts.append(types.Part.from_text(text=final_message))
+        # --- 4. 构造请求内容 ---
+        # 所有图片 + 提示词
+        contents = image_parts + [types.Part.from_text(text=message)]
 
-        # 循环生成指定数量的图片
+        # --- 5. 循环生成 ---
         for i in range(count):
-            # 每次请求都使用 initial_history，确保互不干扰
-            chat = client.chats.create(
+            # 使用 client.models.generate_content 直接调用（非多轮对话模式）
+            response = client.models.generate_content(
                 model=model_name,
-                history=initial_history,
-                config=types.GenerateContentConfig(response_modalities=['TEXT', 'IMAGE'])
+                contents=contents,
+                config=generation_config
             )
-            response = chat.send_message(current_parts)
-            
-            # 记录最后一次成功的 content 供存入 session
-            last_response_content = response.candidates[0].content
 
-            # 提取生成的图片数据
-            for part in response.candidates[0].content.parts:
-                if part.inline_data:
-                    url = save_image_locally(part.inline_data.data)
-                    result_urls.append(url)
+            # --- 6. 构建历史记录（用于二次修改时参考）---
+            history_record = {
+                "prompt": message,
+                "model_version": response.model_version if hasattr(response, 'model_version') else model_name,
+                "generation_config": {
+                    "aspect_ratio": aspect_ratio,
+                    "quality": quality
+                },
+                "input_images_count": len(image_parts),
+                "ai_response": {
+                    "text": None,
+                    "finish_reason": str(response.candidates[0].finish_reason) if response.candidates else None,
+                },
+                "usage_metadata": {
+                    "prompt_token_count": response.usage_metadata.prompt_token_count if response.usage_metadata else 0,
+                    "candidates_token_count": response.usage_metadata.candidates_token_count if response.usage_metadata else 0,
+                    "total_token_count": response.usage_metadata.total_token_count if response.usage_metadata else 0,
+                } if response.usage_metadata else None
+            }
 
-        # 3. 只有成功生成后，才更新 Session 历史
-        if last_response_content:
-            user_content = types.Content(role="user", parts=current_parts)
-            # 更新本地变量
-            initial_history.append(user_content)
-            initial_history.append(last_response_content)
-            
-            # 回存到内存池
-            if len(SESSIONS_POOL) >= MAX_SESSIONS and session_id not in SESSIONS_POOL:
-                first_key = next(iter(SESSIONS_POOL))
-                SESSIONS_POOL.pop(first_key)
-            
-            SESSIONS_POOL[session_id] = initial_history
+            # --- 7. 处理生成的图片并保存 ---
+            image_found = False
+            print(f"DEBUG: Response -> {response}")
+            for part in response.parts:
+                if part.text is not None:
+                    print(part.text)
+                    history_record["ai_response"]["text"] = part.text
+                elif part.inline_data is not None:
+                    img_data = part.inline_data.data
+                    if img_data:
+                        new_img_id = str(uuid.uuid4())
+
+                        # 保存图片并获取URL和本地路径
+                        url, local_rel_path = save_image_locally(img_data)
+
+                        # 存入数据库（包含历史记录）
+                        save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [history_record])
+
+                        result_data.append({
+                            "image_id": new_img_id,
+                            "url": url
+                        })
+                        image_found = True
+                elif hasattr(part, 'as_image') and part.as_image():
+                    image = part.as_image()
+                    # 将 PIL Image 转为 bytes
+                    img_bytes = io.BytesIO()
+                    image.save(img_bytes, format='PNG')
+                    img_data = img_bytes.getvalue()
+
+                    new_img_id = str(uuid.uuid4())
+
+                    # 保存图片并获取URL和本地路径
+                    url, local_rel_path = save_image_locally(img_data)
+
+                    # 存入数据库
+                    save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [])
+
+                    result_data.append({
+                        "image_id": new_img_id,
+                        "url": url
+                    })
+                    image_found = True
+
+            if not image_found:
+                print(f"⚠️ AI 未生图，回复文字: {response.text if hasattr(response, 'text') else '无文字'}")
 
         return {
-            "images": result_urls,
+            "images": [item['url'] for item in result_data],
+            "image_details": result_data,
             "session_id": session_id,
-            "status": "success"
+            "status": "success" if result_data else "no_image",
+            "ai_text": response.text if not image_found and hasattr(response, 'text') else ""
+        }
+
+    except Exception as e:
+        print(f"Service Error: {str(e)}")
+        return {"error": str(e)}
+
+
+def generate_ai_images_service(
+    message: str,
+    session_id: str = None,
+    count: int = 1,
+    model_name: str = "gemini-3.1-flash-image-preview",
+    aspect_ratio: str = "1:1",
+    quality: str = "512"
+) -> dict:
+    """
+    文生图服务 - 使用 Gemini 模型根据提示词生成图片
+    """
+    load_dotenv(override=True)
+    setup_proxy_from_env()
+    client = genai.Client()
+
+    # 初始化 session_id
+    if not session_id:
+        session_id = str(uuid.uuid4())[:8]
+
+    # 构造配置
+    generation_config = types.GenerateContentConfig(
+        response_modalities=['TEXT', 'IMAGE'],
+        image_config=types.ImageConfig(
+            aspect_ratio=aspect_ratio,
+            image_size=quality
+        )
+    )
+
+    result_data = []
+
+    try:
+        # 循环生成
+        for i in range(count):
+            # 使用 client.models.generate_content 直接调用（文生图模式）
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[types.Part.from_text(text=message)],
+                config=generation_config
+            )
+
+            # 构建历史记录
+            history_record = {
+                "prompt": message,
+                "model_version": response.model_version if hasattr(response, 'model_version') else model_name,
+                "generation_config": {
+                    "aspect_ratio": aspect_ratio,
+                    "quality": quality
+                },
+                "ai_response": {
+                    "text": None,
+                    "finish_reason": str(response.candidates[0].finish_reason) if response.candidates else None,
+                },
+                "usage_metadata": {
+                    "prompt_token_count": response.usage_metadata.prompt_token_count if response.usage_metadata else 0,
+                    "candidates_token_count": response.usage_metadata.candidates_token_count if response.usage_metadata else 0,
+                    "total_token_count": response.usage_metadata.total_token_count if response.usage_metadata else 0,
+                } if response.usage_metadata else None
+            }
+
+            # 处理生成的图片并保存
+            image_found = False
+            print(f"DEBUG: Response -> {response}")
+            for part in response.parts:
+                if part.text is not None:
+                    print(part.text)
+                    history_record["ai_response"]["text"] = part.text
+                elif part.inline_data is not None:
+                    img_data = part.inline_data.data
+                    if img_data:
+                        new_img_id = str(uuid.uuid4())
+
+                        # 保存图片并获取URL和本地路径
+                        url, local_rel_path = save_image_locally(img_data)
+
+                        # 存入数据库
+                        save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [history_record])
+
+                        result_data.append({
+                            "image_id": new_img_id,
+                            "url": url
+                        })
+                        image_found = True
+                elif hasattr(part, 'as_image') and part.as_image():
+                    image = part.as_image()
+                    # 将 PIL Image 转为 bytes
+                    img_bytes = io.BytesIO()
+                    image.save(img_bytes, format='PNG')
+                    img_data = img_bytes.getvalue()
+
+                    new_img_id = str(uuid.uuid4())
+
+                    # 保存图片并获取URL和本地路径
+                    url, local_rel_path = save_image_locally(img_data)
+
+                    # 存入数据库
+                    save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [history_record])
+
+                    result_data.append({
+                        "image_id": new_img_id,
+                        "url": url
+                    })
+                    image_found = True
+
+            if not image_found:
+                print(f"⚠️ AI 未生图，回复文字: {response.text if hasattr(response, 'text') else '无文字'}")
+
+        return {
+            "images": [item['url'] for item in result_data],
+            "image_details": result_data,
+            "session_id": session_id,
+            "status": "success" if result_data else "no_image",
+            "ai_text": response.text if not result_data else ""
         }
 
     except Exception as e:
@@ -240,21 +508,46 @@ def generate_ai_images_service(
 
 
 if __name__ == "__main__":
-    # 模拟一个一直运行的后端
-    while True:
-        print("\n--- AI 生图系统 (模拟后端运行) ---")
-        u_input = input("请输入指令 (输入 'q' 退出): ")
-        if u_input == 'q': break
-        
-        s_id = input("请输入 Session ID (首次生成请直接回车): ")
-        if s_id.strip() == "": s_id = None
+    # 模拟一个一直运行的后端测试环境
+    print("\n" + "="*50)
+    print("  AI 生图系统数据库版测试启动 (Model: gemini-2.5-flash-image)")
+    print("="*50)
 
-        # 调用函数
-        result = generate_ai_images_service(message=u_input, session_id=s_id)
+    while True:
+        print("\n[新任务]")
+        u_input = input("请输入描述词 (输入 'q' 退出): ")
+        if u_input.lower() == 'q': 
+            break
+        
+        print("\n--- 上下文选择 ---")
+        print("1. 全新生成 (直接回车)")
+        print("2. 基于某张图进行修改 (输入该图片的 Image ID)")
+        target_img_id = input("请输入 Image ID: ").strip()
+        if target_img_id == "": 
+            target_img_id = None
+
+        s_id = input("请输入 Session ID (可选，不填自动生成): ").strip()
+        if s_id == "": 
+            s_id = None
+
+        # 调用重构后的服务函数
+        # 注意：这里我们手动指定 model_name 为 gemini-2.5-flash-image
+        result = generate_ai_images_service(
+            message=u_input, 
+            session_id=s_id, 
+            image_id=target_img_id,
+            model_name="gemini-2.5-flash-image"
+        )
         
         if "error" in result:
-            print("失败:", result["error"])
+            print("\n❌ 运行失败:", result["error"])
         else:
-            print("成功！")
-            print(f"Session ID: {result['session_id']}")
-            print(f"图片路径: {result['images']}")
+            print("\n✅ 运行成功！")
+            print(f"会话 ID (Session ID): {result['session_id']}")
+            
+            # 打印生成的图片及其 ID
+            for item in result.get('image_details', []):
+                print(f"---")
+                print(f"图片 ID (Image ID): {item['image_id']}")
+                print(f"存储路径 (URL): {item['url']}")
+                print(f"提示：下次输入此 Image ID 即可针对这张图修改。")

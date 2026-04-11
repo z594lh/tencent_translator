@@ -10,3 +10,6 @@ ffmpeg-python>=0.2.0
 av>=10.0.0
 numpy>=1.21.0
 werkzeug>=2.0.0
+pymysql
+openai>=1.0.0
+volcengine-python-sdk[ark]>=5.0.0

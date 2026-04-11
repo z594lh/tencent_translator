@@ -14,10 +14,20 @@ from dotenv import load_dotenv
 from translator import translate, translate_image, translate_html_with_structure, tencent_client
 # 导入你的 AI 模块，新增文生图和图生图函数
 from geminiAI import (
-    generate_ai_response, 
-    get_translation_prompt, 
-    generate_ai_img_response, 
-    generate_ai_images_service, 
+    generate_ai_response,
+    get_translation_prompt,
+    generate_ai_img_response,
+    generate_ai_images_service as gemini_generate_images,
+    edit_ai_images_service as gemini_edit_images,
+)
+# 导入豆包AI模块
+from doubaoAI import (
+    edit_ai_images_service as doubao_generate_service,
+)
+# 导入 Kimi 提示词增强模块
+from kimiAI import (
+    enhance_prompt_text,
+    enhance_prompt_with_image,
 )
 
 # 确保 log 目录存在，并生成当天的日志文件路径
@@ -183,6 +193,41 @@ def api_translate_ai_image():
         "target": target
         })
 
+# ============== AI模型路由分发器 ==============
+
+def get_image_service_by_model(model_name: str):
+    """
+    根据模型名称获取对应的AI生图服务函数
+    所有AI服务统一使用 edit_ai_images_service 接口
+
+    参数:
+        model_name (str): 模型名称
+
+    返回:
+        function: 统一的服务函数
+    """
+    # Gemini 模型列表
+    gemini_models = [
+        'gemini-3.1-flash-image-preview',
+        'gemini-2.5-flash-image',
+        'gemini-2.0-flash-exp-image-generation',
+    ]
+
+    # 豆包模型列表
+    doubao_models = [
+        'doubao-seedream-5-0-260128',
+    ]
+
+    if any(model in model_name.lower() for model in gemini_models):
+        return gemini_edit_images
+    elif any(model in model_name.lower() for model in doubao_models):
+        return doubao_generate_service
+    else:
+        # 默认使用 Gemini
+        print(f"⚠️ 未知模型 '{model_name}'，默认使用 Gemini")
+        return gemini_edit_images
+
+
 @app.route('/api/ai/chat-image', methods=['POST'])
 def chat_image_endpoint():
     try:
@@ -191,55 +236,311 @@ def chat_image_endpoint():
             return jsonify({"error": "No data provided"}), 400
 
         # --- 1. 参数提取与映射 ---
-        # 对应前端 currentPrompt
-        message = data.get('prompt') 
-        # 对应前端 inputSessionId
-        session_id = data.get('session_id') 
-        # 对应前端上传的参考图
-        image_b64 = data.get('image') 
-        # 对应前端 selectedModel
-        model_name = data.get('model', 'gemini-3.1-flash-image-preview') 
-        
-        # --- 2. 提取新增的配置参数 ---
-        # 对应前端 config.num (注意转换类型为 int)
+        message = data.get('prompt')
+        session_id = data.get('session_id')
+
+        model_name = data.get('model', 'gemini-3.1-flash-image-preview')
+
+        # --- 2. 提取配置参数 ---
         count = int(data.get('number_of_images', 1))
-        # 对应前端 config.ratio (如 "16:9")
         aspect_ratio = data.get('aspect_ratio', '1:1')
-        # 对应前端 config.quality (如 "1080")
-        quality = data.get('quality', '720')
+        quality = data.get('quality', '512')
 
         if not message:
             return jsonify({"error": "Message (prompt) is required"}), 400
 
         # --- 3. 调用 Service 方法 ---
-        # 注意：这里传入了我们刚才在 Service 中新加的参数
-        result = generate_ai_images_service(
+        result = gemini_generate_images(
             message=message,
             session_id=session_id,
-            image_b64=image_b64,
             count=count,
             model_name=model_name,
             aspect_ratio=aspect_ratio,
             quality=quality
         )
 
-        # 检查 Service 内部是否抛出异常
+        # 检查错误
         if "error" in result:
             return jsonify({"error": result["error"]}), 500
 
         # --- 4. 结构适配返回前端 ---
         res_images = result.get("images", [])
+        image_details = result.get("image_details", []) # 包含新生成的 ID
+
         return jsonify({
-            "image": res_images[0] if res_images else None, # 兼容旧的单图逻辑
-            "images": res_images,                          # 支持多图展示
+            "image": res_images[0] if res_images else None,
+            "images": res_images,
+            "image_details": image_details, # 返回详情，包含 id 和 url
             "session_id": result.get("session_id"),
+            "status": result.get("status", "success"),
+            "ai_text": result.get("ai_text", "") # 万一 AI 只回了文字
+        })
+
+    except Exception as e:
+        print(f"Server Error: {str(e)}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
+
+@app.route('/api/ai/edit-image', methods=['POST'])
+def edit_image_endpoint():
+    """
+    多图编辑/融合接口
+    - 支持传入多张图片ID (image_ids) 或 base64图片列表 (images)
+    - 用于人物融合、场景编辑等需要多图输入的场景
+    """
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        # --- 1. 参数提取 ---
+        message = data.get('prompt')
+        session_id = data.get('session_id')
+
+        # 多图支持：支持传入图片ID列表或base64列表
+        image_ids = data.get('image_ids') or []  # 数据库中的图片ID列表
+        images_b64 = data.get('images') or []    # base64图片列表
+
+        model_name = data.get('model', 'gemini-3.1-flash-image-preview')
+
+        # --- 2. 提取配置参数 ---
+        count = int(data.get('number_of_images', 1))
+        aspect_ratio = data.get('aspect_ratio', '1:1')
+        quality = data.get('quality', '2K')
+
+        if not message:
+            return jsonify({"error": "Message (prompt) is required"}), 400
+
+        # 至少要有图片ID或base64图片之一
+        if not image_ids and not images_b64:
+            return jsonify({"error": "At least one image (image_ids or images) is required"}), 400
+
+        print(f"💡 - 收到参数:")
+        print(f"   - Prompt: {message}")
+        print(f"   - Image IDs: {image_ids}")
+        print(f"   - Images (base64 count): {len(images_b64)}")
+        print(f"   - Model: {model_name}")
+
+        # --- 3. 根据模型选择对应的服务 ---
+        _, edit_service = get_image_service_by_model(model_name)
+
+        print(f"🤖 使用模型: {model_name}")
+        result = edit_service(
+            message=message,
+            session_id=session_id,
+            image_ids=image_ids if image_ids else None,
+            image_b64_list=images_b64 if images_b64 else None,
+            count=count,
+            model_name=model_name,
+            aspect_ratio=aspect_ratio,
+            quality=quality
+        )
+
+        # 检查错误
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+
+        # --- 4. 结构适配返回前端 ---
+        res_images = result.get("images", [])
+        image_details = result.get("image_details", [])
+
+        return jsonify({
+            "image": res_images[0] if res_images else None,
+            "images": res_images,
+            "image_details": image_details,
+            "session_id": result.get("session_id"),
+            "status": result.get("status", "success"),
+            "ai_text": result.get("ai_text", "")
+        })
+
+    except Exception as e:
+        print(f"Edit Image Error: {str(e)}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
+
+# ============== 新版统一AI接口（测试阶段）=============
+
+@app.route('/api/ai/generate-image', methods=['POST'])
+def unified_generate_image_endpoint():
+    """
+    [新版] 统一AI生图接口 - 支持多模型路由
+    - Gemini: gemini-3.1-flash-image-preview, gemini-2.5-flash-image
+    - 豆包: doubao-seedream-5-0-260128
+    """
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        # --- 1. 参数提取 ---
+        message = data.get('prompt')
+        session_id = data.get('session_id')
+        model_name = data.get('model', 'gemini-3.1-flash-image-preview')
+
+        # --- 2. 提取配置参数 ---
+        count = int(data.get('number_of_images', 1))
+        aspect_ratio = data.get('aspect_ratio', '1:1')
+        quality = data.get('quality', '2K')
+
+        if not message:
+            return jsonify({"error": "Message (prompt) is required"}), 400
+
+        # --- 3. 根据模型选择对应的服务 ---
+        image_service = get_image_service_by_model(model_name)
+
+        print(f"🤖 [Unified API] 使用模型: {model_name}")
+        result = image_service(
+            message=message,
+            session_id=session_id,
+            count=count,
+            model_name=model_name,
+            aspect_ratio=aspect_ratio,
+            quality=quality
+        )
+
+        # 检查错误
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+
+        # --- 4. 结构适配返回前端 ---
+        res_images = result.get("images", [])
+        image_details = result.get("image_details", [])
+
+        return jsonify({
+            "image": res_images[0] if res_images else None,
+            "images": res_images,
+            "image_details": image_details,
+            "session_id": result.get("session_id"),
+            "status": result.get("status", "success"),
+            "ai_text": result.get("ai_text", ""),
+            "model": model_name  # 返回实际使用的模型
+        })
+
+    except Exception as e:
+        print(f"[Unified API] Error: {str(e)}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
+
+@app.route('/api/ai/edit-image-v2', methods=['POST'])
+def unified_edit_image_endpoint():
+    """
+    [新版] 统一AI图生图/编辑接口 - 支持多模型路由
+    - Gemini: 支持图生图编辑
+    - 豆包: 暂不支持，会返回友好提示
+    """
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        # --- 1. 参数提取 ---
+        message = data.get('prompt')
+        session_id = data.get('session_id')
+        model_name = data.get('model', 'gemini-3.1-flash-image-preview')
+
+        # 多图支持
+        image_ids = data.get('image_ids') or []
+        images_b64 = data.get('images') or []
+
+        # --- 2. 提取配置参数 ---
+        count = int(data.get('number_of_images', 1))
+        aspect_ratio = data.get('aspect_ratio', '1:1')
+        quality = data.get('quality', '2K')
+
+        if not message:
+            return jsonify({"error": "Message (prompt) is required"}), 400
+
+        # 至少要有图片ID或base64图片之一
+        if not image_ids and not images_b64:
+            return jsonify({"error": "At least one image (image_ids or images) is required"}), 400
+
+        print(f"💡 [Unified Edit API] 收到参数:")
+        print(f"   - Prompt: {message}")
+        print(f"   - Image IDs: {image_ids}")
+        print(f"   - Images (base64 count): {len(images_b64)}")
+        print(f"   - Model: {model_name}")
+
+        # --- 3. 根据模型选择对应的服务 ---
+        image_service = get_image_service_by_model(model_name)
+
+        print(f"🤖 [Unified API] 使用模型: {model_name}")
+        result = image_service(
+            message=message,
+            session_id=session_id,
+            image_ids=image_ids if image_ids else None,
+            image_b64_list=images_b64 if images_b64 else None,
+            count=count,
+            model_name=model_name,
+            aspect_ratio=aspect_ratio,
+            quality=quality
+        )
+
+        # 检查错误
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+
+        # --- 4. 结构适配返回前端 ---
+        res_images = result.get("images", [])
+        image_details = result.get("image_details", [])
+
+        return jsonify({
+            "image": res_images[0] if res_images else None,
+            "images": res_images,
+            "image_details": image_details,
+            "session_id": result.get("session_id"),
+            "status": result.get("status", "success"),
+            "ai_text": result.get("ai_text", ""),
+            "model": model_name  # 返回实际使用的模型
+        })
+
+    except Exception as e:
+        print(f"[Unified Edit API] Error: {str(e)}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
+
+@app.route('/api/ai/enhance-prompt', methods=['POST'])
+def enhance_prompt_endpoint():
+    """
+    提示词增强接口
+    - 无图片: 调用 enhance_prompt_text (方法1)
+    - 有图片: 调用 enhance_prompt_with_image (方法2)
+    """
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        # 获取参数
+        prompt = data.get('prompt', '')
+        image_b64 = data.get('image', '')  # 可选，base64 编码的图片
+
+        if not prompt:
+            return jsonify({"error": "Prompt is required"}), 400
+
+        # 根据是否有图片调用不同方法
+        if image_b64:
+            # 方法2: 图文结合增强
+            enhanced_prompt = enhance_prompt_with_image(
+                prompt=prompt,
+                image_input=image_b64
+            )
+            method = "image_enhanced"
+        else:
+            # 方法1: 纯文本增强
+            enhanced_prompt = enhance_prompt_text(prompt=prompt)
+            method = "text_enhanced"
+
+        return jsonify({
+            "original_prompt": prompt,
+            "enhanced_prompt": enhanced_prompt,
+            "method": method,
             "status": "success"
         })
 
     except Exception as e:
-        # 打印详细错误方便本地调试
-        print(f"Server Error: {str(e)}")
+        print(f"Enhance Prompt Error: {str(e)}")
         return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
 
 @app.route('/api/ai/gallery', methods=['GET'])
 def get_gallery():
@@ -314,22 +615,44 @@ def delete_gallery_image(filename):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route('/api/ai/chat-image-test', methods=['POST'])
-def chat_image_test_endpoint():
+@app.route('/api/ai/edit-image-test', methods=['POST'])
+def edit_image_test_endpoint():
+    """
+    编辑图片测试接口 - 不调用AI，返回图库随机图片
+    用于前端测试 edit-image 接口
+    """
     try:
         data = request.json
+        
+        # --- 调试核心：打印前端传来的参数 ---
+        print("\n" + "="*30)
+        print("🚀 [Edit Image Test - Frontend Request Data]")
+        # 使用 json.dumps 让控制台输出带缩进的 JSON，方便观察
+        import json
+        print(json.dumps(data, indent=4, ensure_ascii=False))
+        print("="*30 + "\n")
+
         if not data:
             return jsonify({"error": "No data provided"}), 400
 
-        # --- 1. 参数提取 ---
+        # --- 1. 参数提取 (edit-image 接口格式) ---
         session_id = data.get('session_id') or str(uuid.uuid4())[:8]
         count = int(data.get('number_of_images', 1))
+        
+        prompt = data.get('prompt', '')
 
-        # --- 2. 配置本地路径与域名 ---
-        output_dir = os.path.join('static', 'output')
-        # 💡 这里加上你的后端完整地址
+        # 获取前端传来的图片参数（edit-image 接口格式）
+        image_ids = data.get('image_ids') or []
+        images = data.get('images') or []
+
+        print(f"💡 测试模式 - 收到参数:")
+        print(f"   - Prompt: {prompt}")
+        print(f"   - Image IDs: {image_ids}")
+        print(f"   - Images (base64 count): {len(images)}")
+        # --- 2. 获取环境变量与路径 ---
         load_dotenv(override=True)
-        base_url = os.getenv("BASE_URL")
+        base_url = os.getenv("BASE_URL", "http://127.0.0.1:5000")
+        output_dir = os.path.join('static', 'output')
         
         if not os.path.exists(output_dir):
             return jsonify({"error": "static/output 文件夹不存在"}), 500
@@ -340,36 +663,35 @@ def chat_image_test_endpoint():
         if not all_files:
             return jsonify({"error": "文件夹内没有图片"}), 500
 
-        # 随机抽取
         if len(all_files) >= count:
             selected_files = random.sample(all_files, count)
         else:
             selected_files = [random.choice(all_files) for _ in range(count)]
 
-        # --- 3. 拼接完整的 URL ---
-        test_images = [f"{base_url}/static/output/{f}" for f in selected_files]
+        # --- 3. 构造核心返回数据 ---
+        image_details = []
+        res_images = []
+        
+        for f in selected_files:
+            url = f"{base_url}/static/output/{f}"
+            fake_id = str(uuid.uuid4()) 
+            
+            res_images.append(url)
+            image_details.append({
+                "image_id": fake_id,
+                "url": url
+            })
 
+        # --- 4. 返回结构 ---
         return jsonify({
-            "image": test_images[0], 
-            "images": test_images,
+            "image": res_images[0],
+            "images": res_images,
+            "image_details": image_details,
             "session_id": session_id,
-            "status": "success"
+            "status": "success",
+            "ai_text": f"测试模式：Edit-Image 接口测试，收到 Prompt 为 '{data.get('prompt')}'，Image IDs: {data.get('image_ids', [])}"
         })
 
-    except Exception as e:
-        print(f"Debug Error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/jellyfin/stream_url')
-def api_jellyfin_stream_url():
-    import re
-    itemid_raw = request.args.get('itemid', '')
-    # 支持直接传id或url，自动提取32位itemid
-    m = re.search(r'([a-fA-F0-9]{32})', itemid_raw)
-    itemid = m.group(1) if m else itemid_raw.strip()
-    try:
-        url = get_stream_url(itemid)
-        return jsonify({'url': url})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
