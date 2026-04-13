@@ -425,7 +425,10 @@ def get_gallery():
 
                 # 构建包含 image_id 和 url 的列表
                 result_images = [
-                    {"image_id": row['id'], "url": row['image_url']}
+                    {
+                        "image_id": row['id'],
+                        "url": row['image_url'].encode('utf-8', 'ignore').decode('utf-8')  # 过滤非法字符
+                    }
                     for row in results
                 ]
 
