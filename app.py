@@ -450,7 +450,6 @@ def get_gallery():
             conn.close()
 
     except Exception as e:
-        print("接口报错：", e)  # 只在后端打印
         return jsonify({"error": str(e)}), 500
 
 
