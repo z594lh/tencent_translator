@@ -148,6 +148,7 @@ def save_image_locally(image_bytes):
     
 
 def get_db_connection():
+    load_dotenv(override=True)
     return pymysql.connect(
         host=os.getenv("DB_HOST", "localhost"),
         user=os.getenv("DB_USER", "remote_user"),
