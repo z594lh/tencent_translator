@@ -17,18 +17,17 @@ from geminiAI import (
     generate_ai_response,
     get_translation_prompt,
     generate_ai_img_response,
-    generate_ai_images_service as gemini_generate_images,
+    text_to_image_service as gemini_text_to_image,
     edit_ai_images_service as gemini_edit_images,
 )
 # 导入豆包AI模块
 from doubaoAI import (
-    edit_ai_images_service as doubao_generate_service,
+    text_to_image_service as doubao_text_to_image,
+    edit_ai_images_service as doubao_edit_images,
+   
 )
-# 导入 Kimi 提示词增强模块
-from kimiAI import (
-    enhance_prompt_text,
-    enhance_prompt_with_image,
-)
+# 导入数据库连接
+from geminiAI import get_db_connection
 
 # 确保 log 目录存在，并生成当天的日志文件路径
 LOG_DIR = 'log'
@@ -216,18 +215,53 @@ def get_image_service_by_model(model_name: str):
     # 豆包模型列表
     doubao_models = [
         'doubao-seedream-5-0-260128',
+        'doubao-seedream-4-5-251128',
+        'doubao-seedream-4-0-250828',
     ]
 
     if any(model in model_name.lower() for model in gemini_models):
         return gemini_edit_images
     elif any(model in model_name.lower() for model in doubao_models):
-        return doubao_generate_service
+        return doubao_edit_images
     else:
         # 默认使用 Gemini
         print(f"⚠️ 未知模型 '{model_name}'，默认使用 Gemini")
         return gemini_edit_images
 
 
+def get_text_image_service_by_model(model_name: str):
+    """
+    根据模型名称获取对应的AI文生图服务函数
+
+    参数:
+        model_name (str): 模型名称
+
+    返回:
+        function: 文生图服务函数
+    """
+    # Gemini 模型列表
+    gemini_models = [
+        'gemini-3.1-flash-image-preview',
+        'gemini-2.5-flash-image',
+        'gemini-2.0-flash-exp-image-generation',
+    ]
+
+    # 豆包模型列表
+    doubao_models = [
+        'doubao-seedream-5-0-260128',
+    ]
+
+    if any(model in model_name.lower() for model in gemini_models):
+        return gemini_text_to_image
+    elif any(model in model_name.lower() for model in doubao_models):
+        return doubao_text_to_image
+    else:
+        # 默认使用 Gemini
+        print(f"⚠️ 未知模型 '{model_name}'，默认使用 Gemini")
+        return gemini_text_to_image
+
+
+# ============== 新版统一AI接口文生图=============
 @app.route('/api/ai/chat-image', methods=['POST'])
 def chat_image_endpoint():
     try:
@@ -249,8 +283,11 @@ def chat_image_endpoint():
         if not message:
             return jsonify({"error": "Message (prompt) is required"}), 400
 
-        # --- 3. 调用 Service 方法 ---
-        result = gemini_generate_images(
+        # --- 3. 根据模型选择对应的服务 ---
+        text_image_service = get_text_image_service_by_model(model_name)
+
+        print(f"🤖 [Chat-Image] 使用模型: {model_name}")
+        result = text_image_service(
             message=message,
             session_id=session_id,
             count=count,
@@ -281,145 +318,7 @@ def chat_image_endpoint():
         return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
 
-@app.route('/api/ai/edit-image', methods=['POST'])
-def edit_image_endpoint():
-    """
-    多图编辑/融合接口
-    - 支持传入多张图片ID (image_ids) 或 base64图片列表 (images)
-    - 用于人物融合、场景编辑等需要多图输入的场景
-    """
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
-
-        # --- 1. 参数提取 ---
-        message = data.get('prompt')
-        session_id = data.get('session_id')
-
-        # 多图支持：支持传入图片ID列表或base64列表
-        image_ids = data.get('image_ids') or []  # 数据库中的图片ID列表
-        images_b64 = data.get('images') or []    # base64图片列表
-
-        model_name = data.get('model', 'gemini-3.1-flash-image-preview')
-
-        # --- 2. 提取配置参数 ---
-        count = int(data.get('number_of_images', 1))
-        aspect_ratio = data.get('aspect_ratio', '1:1')
-        quality = data.get('quality', '2K')
-
-        if not message:
-            return jsonify({"error": "Message (prompt) is required"}), 400
-
-        # 至少要有图片ID或base64图片之一
-        if not image_ids and not images_b64:
-            return jsonify({"error": "At least one image (image_ids or images) is required"}), 400
-
-        print(f"💡 - 收到参数:")
-        print(f"   - Prompt: {message}")
-        print(f"   - Image IDs: {image_ids}")
-        print(f"   - Images (base64 count): {len(images_b64)}")
-        print(f"   - Model: {model_name}")
-
-        # --- 3. 根据模型选择对应的服务 ---
-        _, edit_service = get_image_service_by_model(model_name)
-
-        print(f"🤖 使用模型: {model_name}")
-        result = edit_service(
-            message=message,
-            session_id=session_id,
-            image_ids=image_ids if image_ids else None,
-            image_b64_list=images_b64 if images_b64 else None,
-            count=count,
-            model_name=model_name,
-            aspect_ratio=aspect_ratio,
-            quality=quality
-        )
-
-        # 检查错误
-        if "error" in result:
-            return jsonify({"error": result["error"]}), 500
-
-        # --- 4. 结构适配返回前端 ---
-        res_images = result.get("images", [])
-        image_details = result.get("image_details", [])
-
-        return jsonify({
-            "image": res_images[0] if res_images else None,
-            "images": res_images,
-            "image_details": image_details,
-            "session_id": result.get("session_id"),
-            "status": result.get("status", "success"),
-            "ai_text": result.get("ai_text", "")
-        })
-
-    except Exception as e:
-        print(f"Edit Image Error: {str(e)}")
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
-
-
-# ============== 新版统一AI接口（测试阶段）=============
-
-@app.route('/api/ai/generate-image', methods=['POST'])
-def unified_generate_image_endpoint():
-    """
-    [新版] 统一AI生图接口 - 支持多模型路由
-    - Gemini: gemini-3.1-flash-image-preview, gemini-2.5-flash-image
-    - 豆包: doubao-seedream-5-0-260128
-    """
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
-
-        # --- 1. 参数提取 ---
-        message = data.get('prompt')
-        session_id = data.get('session_id')
-        model_name = data.get('model', 'gemini-3.1-flash-image-preview')
-
-        # --- 2. 提取配置参数 ---
-        count = int(data.get('number_of_images', 1))
-        aspect_ratio = data.get('aspect_ratio', '1:1')
-        quality = data.get('quality', '2K')
-
-        if not message:
-            return jsonify({"error": "Message (prompt) is required"}), 400
-
-        # --- 3. 根据模型选择对应的服务 ---
-        image_service = get_image_service_by_model(model_name)
-
-        print(f"🤖 [Unified API] 使用模型: {model_name}")
-        result = image_service(
-            message=message,
-            session_id=session_id,
-            count=count,
-            model_name=model_name,
-            aspect_ratio=aspect_ratio,
-            quality=quality
-        )
-
-        # 检查错误
-        if "error" in result:
-            return jsonify({"error": result["error"]}), 500
-
-        # --- 4. 结构适配返回前端 ---
-        res_images = result.get("images", [])
-        image_details = result.get("image_details", [])
-
-        return jsonify({
-            "image": res_images[0] if res_images else None,
-            "images": res_images,
-            "image_details": image_details,
-            "session_id": result.get("session_id"),
-            "status": result.get("status", "success"),
-            "ai_text": result.get("ai_text", ""),
-            "model": model_name  # 返回实际使用的模型
-        })
-
-    except Exception as e:
-        print(f"[Unified API] Error: {str(e)}")
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
-
+# ============== 新版统一AI接口图生图=============
 
 @app.route('/api/ai/edit-image-v2', methods=['POST'])
 def unified_edit_image_endpoint():
@@ -497,118 +396,82 @@ def unified_edit_image_endpoint():
         print(f"[Unified Edit API] Error: {str(e)}")
         return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
-
-@app.route('/api/ai/enhance-prompt', methods=['POST'])
-def enhance_prompt_endpoint():
-    """
-    提示词增强接口
-    - 无图片: 调用 enhance_prompt_text (方法1)
-    - 有图片: 调用 enhance_prompt_with_image (方法2)
-    """
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
-
-        # 获取参数
-        prompt = data.get('prompt', '')
-        image_b64 = data.get('image', '')  # 可选，base64 编码的图片
-
-        if not prompt:
-            return jsonify({"error": "Prompt is required"}), 400
-
-        # 根据是否有图片调用不同方法
-        if image_b64:
-            # 方法2: 图文结合增强
-            enhanced_prompt = enhance_prompt_with_image(
-                prompt=prompt,
-                image_input=image_b64
-            )
-            method = "image_enhanced"
-        else:
-            # 方法1: 纯文本增强
-            enhanced_prompt = enhance_prompt_text(prompt=prompt)
-            method = "text_enhanced"
-
-        return jsonify({
-            "original_prompt": prompt,
-            "enhanced_prompt": enhanced_prompt,
-            "method": method,
-            "status": "success"
-        })
-
-    except Exception as e:
-        print(f"Enhance Prompt Error: {str(e)}")
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
-
-
 @app.route('/api/ai/gallery', methods=['GET'])
 def get_gallery():
     try:
         # 1. 获取分页参数
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
-        
-        output_dir = os.path.join('static', 'output')
-        load_dotenv(override=True)
-        base_url = os.getenv("BASE_URL")
 
-        if not os.path.exists(output_dir):
-            return jsonify({"images": [], "total": 0})
+        # 2. 从数据库查询图片，按 created_at 倒序排列
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                # 查询总数
+                cursor.execute("SELECT COUNT(*) as total FROM ai_images")
+                total_count = cursor.fetchone()['total']
 
-        # 2. 获取文件列表并按修改时间倒序 (新图在前)
-        files = []
-        for f in os.listdir(output_dir):
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                file_path = os.path.join(output_dir, f)
-                files.append({
-                    "name": f,
-                    "mtime": os.path.getmtime(file_path)
+                # 分页查询图片，按 created_at 倒序
+                offset = (page - 1) * page_size
+                sql = """
+                    SELECT id, image_url FROM ai_images
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                cursor.execute(sql, (page_size, offset))
+                results = cursor.fetchall()
+
+                # 构建包含 image_id 和 url 的列表
+                result_images = [
+                    {"image_id": row['id'], "url": row['image_url']}
+                    for row in results
+                ]
+
+                return jsonify({
+                    "status": "success",
+                    "images": result_images,
+                    "total": total_count,
+                    "page": page,
+                    "page_size": page_size,
+                    "has_more": (offset + len(result_images)) < total_count
                 })
-        
-        # 按 mtime 倒序排列
-        files.sort(key=lambda x: x['mtime'], reverse=True)
-
-        # 3. 执行分页截取
-        total_count = len(files)
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        
-        paged_files = files[start_idx:end_idx]
-
-        # 4. 构造完整 URL
-        result_images = [f"{base_url}/static/output/{f['name']}" for f in paged_files]
-
-        return jsonify({
-            "status": "success",
-            "images": result_images,
-            "total": total_count,
-            "page": page,
-            "page_size": page_size,
-            "has_more": end_idx < total_count
-        })
+        finally:
+            conn.close()
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/ai/gallery/<path:filename>', methods=['DELETE']) # 使用 <path:filename> 更稳妥
-def delete_gallery_image(filename):
+@app.route('/api/ai/gallery/<image_id>', methods=['DELETE'])
+def delete_gallery_image(image_id):
     try:
-        # 1. 提取纯文件名，防止路径注入
-        safe_filename = os.path.basename(filename)
-        # 2. 拼接绝对路径
-        file_path = os.path.join(OUTPUT_DIR, safe_filename)
-        
-        # 打印一下，看看后台显示的路径对不对
-        print(f"尝试删除文件: {file_path}")
+        # 1. 从数据库查询图片信息
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                # 查询图片的本地路径
+                cursor.execute("SELECT local_path FROM ai_images WHERE id = %s", (image_id,))
+                result = cursor.fetchone()
 
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return jsonify({"status": "success", "message": "删除成功"}), 200
-        else:
-            print(f"错误: 文件不存在于 {file_path}")
-            return jsonify({"status": "error", "message": "找不到该文件: " + file_path}), 404
+                if not result:
+                    return jsonify({"status": "error", "message": "图片ID不存在"}), 404
+
+                local_path = result['local_path']
+
+                # 2. 删除本地文件
+                if local_path and os.path.exists(local_path):
+                    os.remove(local_path)
+                    print(f"✅ 已删除文件: {local_path}")
+                else:
+                    print(f"⚠️ 文件不存在或路径为空: {local_path}")
+
+                # 3. 从数据库删除记录
+                cursor.execute("DELETE FROM ai_images WHERE id = %s", (image_id,))
+                conn.commit()
+
+                return jsonify({"status": "success", "message": "删除成功"}), 200
+        finally:
+            conn.close()
 
     except Exception as e:
         print(f"删除异常: {str(e)}")

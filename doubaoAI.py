@@ -47,97 +47,13 @@ def save_image_from_url(image_url: str, output_dir: str = "static/output") -> tu
         base_url = os.getenv("BASE_URL", "http://127.0.0.1:5000")
         url = f"{base_url.rstrip('/')}/static/output/{filename}"
 
-        return url, local_path.replace("\\\\", "/")
+        return url, local_path.replace("\\", "/")
 
     except Exception as e:
         print(f"❌ 保存图片失败: {e}")
         return None, None
 
 
-def save_image_to_temp(image_b64_or_url: str) -> str:
-    """将图片(base64或URL)保存为临时文件，返回本地路径"""
-    temp_dir = os.path.join(tempfile.gettempdir(), "doubao_uploads")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    temp_file = os.path.join(temp_dir, f"{uuid.uuid4()}.png")
-
-    try:
-        if image_b64_or_url.startswith("http"):
-            response = requests.get(image_b64_or_url, timeout=30)
-            response.raise_for_status()
-            with open(temp_file, "wb") as f:
-                f.write(response.content)
-        elif image_b64_or_url.startswith("data:image"):
-            base64_data = image_b64_or_url.split(",")[1]
-            image_bytes = base64.b64decode(base64_data)
-            with open(temp_file, "wb") as f:
-                f.write(image_bytes)
-        else:
-            image_bytes = base64.b64decode(image_b64_or_url)
-            with open(temp_file, "wb") as f:
-                f.write(image_bytes)
-
-        return temp_file
-    except Exception as e:
-        print(f"❌ 保存临时图片失败: {e}")
-        return None
-
-
-def upload_image_to_doubao(image_path: str) -> str:
-    """使用 REST API 上传图片到豆包，获取URL"""
-    try:
-        load_dotenv(override=True)
-        api_key = os.environ.get("ARK_API_KEY")
-        if not api_key:
-            raise ValueError("未找到 ARK_API_KEY")
-
-        url = "https://ark.cn-beijing.volces.com/api/v3/files"
-        headers = {
-            "Authorization": f"Bearer {api_key}"
-        }
-
-        with open(image_path, "rb") as f:
-            files = {
-                "file": (os.path.basename(image_path), f, "image/png"),
-                "purpose": (None, "user_data")  # 必须用 user_data
-            }
-            response = requests.post(url, headers=headers, files=files, timeout=60)
-
-        if response.status_code == 200:
-            result = response.json()
-            # 提取上传后的文件URL
-            if "url" in result:
-                return result["url"]
-            elif "data" in result and "url" in result["data"]:
-                return result["data"]["url"]
-            else:
-                print(f"⚠️ 上传成功但未找到URL: {result}")
-                return None
-        else:
-            print(f"❌ 上传失败: {response.status_code} - {response.text}")
-            return None
-
-    except Exception as e:
-        print(f"❌ 上传图片到豆包失败: {e}")
-        return None
-
-
-def get_image_url_from_input(img_data: str, temp_files: list) -> Optional[str]:
-    """处理各种图片输入格式，返回可上传的URL"""
-    if not img_data:
-        return None
-
-    if img_data.startswith("http"):
-        return img_data
-
-    if img_data.startswith("data:image") or len(img_data) > 1000:
-        temp_path = save_image_to_temp(img_data)
-        if temp_path:
-            temp_files.append(temp_path)
-            image_url = upload_image_to_doubao(temp_path)
-            return image_url
-
-    return None
 
 
 def to_doubao_base64(image_input):
@@ -174,6 +90,141 @@ def to_doubao_base64(image_input):
     # ----------------------
     return f"data:image/png;base64,{image_input}"
 
+# ============== 核心服务：文生图接口 ==============
+
+def text_to_image_service(
+    message: str,
+    session_id: str = None,
+    count: int = 1,
+    model_name: str = "doubao-seedream-5-0-260128",
+    aspect_ratio: str = "1:1",
+    quality: str = "1K"
+) -> dict:
+    """
+    文生图服务 - 使用豆包模型根据提示词生成图片
+    支持一次调用生成多张图片（使用sequential_image_generation）
+
+    参数:
+        message (str): 提示词，描述要生成的图片内容
+        session_id (str): 会话ID，用于保持上下文，不传则自动生成
+        count (int): 生成图片数量，默认为1
+        model_name (str): 使用的模型名称，默认"doubao-seedream-5-0-260128"
+        aspect_ratio (str): 宽高比（保留参数，豆包API使用size参数控制）
+        quality (str): 分辨率
+
+    返回:
+        dict: 包含生成的图片URL列表、详情、session_id等信息
+        {
+            "images": [url1, url2, ...],
+            "image_details": [{"image_id": ..., "url": ...}, ...],
+            "session_id": session_id,
+            "status": "success" | "no_image" | "error",
+            "ai_text": ""
+        }
+    """
+    load_dotenv(override=True)
+    client = get_doubao_client()
+
+    # 初始化 session_id
+    if not session_id:
+        session_id = str(uuid.uuid4())[:8]
+
+    try:
+        # 构建请求参数
+        # 多图生成时，在提示词中添加数量说明
+        final_prompt = message
+        if count > 1:
+            if f"生成{count}张" not in message and f"生成 {count} 张" not in message:
+                final_prompt = f"生成{count}张图：{message}"
+
+        request_params = {
+            "model": model_name,
+            "prompt": final_prompt,
+            "size": quality,
+            "response_format": "url",
+            "watermark": False
+        }
+
+        # 组图模式配置（count > 1时启用）
+        if count > 1:
+            request_params["sequential_image_generation"] = "auto"
+            try:
+                from volcenginesdkarkruntime.types.images.images import SequentialImageGenerationOptions
+                request_params["sequential_image_generation_options"] = SequentialImageGenerationOptions(max_images=count)
+                print(f"🎨 启用组图模式，计划生成 {count} 张图片")
+            except ImportError:
+                print("⚠️ 无法导入 SequentialImageGenerationOptions，使用字典格式")
+                request_params["sequential_image_generation_options"] = {"max_images": count}
+
+        print(f"🚀 调用豆包文生图API: model={model_name}, size={quality}, count={count}")
+        response = client.images.generate(**request_params)
+        print(f"DEBUG: Response -> {response}")
+
+        # 处理返回结果
+        result_data = []
+
+        if response.data:
+            print(f"📦 返回 {len(response.data)} 张图片")
+            for i, image in enumerate(response.data):
+                new_img_id = str(uuid.uuid4())
+                image_info = {
+                    "image_id": new_img_id,
+                    "url": None
+                }
+
+                image_url = image.url if hasattr(image, 'url') else None
+
+                if image_url:
+                    local_url, local_path = save_image_from_url(image_url)
+                    if local_url:
+                        image_info["url"] = local_url
+                    else:
+                        image_info["url"] = image_url
+
+                result_data.append(image_info)
+                print(f"✅ 图片 {i+1} 生成成功: {image_info.get('url', 'N/A')[:60]}...")
+
+                # 保存到数据库
+                if local_path:
+                    history_record = {
+                        "prompt": message,
+                        "model": model_name,
+                        "mode": "text2image",
+                        "quality": quality,
+                        "index": i + 1
+                    }
+                    save_image_to_db(
+                        image_id=new_img_id,
+                        session_id=session_id,
+                        url=image_info["url"],
+                        local_path=local_path,
+                        prompt=message,
+                        history=history_record,
+                        model=model_name
+                    )
+
+        return {
+            "images": [item.get("url") for item in result_data if item.get("url")],
+            "image_details": result_data,
+            "session_id": session_id,
+            "status": "success" if result_data else "no_image",
+            "ai_text": ""
+        }
+
+    except Exception as e:
+        print(f"❌ 豆包文生图错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "status": "error",
+            "images": [],
+            "image_details": [],
+            "session_id": session_id,
+            "ai_text": ""
+        }
+
+
 # ============== 核心服务：统一生图接口 ==============
 
 def edit_ai_images_service(
@@ -184,7 +235,7 @@ def edit_ai_images_service(
     count: int = 1,
     model_name: str = "doubao-seedream-5-0-260128",
     aspect_ratio: str = "1:1",
-    quality: str = "2K",
+    quality: str = "1K",
     **kwargs
 ) -> dict:
     """
@@ -210,8 +261,13 @@ def edit_ai_images_service(
             from geminiAI import get_image_relative_path_by_id
             for img_id in image_ids:
                 local_path = get_image_relative_path_by_id(img_id)
+                if not local_path:
+                    print(f"⚠️ 图片 {img_id} 在数据库中不存在")
+                    continue
+                if not os.path.exists(local_path):
+                    print(f"⚠️ 图片 {img_id} 的文件不存在: {local_path}")
+                    continue
                 img_data_db = to_doubao_base64(local_path)
-                # print(f": {img_data}")
                 input_images.append(img_data_db)
 
         if image_b64_list:
@@ -240,9 +296,6 @@ def edit_ai_images_service(
         print(f"🎨 生图模式: {mode} | 输入图片: {len(input_images)}张 | 输出: {count}张")
 
         # ===== 3. 构建请求参数 =====
-        size_map = {"512": "512", "1K": "1K", "2K": "2K", "4K": "4K"}
-        size = size_map.get(quality, quality)
-
         # 多图生成时，在提示词中添加数量说明
         final_prompt = message
         if is_multi_output:
@@ -252,8 +305,7 @@ def edit_ai_images_service(
         request_params = {
             "model": model_name,
             "prompt": final_prompt,
-            "size": size,
-            "output_format": kwargs.get('output_format', 'png'),
+            "size": quality,
             "response_format": "url",
             "watermark": kwargs.get('watermark', False)
         }
@@ -279,7 +331,7 @@ def edit_ai_images_service(
         final_session_id = session_id or str(uuid.uuid4())[:8]
 
         # ===== 4. 调用豆包API =====
-        print(f"🚀 调用豆包API: model={model_name}, size={size}")
+        print(f"🚀 调用豆包API: model={model_name}, size={quality}")
         response = client.images.generate(**request_params)
         print(f"DEBUG: Response -> {response}")
 
@@ -425,38 +477,6 @@ def save_image_to_db(image_id, session_id, url, local_path, prompt, history, mod
     finally:
         conn.close()
 
-
-def get_image_relative_path_by_id(image_id):
-    """根据 ID 从数据库获取图片的本地存储相对路径"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            sql = "SELECT local_path FROM ai_images WHERE id = %s"
-            cursor.execute(sql, (image_id,))
-            result = cursor.fetchone()
-            if result:
-                return result['local_path']
-            return None
-    finally:
-        conn.close()
-
-
-# ============== 快速调用函数 ==============
-
-def quick_generate(prompt: str, image_url: str = None, count: int = 1, size: str = "2K") -> Optional[str]:
-    """快速生成图片，返回URL"""
-    image_b64_list = [image_url] if image_url else None
-
-    result = edit_ai_images_service(
-        message=prompt,
-        image_b64_list=image_b64_list,
-        count=count,
-        quality=size
-    )
-
-    if result.get("status") == "success" and result.get("images"):
-        return result["images"][0]
-    return None
 
 
 # ============== 测试代码 ==============

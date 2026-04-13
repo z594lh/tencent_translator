@@ -144,7 +144,7 @@ def save_image_locally(image_bytes):
     except:
         url = f"/static/output/{filename}"
         
-    return url, relative_path
+    return url, relative_path.replace("\\", "/")
     
 
 def get_db_connection():
@@ -388,7 +388,7 @@ def edit_ai_images_service(
         return {"error": str(e)}
 
 
-def generate_ai_images_service(
+def text_to_image_service(
     message: str,
     session_id: str = None,
     count: int = 1,
@@ -532,9 +532,9 @@ if __name__ == "__main__":
 
         # 调用重构后的服务函数
         # 注意：这里我们手动指定 model_name 为 gemini-2.5-flash-image
-        result = generate_ai_images_service(
-            message=u_input, 
-            session_id=s_id, 
+        result = text_to_image_service(
+            message=u_input,
+            session_id=s_id,
             image_id=target_img_id,
             model_name="gemini-2.5-flash-image"
         )
