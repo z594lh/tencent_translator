@@ -407,19 +407,15 @@ def unified_edit_image_endpoint():
 @app.route('/api/ai/gallery', methods=['GET'])
 def get_gallery():
     try:
-        # 1. 获取分页参数
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
 
-        # 2. 从数据库查询图片，按 created_at 倒序排列
         conn = get_db_connection()
         try:
             with conn.cursor() as cursor:
-                # 查询总数
                 cursor.execute("SELECT COUNT(*) as total FROM ai_images")
                 total_count = cursor.fetchone()['total']
 
-                # 分页查询图片，按 created_at 倒序
                 offset = (page - 1) * page_size
                 sql = """
                     SELECT id, image_url FROM ai_images
@@ -429,11 +425,10 @@ def get_gallery():
                 cursor.execute(sql, (page_size, offset))
                 results = cursor.fetchall()
 
-                # 构建包含 image_id 和 url 的列表
                 result_images = [
                     {
                         "image_id": row['id'],
-                        "url": row['image_url'].encode('utf-8', 'ignore').decode('utf-8')  # 过滤非法字符
+                        "url": str(row['image_url']).encode("utf-8", "ignore").decode("utf-8")
                     }
                     for row in results
                 ]
@@ -450,7 +445,7 @@ def get_gallery():
             conn.close()
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Server error"}), 500
 
 
 @app.route('/api/ai/gallery/<image_id>', methods=['DELETE'])
