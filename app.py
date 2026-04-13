@@ -249,6 +249,8 @@ def get_text_image_service_by_model(model_name: str):
     # 豆包模型列表
     doubao_models = [
         'doubao-seedream-5-0-260128',
+        'doubao-seedream-4-5-251128',
+        'doubao-seedream-4-0-250828',
     ]
 
     if any(model in model_name.lower() for model in gemini_models):
