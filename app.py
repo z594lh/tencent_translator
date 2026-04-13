@@ -445,6 +445,7 @@ def get_gallery():
             conn.close()
 
     except Exception as e:
+        print("真实业务错误：", str(e))
         return jsonify({"error": "Server error"}), 500
 
 
