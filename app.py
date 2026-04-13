@@ -43,7 +43,13 @@ OUTPUT_DIR = os.path.join(app.static_folder, 'output')
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
-
+try:
+    # Flask 2.0+ / 3.0+
+    app.json.ensure_ascii = False
+except AttributeError:
+    # Flask 1.x 老版本
+    app.config['JSON_AS_ASCII'] = False
+    
 
 @app.before_request
 def log_request():
