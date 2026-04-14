@@ -11,8 +11,8 @@ import os
 import uuid
 
 
-# 获取当前脚本所在目录
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 获取项目根目录（当前文件在 services/ 目录下，需要往上退一级）
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
 def read_config():

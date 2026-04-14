@@ -158,20 +158,10 @@ def get_db_connection():
         cursorclass=pymysql.cursors.DictCursor
     )
 
-def ensure_session_exists(cursor, session_id):
-    """确保父表 ai_sessions 中存在该 ID"""
-    check_sql = "SELECT id FROM ai_sessions WHERE id = %s"
-    cursor.execute(check_sql, (session_id,))
-    if not cursor.fetchone():
-        insert_session_sql = "INSERT INTO ai_sessions (id) VALUES (%s)"
-        cursor.execute(insert_session_sql, (session_id,))
-
-def save_image_to_db(image_id, session_id, url, local_path, prompt, history):
+def save_image_to_db(image_id, url, local_path, prompt, history, user_id=None):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            ensure_session_exists(cursor, session_id)
-            
             # 序列化历史记录 (保持你原来的强化版逻辑)
             history_data = []
             for h in history:
@@ -182,14 +172,14 @@ def save_image_to_db(image_id, session_id, url, local_path, prompt, history):
                 else:
                     try:
                         history_data.append(json.loads(json.dumps(h, default=lambda o: o.__dict__)))
-                    except: continue 
-            
+                    except: continue
+
             history_json = json.dumps(history_data)
-            
-            # 增加 local_path 字段的插入
-            sql = """INSERT INTO ai_images (id, session_id, image_url, local_path, prompt, history_snapshot) 
+
+            # 增加 user_id 和 local_path 字段的插入
+            sql = """INSERT INTO ai_images (id, user_id, image_url, local_path, prompt, history_snapshot)
                      VALUES (%s, %s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (image_id, session_id, url, local_path, prompt, history_json))
+            cursor.execute(sql, (image_id, user_id, url, local_path, prompt, history_json))
         conn.commit()
         print(f"📖 数据库记录已同步: Image ID {image_id}")
     except Exception as e:
@@ -215,13 +205,13 @@ def get_image_relative_path_by_id(image_id):
 
 def edit_ai_images_service(
     message: str,
-    session_id: str = None,
     image_ids: list = None,
     image_b64_list: list = None,
     count: int = 1,
     model_name: str = "gemini-3.1-flash-image-preview",
     aspect_ratio: str = "1:1",
-    quality: str = "2K"
+    quality: str = "2K",
+    user_id: int = None
 ) -> dict:
     """
     使用 Gemini 模型基于多张输入图片进行编辑/修改，生成新图片。
@@ -229,7 +219,6 @@ def edit_ai_images_service(
 
     参数:
         message (str): 提示词，描述如何修改/组合图片
-        session_id (str): 会话ID，用于保持上下文
         image_ids (list): 数据库中的图片ID列表，如 ["img-001", "img-002"]
         image_b64_list (list): base64编码的图片列表，如 ["base64str1", "base64str2"]
         count (int): 生成图片数量
@@ -238,15 +227,11 @@ def edit_ai_images_service(
         quality (str): 分辨率，可选 "512", "1K", "2K", "4K"
 
     返回:
-        dict: 包含生成的图片URL、session_id等信息
+        dict: 包含生成的图片URL等信息
     """
     load_dotenv(override=True)
     setup_proxy_from_env()
     client = genai.Client()
-
-    # --- 1. 初始化 session_id ---
-    if not session_id:
-        session_id = str(uuid.uuid4())[:8]
 
     # --- 2. 收集所有输入图片作为 Part ---
     image_parts = []
@@ -345,7 +330,7 @@ def edit_ai_images_service(
                         url, local_rel_path = save_image_locally(img_data)
 
                         # 存入数据库（包含历史记录）
-                        save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [history_record])
+                        save_image_to_db(new_img_id, url, local_rel_path, message, [history_record], user_id=user_id)
 
                         result_data.append({
                             "image_id": new_img_id,
@@ -365,7 +350,7 @@ def edit_ai_images_service(
                     url, local_rel_path = save_image_locally(img_data)
 
                     # 存入数据库
-                    save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [])
+                    save_image_to_db(new_img_id, url, local_rel_path, message, [], user_id=user_id)
 
                     result_data.append({
                         "image_id": new_img_id,
@@ -379,7 +364,6 @@ def edit_ai_images_service(
         return {
             "images": [item['url'] for item in result_data],
             "image_details": result_data,
-            "session_id": session_id,
             "status": "success" if result_data else "no_image",
             "ai_text": response.text if not image_found and hasattr(response, 'text') else ""
         }
@@ -391,11 +375,11 @@ def edit_ai_images_service(
 
 def text_to_image_service(
     message: str,
-    session_id: str = None,
     count: int = 1,
     model_name: str = "gemini-3.1-flash-image-preview",
     aspect_ratio: str = "1:1",
-    quality: str = "512"
+    quality: str = "512",
+    user_id: int = None
 ) -> dict:
     """
     文生图服务 - 使用 Gemini 模型根据提示词生成图片
@@ -403,10 +387,6 @@ def text_to_image_service(
     load_dotenv(override=True)
     setup_proxy_from_env()
     client = genai.Client()
-
-    # 初始化 session_id
-    if not session_id:
-        session_id = str(uuid.uuid4())[:8]
 
     # 构造配置
     generation_config = types.GenerateContentConfig(
@@ -464,7 +444,7 @@ def text_to_image_service(
                         url, local_rel_path = save_image_locally(img_data)
 
                         # 存入数据库
-                        save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [history_record])
+                        save_image_to_db(new_img_id, url, local_rel_path, message, [history_record], user_id=user_id)
 
                         result_data.append({
                             "image_id": new_img_id,
@@ -484,7 +464,7 @@ def text_to_image_service(
                     url, local_rel_path = save_image_locally(img_data)
 
                     # 存入数据库
-                    save_image_to_db(new_img_id, session_id, url, local_rel_path, message, [history_record])
+                    save_image_to_db(new_img_id, url, local_rel_path, message, [history_record], user_id=user_id)
 
                     result_data.append({
                         "image_id": new_img_id,
@@ -498,7 +478,6 @@ def text_to_image_service(
         return {
             "images": [item['url'] for item in result_data],
             "image_details": result_data,
-            "session_id": session_id,
             "status": "success" if result_data else "no_image",
             "ai_text": response.text if not result_data else ""
         }
@@ -524,28 +503,21 @@ if __name__ == "__main__":
         print("1. 全新生成 (直接回车)")
         print("2. 基于某张图进行修改 (输入该图片的 Image ID)")
         target_img_id = input("请输入 Image ID: ").strip()
-        if target_img_id == "": 
+        if target_img_id == "":
             target_img_id = None
-
-        s_id = input("请输入 Session ID (可选，不填自动生成): ").strip()
-        if s_id == "": 
-            s_id = None
 
         # 调用重构后的服务函数
         # 注意：这里我们手动指定 model_name 为 gemini-2.5-flash-image
         result = text_to_image_service(
             message=u_input,
-            session_id=s_id,
-            image_id=target_img_id,
             model_name="gemini-2.5-flash-image"
         )
-        
+
         if "error" in result:
             print("\n❌ 运行失败:", result["error"])
         else:
             print("\n✅ 运行成功！")
-            print(f"会话 ID (Session ID): {result['session_id']}")
-            
+
             # 打印生成的图片及其 ID
             for item in result.get('image_details', []):
                 print(f"---")

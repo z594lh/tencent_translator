@@ -94,11 +94,11 @@ def to_doubao_base64(image_input):
 
 def text_to_image_service(
     message: str,
-    session_id: str = None,
     count: int = 1,
     model_name: str = "doubao-seedream-5-0-260128",
     aspect_ratio: str = "1:1",
-    quality: str = "1K"
+    quality: str = "1K",
+    user_id: int = None
 ) -> dict:
     """
     文生图服务 - 使用豆包模型根据提示词生成图片
@@ -106,28 +106,22 @@ def text_to_image_service(
 
     参数:
         message (str): 提示词，描述要生成的图片内容
-        session_id (str): 会话ID，用于保持上下文，不传则自动生成
         count (int): 生成图片数量，默认为1
         model_name (str): 使用的模型名称，默认"doubao-seedream-5-0-260128"
         aspect_ratio (str): 宽高比（保留参数，豆包API使用size参数控制）
         quality (str): 分辨率
 
     返回:
-        dict: 包含生成的图片URL列表、详情、session_id等信息
+        dict: 包含生成的图片URL列表、详情等信息
         {
             "images": [url1, url2, ...],
             "image_details": [{"image_id": ..., "url": ...}, ...],
-            "session_id": session_id,
             "status": "success" | "no_image" | "error",
             "ai_text": ""
         }
     """
     load_dotenv(override=True)
     client = get_doubao_client()
-
-    # 初始化 session_id
-    if not session_id:
-        session_id = str(uuid.uuid4())[:8]
 
     try:
         # 构建请求参数
@@ -195,18 +189,17 @@ def text_to_image_service(
                     }
                     save_image_to_db(
                         image_id=new_img_id,
-                        session_id=session_id,
                         url=image_info["url"],
                         local_path=local_path,
                         prompt=message,
                         history=history_record,
-                        model=model_name
+                        model=model_name,
+                        user_id=user_id
                     )
 
         return {
             "images": [item.get("url") for item in result_data if item.get("url")],
             "image_details": result_data,
-            "session_id": session_id,
             "status": "success" if result_data else "no_image",
             "ai_text": ""
         }
@@ -220,7 +213,6 @@ def text_to_image_service(
             "status": "error",
             "images": [],
             "image_details": [],
-            "session_id": session_id,
             "ai_text": ""
         }
 
@@ -229,14 +221,13 @@ def text_to_image_service(
 
 def edit_ai_images_service(
     message: str,
-    session_id: str = None,
     image_ids: list = None,
     image_b64_list: list = None,
     count: int = 1,
     model_name: str = "doubao-seedream-5-0-260128",
     aspect_ratio: str = "1:1",
     quality: str = "1K",
-    **kwargs
+    user_id: int = None
 ) -> dict:
     """
     豆包AI统一生图服务 - 根据参数自动判断生图模式
@@ -258,7 +249,7 @@ def edit_ai_images_service(
     try:
         # ===== 1. 收集所有输入图片 =====
         if image_ids:
-            from geminiAI import get_image_relative_path_by_id
+            from services.geminiAi import get_image_relative_path_by_id
             for img_id in image_ids:
                 local_path = get_image_relative_path_by_id(img_id)
                 if not local_path:
@@ -307,7 +298,7 @@ def edit_ai_images_service(
             "prompt": final_prompt,
             "size": quality,
             "response_format": "url",
-            "watermark": kwargs.get('watermark', False)
+            "watermark": False
         }
 
         # 添加图片参数
@@ -327,8 +318,6 @@ def edit_ai_images_service(
             except ImportError:
                 print("⚠️ 无法导入 SequentialImageGenerationOptions")
                 request_params["sequential_image_generation_options"] = {"max_images": count}
-
-        final_session_id = session_id or str(uuid.uuid4())[:8]
 
         # ===== 4. 调用豆包API =====
         print(f"🚀 调用豆包API: model={model_name}, size={quality}")
@@ -381,18 +370,17 @@ def edit_ai_images_service(
                     }
                     save_image_to_db(
                         image_id=new_img_id,
-                        session_id=final_session_id,
                         url=image_info["url"],
                         local_path=image_info["local_path"],
                         prompt=message,
                         history=history_record,
-                        model=model_name
+                        model=model_name,
+                        user_id=user_id
                     )
 
         return {
             "images": [item.get("url") for item in result_data if item.get("url")],
             "image_details": result_data,
-            "session_id": final_session_id,
             "status": "success" if result_data else "error",
             "ai_text": "",
             "mode": mode,
@@ -433,22 +421,11 @@ def get_db_connection():
     )
 
 
-def ensure_session_exists(cursor, session_id):
-    """确保父表 ai_sessions 中存在该 ID"""
-    check_sql = "SELECT id FROM ai_sessions WHERE id = %s"
-    cursor.execute(check_sql, (session_id,))
-    if not cursor.fetchone():
-        insert_session_sql = "INSERT INTO ai_sessions (id) VALUES (%s)"
-        cursor.execute(insert_session_sql, (session_id,))
-
-
-def save_image_to_db(image_id, session_id, url, local_path, prompt, history, model="doubao-seedream-5-0-260128"):
+def save_image_to_db(image_id, url, local_path, prompt, history, model="doubao-seedream-5-0-260128", user_id=None):
     """保存图片信息到数据库"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            ensure_session_exists(cursor, session_id)
-
             history_data = []
             if isinstance(history, list):
                 for h in history:
@@ -466,9 +443,9 @@ def save_image_to_db(image_id, session_id, url, local_path, prompt, history, mod
 
             history_json = json.dumps(history_data)
 
-            sql = """INSERT INTO ai_images (id, session_id, image_url, local_path, prompt, history_snapshot)
+            sql = """INSERT INTO ai_images (id, user_id, image_url, local_path, prompt, history_snapshot)
                      VALUES (%s, %s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (image_id, session_id, url, local_path, prompt, history_json))
+            cursor.execute(sql, (image_id, user_id, url, local_path, prompt, history_json))
         conn.commit()
         print(f"📖 数据库记录已同步: Image ID {image_id}")
     except Exception as e:
