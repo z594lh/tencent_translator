@@ -13,9 +13,10 @@ config.ini
 .env
 
 # 忽略日志文件
-/log/
+log/
 
 videos/
 
 # 忽略图库生成的输出图片
 static/output/*
+static/invoices/*

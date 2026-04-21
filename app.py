@@ -11,6 +11,7 @@ from blueprints.pages import pages_bp
 from blueprints.user_auth import auth_bp
 from blueprints.translation import translation_bp
 from blueprints.ai_image import ai_image_bp
+from blueprints.expenses import expenses_bp
 
 
 def getConfigUrl():
@@ -85,6 +86,9 @@ app.register_blueprint(ai_image_bp)
 
 # 注册视频相关路由
 app.register_blueprint(video_bp)
+
+# 注册记账路由
+app.register_blueprint(expenses_bp)
 
 
 if __name__ == '__main__':
