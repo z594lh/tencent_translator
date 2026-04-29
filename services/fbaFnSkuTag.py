@@ -12,7 +12,6 @@ OUTPUT_DIR = "static/fbatag"
 # --- 字体注册 ---
 if os.path.exists(FONT_PATH):
     pdfmetrics.registerFont(TTFont('SimHei', FONT_PATH))
-    print(f"✅ 字体加载成功: {FONT_PATH}")
 else:
     print(f"❌ 警告：未找到字体文件 {FONT_PATH}，中文将无法显示！")
 
