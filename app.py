@@ -13,6 +13,8 @@ from blueprints.translation import translation_bp
 from blueprints.ai_image import ai_image_bp
 from blueprints.expenses import expenses_bp
 from blueprints.fba_tools import fba_tools_bp
+from blueprints.amazon_api import amazon_api_bp
+
 def getConfigUrl():
     """从配置中读取链接"""
     return config.get_tencent_url()
@@ -91,6 +93,9 @@ app.register_blueprint(expenses_bp)
 
 # 注册 FBA 工具路由
 app.register_blueprint(fba_tools_bp)
+
+# 注册亚马逊 API 路由
+app.register_blueprint(amazon_api_bp)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

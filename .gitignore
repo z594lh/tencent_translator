@@ -21,3 +21,5 @@ videos/
 static/output/*
 static/invoices/*
 static/fbatag/*
+
+.claude/
