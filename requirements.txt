@@ -13,3 +13,8 @@ werkzeug>=2.0.0
 pymysql
 openai>=1.0.0
 volcengine-python-sdk[ark]>=5.0.0
+reportlab>=3.6.0
+pystrich
+pdf417gen
+pillow
+PyMuPDF>=1.23.0

@@ -155,8 +155,6 @@ def get_expense_list():
     查询参数: month, category, account_type, reimbursed, created_by, page, page_size
     """
     try:
-        user_id = request.current_user['id']
-
         # 查询参数
         month = request.args.get('month', '').strip()
         category = request.args.get('category', '').strip()
@@ -175,8 +173,8 @@ def get_expense_list():
         try:
             with conn.cursor() as cursor:
                 # 构建查询条件
-                conditions = ["user_id = %s"]
-                params = [user_id]
+                conditions = []
+                params = []
 
                 if month:
                     conditions.append("DATE_FORMAT(e.date, '%Y-%m') = %s")
@@ -194,7 +192,7 @@ def get_expense_list():
                     conditions.append("e.created_by = %s")
                     params.append(int(created_by))
 
-                where_clause = " AND ".join(conditions)
+                where_clause = " AND ".join(conditions) if conditions else "1=1"
 
                 # 统计总数
                 count_sql = f"SELECT COUNT(*) as total FROM expenses e WHERE {where_clause}"
