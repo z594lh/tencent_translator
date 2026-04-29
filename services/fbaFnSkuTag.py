@@ -6,8 +6,9 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # --- 配置区 ---
-FONT_PATH = os.path.join("static", "font", "SimHei.TTF")
-OUTPUT_DIR = "static/fbatag"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FONT_PATH = os.path.join(BASE_DIR, "static", "font", "SIMHEI.TTF")
+OUTPUT_DIR = os.path.join(BASE_DIR, "static", "fbatag")
 
 # --- 字体注册 ---
 if os.path.exists(FONT_PATH):
