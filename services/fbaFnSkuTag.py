@@ -6,7 +6,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # --- 配置区 ---
-FONT_PATH = r"static\font\SimHei.TTF"
+FONT_PATH = os.path.join("static", "font", "SimHei.TTF")
 OUTPUT_DIR = "static/fbatag"
 
 # --- 字体注册 ---
