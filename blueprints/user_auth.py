@@ -9,10 +9,7 @@ import secrets
 from functools import wraps
 
 # 导入数据库连接
-try:
-    from services.geminiAi import get_db_connection
-except ImportError:
-    from services.geminiAi import get_db_connection
+from services.mysql_service import get_db_connection
 
 # 创建 Blueprint
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/user')

@@ -14,8 +14,8 @@ from blueprints.user_auth import login_required
 from services.geminiAi import (
     text_to_image_service as gemini_text_to_image,
     edit_ai_images_service as gemini_edit_images,
-    get_db_connection,
 )
+from services.mysql_service import get_db_connection
 from services.doubaoAI import (
     text_to_image_service as doubao_text_to_image,
     edit_ai_images_service as doubao_edit_images,

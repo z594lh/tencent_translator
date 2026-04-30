@@ -427,7 +427,8 @@ class AmazonSpApiClient:
         shipment_id_list: list = None,
         last_update_after: str = None,
         last_update_before: str = None,
-        query_type: str = "SHIPMENT"
+        query_type: str = "SHIPMENT",
+        next_token: str = None
     ) -> dict:
         """获取货件列表
 
@@ -437,6 +438,7 @@ class AmazonSpApiClient:
             last_update_after: 最后更新时间（ISO格式）
             last_update_before: 最后更新时间（ISO格式）
             query_type: 查询类型，默认"SHIPMENT"
+            next_token: 分页令牌
         """
         params = {"QueryType": query_type}
 
@@ -448,6 +450,14 @@ class AmazonSpApiClient:
             params["LastUpdatedAfter"] = last_update_after
         if last_update_before:
             params["LastUpdatedBefore"] = last_update_before
+        if next_token:
+            params["NextToken"] = next_token
+
+        # DATE_RANGE 查询类型要求 LastUpdatedBefore 不能为空，自动补当前时间
+        # 只在非分页请求时补，避免分页过程中时间变化导致参数不一致
+        if not next_token and query_type == "DATE_RANGE" and "LastUpdatedAfter" in params and "LastUpdatedBefore" not in params:
+            from datetime import datetime
+            params["LastUpdatedBefore"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
         return self._request("GET", "/fba/inbound/v0/shipments", params=params)
 

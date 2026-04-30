@@ -15,6 +15,26 @@ from blueprints.expenses import expenses_bp
 from blueprints.fba_tools import fba_tools_bp
 from blueprints.amazon_api import amazon_api_bp
 
+# APScheduler 定时任务
+from apscheduler.schedulers.background import BackgroundScheduler
+from services.amazon_db_sync import AmazonDbSyncService
+
+def run_scheduled_sync():
+    """每小时执行的 Amazon 数据同步任务"""
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 开始定时同步...")
+    try:
+        service = AmazonDbSyncService()
+        results = service.sync_all()
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 定时同步完成: {results}")
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 定时同步异常: {e}")
+
+# 创建并配置定时任务调度器
+scheduler = BackgroundScheduler()
+# 每小时执行一次（从整点开始，如 10:00, 11:00...）
+scheduler.add_job(run_scheduled_sync, 'cron', minute=0, id='amazon_sync_hourly', replace_existing=True)
+scheduler.start()
+
 def getConfigUrl():
     """从配置中读取链接"""
     return config.get_tencent_url()
@@ -26,6 +46,24 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 CORS(app)
+
+# 自定义 JSON 序列化：datetime 统一返回 %Y-%m-%d %H:%M:%S
+try:
+    from flask.json.provider import DefaultJSONProvider
+    class CustomJSONProvider(DefaultJSONProvider):
+        def default(self, o):
+            if isinstance(o, datetime):
+                return o.strftime('%Y-%m-%d %H:%M:%S')
+            return super().default(o)
+    app.json = CustomJSONProvider(app)
+except ImportError:
+    from flask.json import JSONEncoder
+    class CustomJSONEncoder(JSONEncoder):
+        def default(self, o):
+            if isinstance(o, datetime):
+                return o.strftime('%Y-%m-%d %H:%M:%S')
+            return super().default(o)
+    app.json_encoder = CustomJSONEncoder
 
 OUTPUT_DIR = os.path.join(app.static_folder, 'output')
 

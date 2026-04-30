@@ -20,3 +20,4 @@ pillow
 PyMuPDF>=1.23.0
 requests
 requests-aws4auth
+apscheduler

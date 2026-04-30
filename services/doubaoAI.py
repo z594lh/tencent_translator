@@ -5,7 +5,6 @@ import base64
 import json
 import tempfile
 import requests
-import pymysql
 from typing import List, Optional
 from dotenv import load_dotenv
 from volcenginesdkarkruntime import Ark
@@ -249,7 +248,6 @@ def edit_ai_images_service(
     try:
         # ===== 1. 收集所有输入图片 =====
         if image_ids:
-            from services.geminiAi import get_image_relative_path_by_id
             for img_id in image_ids:
                 local_path = get_image_relative_path_by_id(img_id)
                 if not local_path:
@@ -408,51 +406,12 @@ def edit_ai_images_service(
 
 
 # ============== 数据库功能 ==============
-
-def get_db_connection():
-    load_dotenv(override=True)
-    return pymysql.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", ""), 
-        database=os.getenv("DB_NAME", "ai_image_project"),
-        charset='utf8mb4',
-        cursorclass=pymysql.cursors.DictCursor
-    )
-
-
-def save_image_to_db(image_id, url, local_path, prompt, history, model="doubao-seedream-5-0-260128", user_id=None):
-    """保存图片信息到数据库"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            history_data = []
-            if isinstance(history, list):
-                for h in history:
-                    if hasattr(h, 'to_json'):
-                        history_data.append(json.loads(h.to_json()))
-                    elif isinstance(h, dict):
-                        history_data.append(h)
-                    else:
-                        try:
-                            history_data.append(json.loads(json.dumps(h, default=lambda o: o.__dict__)))
-                        except:
-                            continue
-            elif isinstance(history, dict):
-                history_data = [history]
-
-            history_json = json.dumps(history_data)
-
-            sql = """INSERT INTO ai_images (id, user_id, image_url, local_path, prompt, history_snapshot)
-                     VALUES (%s, %s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (image_id, user_id, url, local_path, prompt, history_json))
-        conn.commit()
-        print(f"📖 数据库记录已同步: Image ID {image_id}")
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Database Error: {e}")
-    finally:
-        conn.close()
+# 数据库操作已迁移到 services/mysql_service.py
+from services.mysql_service import (
+    get_db_connection,
+    save_image_to_db,
+    get_image_relative_path_by_id,
+)
 
 
 
