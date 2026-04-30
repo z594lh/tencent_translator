@@ -252,12 +252,18 @@ def get_inventory_summaries_from_db(
             cursor.execute(f"SELECT COUNT(*) as total FROM amazon_inventory WHERE {where_clause}", tuple(params))
             total = cursor.fetchone()['total']
 
-            # 分页查询
+            # 分页查询（连表 products 获取产品信息）
             offset = (page - 1) * page_size
             sql = f"""
-                SELECT * FROM amazon_inventory
+                SELECT
+                    i.*,
+                    p.product_name,
+                    p.declare_name_cn,
+                    p.declare_name_en
+                FROM amazon_inventory i
+                LEFT JOIN products p ON i.seller_sku = p.seller_sku
                 WHERE {where_clause}
-                ORDER BY sync_time DESC
+                ORDER BY i.sync_time DESC
                 LIMIT %s OFFSET %s
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
@@ -508,9 +514,15 @@ def get_shipment_items_from_db(
 
             offset = (page - 1) * page_size
             sql = f"""
-                SELECT * FROM amazon_shipment_items
+                SELECT
+                    s.*,
+                    p.product_name,
+                    p.declare_name_cn,
+                    p.declare_name_en
+                FROM amazon_shipment_items s
+                LEFT JOIN products p ON s.seller_sku = p.seller_sku
                 WHERE {where_clause}
-                ORDER BY sync_time DESC
+                ORDER BY s.sync_time DESC
                 LIMIT %s OFFSET %s
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))

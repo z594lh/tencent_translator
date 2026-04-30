@@ -14,6 +14,8 @@ from blueprints.ai_image import ai_image_bp
 from blueprints.expenses import expenses_bp
 from blueprints.fba_tools import fba_tools_bp
 from blueprints.amazon_api import amazon_api_bp
+from blueprints.supplier import supplier_bp
+from blueprints.products import products_bp
 
 # APScheduler 定时任务
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -134,6 +136,12 @@ app.register_blueprint(fba_tools_bp)
 
 # 注册亚马逊 API 路由
 app.register_blueprint(amazon_api_bp)
+
+# 注册供应商管理路由
+app.register_blueprint(supplier_bp)
+
+# 注册产品管理路由
+app.register_blueprint(products_bp)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
