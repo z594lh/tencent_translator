@@ -464,6 +464,57 @@ class AmazonSpApiClient:
     def get_shipment_items(self, shipment_id: str) -> dict:
         """获取货件商品列表"""
         return self._request("GET", f"/fba/inbound/v0/shipments/{shipment_id}/items")
+    
+    def get_shipment_labels(
+        self,
+        shipment_id: str,
+        carton_ids: list = None,
+        page_type: str = "PackageLabel_Letter_6",
+        label_type: str = "UNIQUE"
+    ) -> dict:
+        """下载货件箱唛标签
+        
+        Args:
+            carton_ids: 纸箱ID列表，如 ["carton1", "carton2"]。
+                    如果为None或空，API会报错，必须提供。
+        """
+        params = {
+            "PageType": page_type,
+            "LabelType": label_type
+        }
+        
+        # cartonIdList 是必填参数，多个用逗号分隔
+        if carton_ids:
+            params["PackageLabelsToPrint"] = ",".join(carton_ids)
+        else:
+            raise ValueError("必须提供 carton_ids（纸箱ID列表）")
+        
+        return self._request("GET", f"/fba/inbound/v0/shipments/{shipment_id}/labels", params=params)
+    
+
+    def list_inbound_plans(self, query: str = None, marketplace_id: str = None, status: str = None, page_size: int = None, pagination_token: str = None) -> dict:
+        """查询入库计划列表"""
+        params = {}
+        if query:
+            params["query"] = query
+        if marketplace_id:
+            params["marketplaceId"] = marketplace_id
+        if status:
+            params["status"] = status
+        if page_size:
+            params["pageSize"] = page_size
+        if pagination_token:
+            params["paginationToken"] = pagination_token
+        return self._request("GET", "/inbound/fba/2024-03-20/inboundPlans", params=params)
+
+    def list_inbound_plan_boxes(self, inbound_plan_id: str, page_size: int = None, pagination_token: str = None) -> dict:
+        """获取入库计划的箱子列表"""
+        params = {}
+        if page_size:
+            params["pageSize"] = page_size
+        if pagination_token:
+            params["paginationToken"] = pagination_token
+        return self._request("GET", f"/inbound/fba/2024-03-20/inboundPlans/{inbound_plan_id}/boxes", params=params)
 
     # -------------------- Listings Items API --------------------
 
