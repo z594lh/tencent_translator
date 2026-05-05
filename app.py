@@ -33,7 +33,6 @@ def run_scheduled_sync():
 
 # 创建并配置定时任务调度器
 scheduler = BackgroundScheduler()
-# 每小时执行一次（从整点开始，如 10:00, 11:00...）
 scheduler.add_job(run_scheduled_sync, 'cron', minute=0, id='amazon_sync_hourly', replace_existing=True)
 scheduler.start()
 

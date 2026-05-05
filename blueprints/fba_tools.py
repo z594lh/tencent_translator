@@ -11,6 +11,10 @@ from services.pdf_editor import crop_pdf, split_pdf
 
 import io
 import json
+import re
+
+import fitz
+from services.mysql_service import get_db_connection
 
 # 创建 Blueprint
 fba_tools_bp = Blueprint('fba_tools', __name__, url_prefix='/api')
@@ -118,6 +122,45 @@ def edit_pdf():
         return jsonify({"status": "error", "message": f"裁剪失败: {str(e)}"}), 500
 
 
+def _extract_fba_info_from_text(text):
+    """从页面文本中提取 FBA 号和 SKU"""
+    # FBA 号：匹配 FBA 开头字符串，去掉末尾 U+数字 箱号
+    fba_id = None
+    fba_match = re.search(r'FBA[A-Z0-9]+', text, re.IGNORECASE)
+    if fba_match:
+        fba_id = fba_match.group(0).upper()
+        fba_id = re.sub(r'U\d+$', '', fba_id)
+
+    # SKU：匹配 Single SKU 后的值
+    sku = None
+    sku_match = re.search(r'Single SKU[:\s]+([A-Z0-9][A-Z0-9\-_]*)', text, re.IGNORECASE)
+    if sku_match:
+        sku = sku_match.group(1)
+
+    return fba_id, sku
+
+
+def _get_product_names_by_skus(skus):
+    """根据 SKU 列表批量查询中文名"""
+    if not skus:
+        return {}
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ','.join(['%s'] * len(skus))
+            sql = f"""
+                SELECT seller_sku,
+                       COALESCE(NULLIF(product_name, ''), declare_name_cn) AS name
+                FROM products
+                WHERE seller_sku IN ({placeholders})
+            """
+            cursor.execute(sql, tuple(skus))
+            rows = cursor.fetchall()
+            return {row['seller_sku']: row['name'] for row in rows}
+    finally:
+        conn.close()
+
+
 @fba_tools_bp.route('/pdf/split', methods=['POST'])
 def split_pdf_route():
     """
@@ -142,7 +185,37 @@ def split_pdf_route():
         return jsonify({"status": "error", "message": "未指定要拆分的页面"}), 400
 
     try:
-        output, is_zip, download_name = split_pdf(file.read(), pages)
+        file_bytes = file.read()
+
+        # 自动提取 FBA 信息并生成自定义文件名
+        filenames = {}
+        try:
+            doc_temp = fitz.open(stream=file_bytes, filetype="pdf")
+            page_infos = []
+            skus = set()
+            for page_num in pages:
+                if 0 <= page_num < len(doc_temp):
+                    page = doc_temp[page_num]
+                    text = page.get_text()
+                    fba_id, sku = _extract_fba_info_from_text(text)
+                    page_infos.append((page_num, fba_id, sku))
+                    if sku:
+                        skus.add(sku)
+            doc_temp.close()
+
+            if skus:
+                name_map = _get_product_names_by_skus(list(skus))
+                for page_num, fba_id, sku in page_infos:
+                    if fba_id and sku:
+                        name = name_map.get(sku) or ''
+                        safe_name = re.sub(r'[\\/:*?"<>|]', '', name)
+                        safe_sku = re.sub(r'[\\/:*?"<>|]', '', sku)
+                        filenames[page_num] = f"{fba_id}{safe_name}{safe_sku}.pdf"
+        except Exception as e:
+            print(f"[PDF Split] 提取FBA信息失败: {e}")
+            # 提取失败不影响正常拆分，回退到默认文件名
+
+        output, is_zip, download_name = split_pdf(file_bytes, pages, filenames)
         mimetype = 'application/zip' if is_zip else 'application/pdf'
         return send_file(
             output,

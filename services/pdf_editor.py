@@ -51,14 +51,16 @@ def crop_pdf(file_stream, operations):
     return output
 
 
-def split_pdf(file_stream, pages):
+def split_pdf(file_stream, pages, filenames=None):
     """
     拆分 PDF 页面
     :param file_stream: PDF 文件流
     :param pages: 页码列表 [0, 2, ...]
+    :param filenames: 可选，自定义文件名映射 {page_num: "filename.pdf"}
     :return: (output_bytes, is_zip, download_name)
     """
     doc = fitz.open(stream=file_stream, filetype="pdf")
+    filenames = filenames or {}
 
     if len(pages) == 1:
         new_doc = fitz.open()
@@ -68,7 +70,8 @@ def split_pdf(file_stream, pages):
         output.seek(0)
         doc.close()
         new_doc.close()
-        return output, False, f'page_{pages[0] + 1}.pdf'
+        name = filenames.get(pages[0], f'page_{pages[0] + 1}.pdf')
+        return output, False, name
     else:
         output = io.BytesIO()
         with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -77,7 +80,8 @@ def split_pdf(file_stream, pages):
                 new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
                 page_bytes = io.BytesIO()
                 new_doc.save(page_bytes)
-                zf.writestr(f'page_{page_num + 1}.pdf', page_bytes.getvalue())
+                name = filenames.get(page_num, f'page_{page_num + 1}.pdf')
+                zf.writestr(name, page_bytes.getvalue())
                 new_doc.close()
         doc.close()
         output.seek(0)
