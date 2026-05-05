@@ -13,20 +13,21 @@ from blueprints.translation import translation_bp
 from blueprints.ai_image import ai_image_bp
 from blueprints.expenses import expenses_bp
 from blueprints.fba_tools import fba_tools_bp
-from blueprints.amazon_api import amazon_api_bp
+from blueprints.amazon.inventory import amazon_inventory_bp
+from blueprints.amazon.shipments import amazon_shipments_bp
+from blueprints.amazon.inbound_plans import amazon_inbound_plans_bp
 from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
 
 # APScheduler 定时任务
 from apscheduler.schedulers.background import BackgroundScheduler
-from services.amazon_db_sync import AmazonDbSyncService
+from blueprints.amazon.shipments import _sync_all
 
 def run_scheduled_sync():
-    """每小时执行的 Amazon 数据同步任务"""
+    """每小时执行的 Amazon 数据同步任务（库存 + 货件 + 货件商品 + 入库计划 + 入库计划箱子）"""
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 开始定时同步...")
     try:
-        service = AmazonDbSyncService()
-        results = service.sync_all()
+        results = _sync_all()
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 定时同步完成: {results}")
     except Exception as e:
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 定时同步异常: {e}")
@@ -134,7 +135,9 @@ app.register_blueprint(expenses_bp)
 app.register_blueprint(fba_tools_bp)
 
 # 注册亚马逊 API 路由
-app.register_blueprint(amazon_api_bp)
+app.register_blueprint(amazon_inventory_bp)
+app.register_blueprint(amazon_shipments_bp)
+app.register_blueprint(amazon_inbound_plans_bp)
 
 # 注册供应商管理路由
 app.register_blueprint(supplier_bp)

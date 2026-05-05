@@ -515,6 +515,10 @@ class AmazonSpApiClient:
         if pagination_token:
             params["paginationToken"] = pagination_token
         return self._request("GET", f"/inbound/fba/2024-03-20/inboundPlans/{inbound_plan_id}/boxes", params=params)
+    
+    def cancel_inbound_plan(self, inbound_plan_id: str) -> dict:
+        """取消入库计划"""
+        return self._request("PUT", f"/inbound/fba/2024-03-20/inboundPlans/{inbound_plan_id}/cancellation")
 
     # -------------------- Listings Items API --------------------
 
