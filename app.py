@@ -21,8 +21,8 @@ from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
 
 # APScheduler 定时任务
-# from services.scheduler import start_scheduler
-# scheduler = start_scheduler()
+from services.scheduler import start_scheduler
+scheduler = start_scheduler()
 
 def getConfigUrl():
     """从配置中读取链接"""
