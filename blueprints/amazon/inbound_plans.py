@@ -305,9 +305,9 @@ def _sync_inbound_plan_boxes(plan_id):
         }
 
 
-def _sync_all_inbound_plan_boxes():
+def _sync_all_inbound_plan_boxes(status=None):
     """批量同步所有入库计划的箱子列表"""
-    plan_ids = _get_inbound_plan_ids()
+    plan_ids = _get_inbound_plan_ids(status=status)
     if not plan_ids:
         return {"total_synced": 0, "total_plans": 0, "errors": []}
 
