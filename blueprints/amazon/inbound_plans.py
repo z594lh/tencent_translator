@@ -203,7 +203,7 @@ def sync_amazon_inbound_plans_all():
 
 # ==================== 同步与数据库操作 ====================
 
-def _sync_inbound_plans():
+def _sync_inbound_plans(status=None):
     """同步入库计划列表（自动处理分页）"""
     client = _get_client()
     all_plans = []
@@ -217,6 +217,7 @@ def _sync_inbound_plans():
 
             result = client.list_inbound_plans(
                 marketplace_id=MARKETPLACE_ID,
+                status=status,
                 page_size=20,
                 pagination_token=next_token
             )
@@ -256,9 +257,9 @@ def _get_inbound_plans(status=None, page=1, page_size=20):
     )
 
 
-def _get_inbound_plan_ids():
+def _get_inbound_plan_ids(status=None):
     """从数据库获取所有入库计划ID"""
-    return get_inbound_plan_ids_from_db(marketplace_id=MARKETPLACE_ID)
+    return get_inbound_plan_ids_from_db(marketplace_id=MARKETPLACE_ID, status=status)
 
 
 def _sync_inbound_plan_boxes(plan_id):
@@ -447,6 +448,8 @@ def sync_inbound_plans_to_db(marketplace_id, plans):
     finally:
         conn.close()
 
+    return count, None
+
 
 def get_inbound_plan_boxes_by_shipment_id_from_db(shipment_id=None, page=1, page_size=20):
     """
@@ -533,16 +536,25 @@ def get_inbound_plans_from_db(marketplace_id=None, status=None, page=1, page_siz
         conn.close()
 
 
-def get_inbound_plan_ids_from_db(marketplace_id=None):
+def get_inbound_plan_ids_from_db(marketplace_id=None, status=None):
     """
     从数据库获取所有入库计划ID列表
     """
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            conditions = []
+            params = []
             if marketplace_id:
-                sql = "SELECT inbound_plan_id FROM amazon_inbound_plans WHERE marketplace_id = %s"
-                cursor.execute(sql, (marketplace_id,))
+                conditions.append("marketplace_id = %s")
+                params.append(marketplace_id)
+            if status:
+                conditions.append("status = %s")
+                params.append(status)
+            if conditions:
+                where_clause = "WHERE " + " AND ".join(conditions)
+                sql = f"SELECT inbound_plan_id FROM amazon_inbound_plans {where_clause}"
+                cursor.execute(sql, tuple(params))
             else:
                 sql = "SELECT inbound_plan_id FROM amazon_inbound_plans"
                 cursor.execute(sql)

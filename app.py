@@ -20,22 +20,8 @@ from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
 
 # APScheduler 定时任务
-from apscheduler.schedulers.background import BackgroundScheduler
-from blueprints.amazon.shipments import _sync_all
-
-def run_scheduled_sync():
-    """每小时执行的 Amazon 数据同步任务（库存 + 货件 + 货件商品 + 入库计划 + 入库计划箱子）"""
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 开始定时同步...")
-    try:
-        results = _sync_all()
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 定时同步完成: {results}")
-    except Exception as e:
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Scheduler] 定时同步异常: {e}")
-
-# 创建并配置定时任务调度器
-scheduler = BackgroundScheduler()
-scheduler.add_job(run_scheduled_sync, 'cron', minute=0, id='amazon_sync_hourly', replace_existing=True)
-scheduler.start()
+from services.scheduler import start_scheduler
+scheduler = start_scheduler()
 
 def getConfigUrl():
     """从配置中读取链接"""

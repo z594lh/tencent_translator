@@ -343,7 +343,8 @@ def _sync_all_shipments(
     return {
         "synced_count": synced_count,
         "total_fetched": len(all_shipments),
-        "error": error
+        "error": error,
+        "shipment_ids": [s.get('ShipmentId') for s in all_shipments]
     }
 
 
@@ -420,49 +421,49 @@ def _get_shipment_items_for_shipments(shipment_ids):
     return get_shipment_items_by_shipment_ids_from_db(shipment_ids)
 
 
-def _sync_all(sync_inventory_flag=True, sync_shipments_flag=True, sync_items_flag=True,
+def _sync_all(sync_shipments_flag=True, sync_items_flag=True,
               sync_inbound_plans_flag=True, sync_inbound_boxes_flag=True):
-    """一键同步所有数据"""
-    from blueprints.amazon.inventory import _sync_inventory
+    """
+    一键同步 Amazon 数据（货件 + 货件商品 + 入库计划 + 入库计划箱子）
+    默认不同步库存，库存由独立定时任务处理
+    """
     from blueprints.amazon.inbound_plans import _sync_inbound_plans, _sync_all_inbound_plan_boxes
 
     results = {}
 
-    if sync_inventory_flag:
-        print("=" * 50)
-        print("开始同步库存数据...")
-        results['inventory'] = _sync_inventory()
-        print(f"库存同步完成: {results['inventory']}")
-
     if sync_shipments_flag:
         print("=" * 50)
         print("开始同步货件数据...")
-        last_update_after = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        last_update_after = (datetime.utcnow() - timedelta(days=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
         default_statuses = ['WORKING', 'SHIPPED', 'RECEIVING', 'CANCELLED', 'DELETED', 'CLOSED', 'ERROR', 'IN_TRANSIT', 'DELIVERED', 'CHECKED_IN']
-        results['shipments'] = _sync_all_shipments(
+        shipments_result = _sync_all_shipments(
             shipment_status_list=default_statuses,
             last_update_after=last_update_after
         )
-        print(f"货件同步完成: {results['shipments']}")
+        results['shipments'] = shipments_result
+        print(f"货件同步完成: {shipments_result}")
 
     if sync_items_flag and results.get('shipments', {}).get('synced_count', 0) > 0:
         print("=" * 50)
         print("开始同步货件商品数据...")
-        shipment_list = _get_shipments(page=1, page_size=1000)
-        shipment_ids = [s['shipment_id'] for s in shipment_list.get('list', [])]
-        results['shipment_items'] = _sync_all_shipment_items(shipment_ids)
-        print(f"货件商品同步完成: {results['shipment_items']}")
+        shipment_ids = results['shipments'].get('shipment_ids', [])
+        if shipment_ids:
+            results['shipment_items'] = _sync_all_shipment_items(shipment_ids)
+            print(f"货件商品同步完成: {results['shipment_items']}")
+        else:
+            print("没有获取到货件ID，跳过货件商品同步")
+            results['shipment_items'] = {"total_synced": 0, "errors": []}
 
     if sync_inbound_plans_flag:
         print("=" * 50)
         print("开始同步入库计划数据...")
-        results['inbound_plans'] = _sync_inbound_plans()
+        results['inbound_plans'] = _sync_inbound_plans(status='ACTIVE')
         print(f"入库计划同步完成: {results['inbound_plans']}")
 
     if sync_inbound_boxes_flag and results.get('inbound_plans', {}).get('synced_count', 0) > 0:
         print("=" * 50)
         print("开始同步入库计划箱子数据...")
-        results['inbound_plan_boxes'] = _sync_all_inbound_plan_boxes()
+        results['inbound_plan_boxes'] = _sync_all_inbound_plan_boxes(status='ACTIVE')
         print(f"入库计划箱子同步完成: {results['inbound_plan_boxes']}")
 
     return results
