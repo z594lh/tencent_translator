@@ -21,6 +21,7 @@ videos/
 static/output/*
 static/invoices/*
 static/fbatag/*
+static/products/*
 
 .claude/
 test.py
