@@ -525,19 +525,9 @@ def get_expense_logs(id):
     获取某笔支出的操作日志
     """
     try:
-        user_id = request.current_user['id']
-
         conn = get_db_connection()
         try:
             with conn.cursor() as cursor:
-                # 先校验记录是否属于当前用户
-                cursor.execute(
-                    "SELECT id FROM expenses WHERE id = %s AND user_id = %s",
-                    (id, user_id)
-                )
-                if not cursor.fetchone():
-                    return jsonify({"status": "error", "message": "记录不存在或无权查看"}), 404
-
                 # 查询日志，关联 users 取操作人昵称
                 cursor.execute("""
                     SELECT

@@ -19,6 +19,8 @@ from blueprints.amazon.inbound_plans import amazon_inbound_plans_bp
 from blueprints.amazon.invoice_export import amazon_invoice_export_bp
 from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
+from blueprints.logistics import logistics_bp
+from blueprints.pricing import pricing_bp
 
 # APScheduler 定时任务
 from services.scheduler import start_scheduler
@@ -132,6 +134,12 @@ app.register_blueprint(supplier_bp)
 
 # 注册产品管理路由
 app.register_blueprint(products_bp)
+
+# 注册货代管理路由
+app.register_blueprint(logistics_bp)
+
+# 注册定价计算路由
+app.register_blueprint(pricing_bp)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

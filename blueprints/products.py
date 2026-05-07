@@ -36,7 +36,7 @@ NEW_FIELDS = [
     'amazon_internal_id', 'asin', 'fnsku',
     'vat_number', 'eori_number',
     'sales_url', 'weight_kg', 'dimensions_cm',
-    'image_url', 'image_urls'
+    'image_url', 'image_urls', 'category_id'
 ]
 
 
@@ -138,6 +138,7 @@ def _extract_product_data(data):
         'dimensions_cm': _val('dimensions_cm', '', True),
         'image_url': _val('image_url', '', True),
         'image_urls': _val('image_urls', '', True),
+        'category_id': int(_val('category_id') or 0) or None,
     }
 
 
@@ -177,6 +178,7 @@ def list_products():
     try:
         keyword = request.args.get('keyword', '').strip() or None
         status = request.args.get('status', '').strip() or None
+        category_id = request.args.get('category_id', '').strip() or None
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
 
@@ -201,6 +203,10 @@ def list_products():
                 if status is not None:
                     conditions.append("status = %s")
                     params.append(int(status))
+
+                if category_id is not None:
+                    conditions.append("category_id = %s")
+                    params.append(int(category_id))
 
                 where_clause = " AND ".join(conditions)
 
@@ -507,4 +513,189 @@ def delete_product(product_id):
 
     except Exception as e:
         print(f"[Products] 删除异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@products_bp.route('/products/categories', methods=['GET'])
+@login_required
+def list_product_categories():
+    """查询产品分类列表（支持分页、关键字搜索）"""
+    try:
+        keyword = request.args.get('keyword', '').strip() or None
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 20))
+
+        if page < 1:
+            page = 1
+        if page_size < 1 or page_size > 500:
+            page_size = 20
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                conditions = ["1=1"]
+                params = []
+
+                if keyword:
+                    conditions.append(
+                        "(category LIKE %s OR category_cn LIKE %s)"
+                    )
+                    like_val = f"%{keyword}%"
+                    params.extend([like_val, like_val])
+
+                where_clause = " AND ".join(conditions)
+
+                cursor.execute(
+                    f"SELECT COUNT(*) as total FROM category_commission_rates WHERE {where_clause}",
+                    tuple(params)
+                )
+                total = cursor.fetchone()['total']
+
+                offset = (page - 1) * page_size
+                sql = f"""
+                    SELECT id, category, category_cn, commission_rate, marketplace_id
+                    FROM category_commission_rates
+                    WHERE {where_clause}
+                    ORDER BY id DESC
+                    LIMIT %s OFFSET %s
+                """
+                cursor.execute(sql, tuple(params + [page_size, offset]))
+                rows = cursor.fetchall()
+
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        "list": rows,
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size
+                    }
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Products] 查询分类列表异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@products_bp.route('/products/categories/<int:category_id>', methods=['GET'])
+@login_required
+def get_product_category(category_id):
+    """查询单个分类详情"""
+    try:
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, category, category_cn, commission_rate, marketplace_id
+                    FROM category_commission_rates WHERE id = %s
+                """, (category_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return jsonify({"status": "error", "message": "分类不存在"}), 404
+                return jsonify({"status": "success", "data": row})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Products] 查询分类详情异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@products_bp.route('/products/categories', methods=['POST'])
+@login_required
+def create_product_category():
+    """创建分类"""
+    try:
+        data = request.get_json() or {}
+        category = data.get('category', '').strip()
+        category_cn = data.get('category_cn', '').strip() or None
+        commission_rate = data.get('commission_rate')
+
+        if not category:
+            return jsonify({"status": "error", "message": "类目英文名不能为空"}), 400
+        if commission_rate is None:
+            return jsonify({"status": "error", "message": "佣金比例不能为空"}), 400
+
+        try:
+            commission_rate = float(commission_rate)
+        except (ValueError, TypeError):
+            return jsonify({"status": "error", "message": "佣金比例必须是数字"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO category_commission_rates (category, category_cn, commission_rate)
+                    VALUES (%s, %s, %s)
+                """, (category, category_cn, commission_rate))
+                conn.commit()
+                new_id = cursor.lastrowid
+                return jsonify({"status": "success", "message": "创建成功", "data": {"id": new_id}})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Products] 创建分类异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@products_bp.route('/products/categories/<int:category_id>', methods=['PUT'])
+@login_required
+def update_product_category(category_id):
+    """更新分类"""
+    try:
+        data = request.get_json() or {}
+        category = data.get('category', '').strip()
+        category_cn = data.get('category_cn', '').strip() or None
+        commission_rate = data.get('commission_rate')
+
+        if not category:
+            return jsonify({"status": "error", "message": "类目英文名不能为空"}), 400
+        if commission_rate is None:
+            return jsonify({"status": "error", "message": "佣金比例不能为空"}), 400
+
+        try:
+            commission_rate = float(commission_rate)
+        except (ValueError, TypeError):
+            return jsonify({"status": "error", "message": "佣金比例必须是数字"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE category_commission_rates
+                    SET category=%s, category_cn=%s, commission_rate=%s
+                    WHERE id = %s
+                """, (category, category_cn, commission_rate, category_id))
+                conn.commit()
+                if cursor.rowcount == 0:
+                    return jsonify({"status": "error", "message": "分类不存在"}), 404
+                return jsonify({"status": "success", "message": "更新成功"})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Products] 更新分类异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@products_bp.route('/products/categories/<int:category_id>', methods=['DELETE'])
+@login_required
+def delete_product_category(category_id):
+    """删除分类（有产品引用时禁止删除）"""
+    try:
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM products WHERE category_id = %s LIMIT 1", (category_id,))
+                if cursor.fetchone():
+                    return jsonify({"status": "error", "message": "该分类下存在产品，无法删除"}), 400
+
+                cursor.execute("DELETE FROM category_commission_rates WHERE id = %s", (category_id,))
+                conn.commit()
+                if cursor.rowcount == 0:
+                    return jsonify({"status": "error", "message": "分类不存在"}), 404
+                return jsonify({"status": "success", "message": "删除成功"})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Products] 删除分类异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500

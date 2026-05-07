@@ -21,8 +21,8 @@ def generate_amazon_label_v4(
     product_name: str,
     extra_info: str,
     sku: str,
-    width_mm: float = 50,
-    height_mm: float = 30,
+    width_mm: float = 70,
+    height_mm: float = 40,
     output_dir: str = "static/fbatag"
 ):
     if not os.path.exists(output_dir):
