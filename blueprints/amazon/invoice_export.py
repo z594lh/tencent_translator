@@ -52,14 +52,20 @@ def _fetch_shipment_invoice_data(shipment_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # 1. 查 shipment 仓库代码
+            # 1. 查 shipment 仓库代码和亚马逊参考号
+            # 注意：前端传入的 shipment_id 是老版 FBA 货件号（shipment_confirmation_id）
             cursor.execute(
-                "SELECT destination_fulfillment_center_id FROM amazon_shipments WHERE shipment_id = %s",
+                "SELECT destination_warehouse_id, amazon_reference_id FROM amazon_inbound_shipments_detail WHERE shipment_confirmation_id = %s",
                 (shipment_id,),
             )
             shipment_row = cursor.fetchone()
             warehouse_id = (
-                shipment_row["destination_fulfillment_center_id"]
+                shipment_row["destination_warehouse_id"]
+                if shipment_row
+                else ""
+            )
+            amazon_reference_id = (
+                shipment_row["amazon_reference_id"]
                 if shipment_row
                 else ""
             )
@@ -169,7 +175,7 @@ def _fetch_shipment_invoice_data(shipment_id):
                         "是否带电": "是" if prod.get("is_electric") else "否",
                         "是否带磁": "是" if prod.get("is_magnetic") else "否",
                         "FBA货箱编号": box.get("box_id") or "",
-                        "亚马逊内部编码ID": prod.get("amazon_internal_id") or "",
+                        "亚马逊内部编码ID": amazon_reference_id or "",
                         "货箱长度(cm)": (
                             round(
                                 _convert_length(

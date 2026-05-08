@@ -198,6 +198,171 @@ def sync_amazon_inbound_plans_all():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@amazon_inbound_plans_bp.route('/amazon/inbound-plans/<plan_id>/shipments', methods=['GET'])
+@login_required
+def amazon_inbound_plan_shipments(plan_id):
+    """
+    从数据库分页查询指定入库计划的货件列表
+    查询参数:
+        page       - 页码，默认 1
+        page_size  - 每页数量，默认 20
+    """
+    try:
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 20))
+
+        if page < 1:
+            page = 1
+        if page_size < 1 or page_size > 500:
+            page_size = 20
+
+        result = _get_inbound_plan_shipments(
+            plan_id=plan_id,
+            page=page,
+            page_size=page_size
+        )
+
+        return jsonify({
+            "status": "success",
+            "data": result
+        })
+
+    except Exception as e:
+        print(f"[Amazon Inbound Plan Shipments DB] 查询异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_inbound_plans_bp.route('/amazon/inbound-shipments/<shipment_id>/detail', methods=['GET'])
+@login_required
+def amazon_inbound_shipment_detail(shipment_id):
+    """
+    从数据库查询指定货件的详情
+    """
+    try:
+        result = _get_inbound_shipment_detail(shipment_id=shipment_id)
+
+        if not result:
+            return jsonify({"status": "error", "message": "未找到货件详情"}), 404
+
+        return jsonify({
+            "status": "success",
+            "data": result
+        })
+
+    except Exception as e:
+        print(f"[Amazon Inbound Shipment Detail DB] 查询异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>/shipments', methods=['POST'])
+@login_required
+def sync_amazon_inbound_plan_shipments(plan_id):
+    """
+    手动触发指定入库计划的货件列表同步（从 API 写入数据库）
+    """
+    try:
+        result = _sync_inbound_plan_shipments(plan_id)
+
+        return jsonify({
+            "status": "success",
+            "message": f"同步完成，共处理 {result.get('synced_count', 0)} 条",
+            "data": result
+        })
+
+    except Exception as e:
+        print(f"[Amazon Sync] 入库计划货件同步异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>/shipments-all', methods=['POST'])
+@login_required
+def sync_amazon_inbound_plan_shipments_all(plan_id):
+    """
+    手动触发指定入库计划的货件列表及详情全量同步
+    """
+    try:
+        result = _sync_inbound_plan_shipments_all(plan_id)
+
+        return jsonify({
+            "status": "success",
+            "message": "入库计划货件全量同步完成",
+            "data": result
+        })
+
+    except Exception as e:
+        print(f"[Amazon Sync] 入库计划货件全量同步异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_inbound_plans_bp.route('/amazon/sync/inbound-shipments', methods=['POST'])
+@login_required
+def sync_amazon_inbound_shipments():
+    """
+    一键同步 ACTIVE 状态的所有入库计划及其货件详情
+    流程：同步入库计划 -> 同步货件列表 -> 同步货件详情
+    """
+    try:
+        result = _sync_active_inbound_shipments_full()
+
+        return jsonify({
+            "status": "success",
+            "message": f"同步完成，入库计划 {result['plans'].get('synced_count', 0)} 个，货件 {result['shipments_synced']} 条，详情 {result['details_synced']} 条",
+            "data": result
+        })
+
+    except Exception as e:
+        print(f"[Amazon Sync] 货件全量同步异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_inbound_plans_bp.route('/amazon/inbound-shipments', methods=['GET'])
+@login_required
+def amazon_inbound_shipments():
+    """
+    从数据库分页查询入库计划货件列表（连表详情）
+    查询参数:
+        inbound_plan_id          - 按入库计划ID筛选
+        shipment_confirmation_id - 按老版货件号筛选（FBA开头）
+        amazon_reference_id      - 按亚马逊参考号筛选
+        destination_warehouse_id - 按目的仓库筛选
+        status                   - 按状态筛选
+        page                     - 页码，默认 1
+        page_size                - 每页数量，默认 20
+    """
+    try:
+        inbound_plan_id = request.args.get('inbound_plan_id', '').strip() or None
+        shipment_confirmation_id = request.args.get('shipment_confirmation_id', '').strip() or None
+        amazon_reference_id = request.args.get('amazon_reference_id', '').strip() or None
+        destination_warehouse_id = request.args.get('destination_warehouse_id', '').strip() or None
+        status = request.args.get('status', '').strip() or None
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 20))
+
+        if page < 1:
+            page = 1
+        if page_size < 1 or page_size > 500:
+            page_size = 20
+
+        result = _get_inbound_shipments(
+            inbound_plan_id=inbound_plan_id,
+            shipment_confirmation_id=shipment_confirmation_id,
+            amazon_reference_id=amazon_reference_id,
+            destination_warehouse_id=destination_warehouse_id,
+            status=status,
+            page=page,
+            page_size=page_size
+        )
+
+        return jsonify({
+            "status": "success",
+            "data": result
+        })
+
+    except Exception as e:
+        print(f"[Amazon Inbound Shipments DB] 查询异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 # ==================== 分割线 ====================
 
 
@@ -335,6 +500,226 @@ def _get_inbound_plan_boxes(plan_id=None, page=1, page_size=20):
         page=page,
         page_size=page_size
     )
+
+
+def _sync_inbound_plan_shipments(plan_id):
+    """同步指定入库计划的货件列表"""
+    client = _get_client()
+
+    try:
+        print(f"[Inbound Plan Shipments Sync] Plan {plan_id} 正在获取货件列表...")
+        result = client._request("GET", f"/inbound/fba/2024-03-20/inboundPlans/{plan_id}")
+        shipments = result.get("shipments", [])
+
+        synced_count, error = sync_inbound_shipments_to_db(plan_id, shipments)
+
+        return {
+            "synced_count": synced_count,
+            "total_fetched": len(shipments),
+            "error": error,
+            "shipment_ids": [s.get("shipmentId") for s in shipments]
+        }
+
+    except Exception as e:
+        return {
+            "synced_count": 0,
+            "total_fetched": 0,
+            "error": str(e),
+            "shipment_ids": []
+        }
+
+
+def _sync_inbound_shipment_detail(plan_id, shipment_id):
+    """同步指定货件的详情"""
+    client = _get_client()
+
+    try:
+        print(f"[Inbound Shipment Detail Sync] Plan {plan_id} Shipment {shipment_id} 正在获取详情...")
+        detail = client._request(
+            "GET",
+            f"/inbound/fba/2024-03-20/inboundPlans/{plan_id}/shipments/{shipment_id}"
+        )
+
+        synced_count, error = sync_inbound_shipment_detail_to_db(plan_id, shipment_id, detail)
+
+        return {
+            "synced_count": synced_count,
+            "total_fetched": 1,
+            "error": error,
+            "detail": detail
+        }
+
+    except Exception as e:
+        return {
+            "synced_count": 0,
+            "total_fetched": 0,
+            "error": str(e),
+            "detail": None
+        }
+
+
+def _sync_inbound_plan_shipments_all(plan_id):
+    """同步指定入库计划的货件列表及所有货件详情"""
+    shipments_result = _sync_inbound_plan_shipments(plan_id)
+    shipment_ids = shipments_result.get("shipment_ids", [])
+
+    total_detail_synced = 0
+    errors = []
+    warehouse_ids = set()
+
+    for sid in shipment_ids:
+        result = _sync_inbound_shipment_detail(plan_id, sid)
+        total_detail_synced += result.get("synced_count", 0)
+        if result.get("error"):
+            errors.append({"shipment_id": sid, "error": result["error"]})
+        else:
+            detail = result.get("detail", {})
+            destination = detail.get("destination", {})
+            wid = destination.get("warehouseId")
+            if wid:
+                warehouse_ids.add(wid)
+        time.sleep(0.3)
+
+    # 同步仓库代码到 fba_warehouses
+    if warehouse_ids:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                sql = """
+                    INSERT INTO fba_warehouses (warehouse_id, marketplace_id, sync_time)
+                    VALUES (%s, %s, NOW())
+                    ON DUPLICATE KEY UPDATE sync_time = NOW()
+                """
+                for wid in warehouse_ids:
+                    cursor.execute(sql, (wid, MARKETPLACE_ID))
+                conn.commit()
+            print(f"[Inbound Plan Shipments All] 同步仓库 {len(warehouse_ids)} 个")
+        except Exception as e:
+            conn.rollback()
+            print(f"[Inbound Plan Shipments All] 仓库同步异常: {e}")
+        finally:
+            conn.close()
+
+    return {
+        "shipments": shipments_result,
+        "details_synced_count": total_detail_synced,
+        "total_shipments": len(shipment_ids),
+        "errors": errors
+    }
+
+
+def _sync_all_inbound_plan_shipments(status=None):
+    """批量同步所有入库计划的货件列表"""
+    plan_ids = _get_inbound_plan_ids(status=status)
+    if not plan_ids:
+        return {"total_synced": 0, "total_plans": 0, "errors": []}
+
+    total_synced = 0
+    errors = []
+
+    for plan_id in plan_ids:
+        result = _sync_inbound_plan_shipments(plan_id)
+        total_synced += result.get("synced_count", 0)
+        if result.get("error"):
+            errors.append({"plan_id": plan_id, "error": result["error"]})
+        time.sleep(0.3)
+
+    return {
+        "total_synced": total_synced,
+        "total_plans": len(plan_ids),
+        "errors": errors
+    }
+
+
+def _get_inbound_plan_shipments(plan_id=None, page=1, page_size=20):
+    """从数据库查询入库计划货件列表（支持分页）"""
+    return get_inbound_plan_shipments_from_db(
+        inbound_plan_id=plan_id,
+        page=page,
+        page_size=page_size
+    )
+
+
+def _get_inbound_shipment_detail(shipment_id):
+    """从数据库查询货件详情"""
+    return get_inbound_shipment_detail_from_db(shipment_id=shipment_id)
+
+
+def _get_inbound_shipments(inbound_plan_id=None, shipment_confirmation_id=None,
+                           amazon_reference_id=None, destination_warehouse_id=None,
+                           status=None, page=1, page_size=20):
+    """从数据库查询入库计划货件连表详情（支持分页）"""
+    return get_inbound_shipments_list_from_db(
+        inbound_plan_id=inbound_plan_id,
+        shipment_confirmation_id=shipment_confirmation_id,
+        amazon_reference_id=amazon_reference_id,
+        destination_warehouse_id=destination_warehouse_id,
+        status=status,
+        page=page,
+        page_size=page_size
+    )
+
+
+def _sync_active_inbound_shipments_full():
+    """
+    一键同步 ACTIVE 状态的所有入库计划及其货件详情
+    流程：
+        1. 同步 ACTIVE 状态的入库计划列表
+        2. 同步这些入库计划的货件列表
+        3. 同步每个货件的详情
+    """
+    # 1. 同步 ACTIVE 入库计划
+    plans_result = _sync_inbound_plans(status='ACTIVE')
+
+    # 2. 获取数据库中 ACTIVE 状态的入库计划ID
+    plan_ids = _get_inbound_plan_ids(status='ACTIVE')
+    if not plan_ids:
+        return {
+            "plans": plans_result,
+            "shipments_synced": 0,
+            "details_synced": 0,
+            "total_shipments": 0,
+            "shipment_errors": [],
+            "detail_errors": []
+        }
+
+    # 3. 同步这些计划的货件列表
+    total_shipments_synced = 0
+    shipment_sync_errors = []
+    all_shipment_entries = []  # [(plan_id, shipment_id), ...]
+
+    for plan_id in plan_ids:
+        result = _sync_inbound_plan_shipments(plan_id)
+        total_shipments_synced += result.get('synced_count', 0)
+        if result.get('error'):
+            shipment_sync_errors.append({"plan_id": plan_id, "error": result['error']})
+        for sid in result.get('shipment_ids', []):
+            all_shipment_entries.append((plan_id, sid))
+        time.sleep(0.3)
+
+    # 4. 同步每个货件的详情
+    total_details_synced = 0
+    detail_sync_errors = []
+
+    for plan_id, shipment_id in all_shipment_entries:
+        result = _sync_inbound_shipment_detail(plan_id, shipment_id)
+        total_details_synced += result.get('synced_count', 0)
+        if result.get('error'):
+            detail_sync_errors.append({
+                "plan_id": plan_id,
+                "shipment_id": shipment_id,
+                "error": result['error']
+            })
+        time.sleep(0.3)
+
+    return {
+        "plans": plans_result,
+        "shipments_synced": total_shipments_synced,
+        "details_synced": total_details_synced,
+        "total_shipments": len(all_shipment_entries),
+        "shipment_errors": shipment_sync_errors,
+        "detail_errors": detail_sync_errors
+    }
 
 
 # ==================== 数据库操作 ====================
@@ -740,6 +1125,270 @@ def get_inbound_plan_boxes_from_db(inbound_plan_id=None, page=1, page_size=20):
             rows = cursor.fetchall()
 
             _enrich_boxes_with_product_names(rows)
+
+            return {
+                "list": rows,
+                "total": total,
+                "page": page,
+                "page_size": page_size
+            }
+    finally:
+        conn.close()
+
+
+def sync_inbound_shipments_to_db(plan_id, shipments):
+    """
+    同步入库计划货件列表到数据库
+    """
+    if not shipments:
+        return 0, None
+
+    conn = get_db_connection()
+    count = 0
+    try:
+        with conn.cursor() as cursor:
+            for shipment in shipments:
+                sql = """
+                    INSERT INTO amazon_inbound_shipments (
+                        inbound_plan_id, shipment_id, status,
+                        sync_time
+                    ) VALUES (
+                        %s, %s, %s,
+                        NOW()
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        status = VALUES(status),
+                        sync_time = NOW()
+                """
+
+                params = (
+                    plan_id,
+                    shipment.get("shipmentId"),
+                    shipment.get("status"),
+                )
+
+                cursor.execute(sql, params)
+                count += 1
+
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return count, str(e)
+    finally:
+        conn.close()
+
+    return count, None
+
+
+def sync_inbound_shipment_detail_to_db(plan_id, shipment_id, detail):
+    """
+    同步货件详情到数据库
+    """
+    if not detail:
+        return 0, None
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            destination = detail.get("destination", {})
+            source = detail.get("source", {})
+            selected_window = detail.get("selectedDeliveryWindow", {})
+            tracking = detail.get("trackingDetails", {})
+            dates = detail.get("dates", {})
+
+            sql = """
+                INSERT INTO amazon_inbound_shipments_detail (
+                    inbound_plan_id, shipment_id, shipment_confirmation_id,
+                    amazon_reference_id, name, status,
+                    placement_option_id, selected_transportation_option_id,
+                    destination_warehouse_id, destination_type,
+                    destination_address_json,
+                    source_type, source_address_json,
+                    selected_delivery_window_json,
+                    tracking_details_json,
+                    dates_json,
+                    sync_time
+                ) VALUES (
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s,
+                    %s, %s,
+                    %s,
+                    %s,
+                    %s,
+                    NOW()
+                )
+                ON DUPLICATE KEY UPDATE
+                    shipment_confirmation_id = VALUES(shipment_confirmation_id),
+                    amazon_reference_id = VALUES(amazon_reference_id),
+                    name = VALUES(name),
+                    status = VALUES(status),
+                    placement_option_id = VALUES(placement_option_id),
+                    selected_transportation_option_id = VALUES(selected_transportation_option_id),
+                    destination_warehouse_id = VALUES(destination_warehouse_id),
+                    destination_type = VALUES(destination_type),
+                    destination_address_json = VALUES(destination_address_json),
+                    source_type = VALUES(source_type),
+                    source_address_json = VALUES(source_address_json),
+                    selected_delivery_window_json = VALUES(selected_delivery_window_json),
+                    tracking_details_json = VALUES(tracking_details_json),
+                    dates_json = VALUES(dates_json),
+                    sync_time = NOW()
+            """
+
+            params = (
+                plan_id,
+                shipment_id,
+                detail.get("shipmentConfirmationId"),
+                detail.get("amazonReferenceId"),
+                detail.get("name"),
+                detail.get("status"),
+                detail.get("placementOptionId"),
+                detail.get("selectedTransportationOptionId"),
+                destination.get("warehouseId"),
+                destination.get("destinationType"),
+                json.dumps(destination.get("address")) if destination.get("address") else None,
+                source.get("sourceType"),
+                json.dumps(source.get("address")) if source.get("address") else None,
+                json.dumps(selected_window) if selected_window else None,
+                json.dumps(tracking) if tracking else None,
+                json.dumps(dates) if dates else None,
+            )
+
+            cursor.execute(sql, params)
+            conn.commit()
+            return 1, None
+    except Exception as e:
+        conn.rollback()
+        return 0, str(e)
+    finally:
+        conn.close()
+
+
+def get_inbound_plan_shipments_from_db(inbound_plan_id=None, page=1, page_size=20):
+    """
+    从数据库分页查询入库计划货件列表
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            conditions = ["1=1"]
+            params = []
+
+            if inbound_plan_id:
+                conditions.append("inbound_plan_id = %s")
+                params.append(inbound_plan_id)
+
+            where_clause = " AND ".join(conditions)
+
+            cursor.execute(f"SELECT COUNT(*) as total FROM amazon_inbound_shipments WHERE {where_clause}", tuple(params))
+            total = cursor.fetchone()["total"]
+
+            offset = (page - 1) * page_size
+            sql = f"""
+                SELECT * FROM amazon_inbound_shipments
+                WHERE {where_clause}
+                ORDER BY sync_time DESC
+                LIMIT %s OFFSET %s
+            """
+            cursor.execute(sql, tuple(params + [page_size, offset]))
+            rows = cursor.fetchall()
+
+            return {
+                "list": rows,
+                "total": total,
+                "page": page,
+                "page_size": page_size
+            }
+    finally:
+        conn.close()
+
+
+def get_inbound_shipment_detail_from_db(shipment_id):
+    """
+    从数据库查询货件详情
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            sql = "SELECT * FROM amazon_inbound_shipments_detail WHERE shipment_id = %s"
+            cursor.execute(sql, (shipment_id,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def get_inbound_shipments_list_from_db(inbound_plan_id=None, shipment_confirmation_id=None,
+                                       amazon_reference_id=None, destination_warehouse_id=None,
+                                       status=None, page=1, page_size=20):
+    """
+    从数据库分页查询入库计划货件列表（amazon_inbound_shipments 连表 amazon_inbound_shipments_detail）
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            conditions = ["1=1"]
+            params = []
+
+            if inbound_plan_id:
+                conditions.append("s.inbound_plan_id = %s")
+                params.append(inbound_plan_id)
+            if shipment_confirmation_id:
+                conditions.append("d.shipment_confirmation_id = %s")
+                params.append(shipment_confirmation_id)
+            if amazon_reference_id:
+                conditions.append("d.amazon_reference_id = %s")
+                params.append(amazon_reference_id)
+            if destination_warehouse_id:
+                conditions.append("d.destination_warehouse_id = %s")
+                params.append(destination_warehouse_id)
+            if status:
+                conditions.append("s.status = %s")
+                params.append(status)
+
+            where_clause = " AND ".join(conditions)
+
+            count_sql = f"""
+                SELECT COUNT(*) as total
+                FROM amazon_inbound_shipments s
+                LEFT JOIN amazon_inbound_shipments_detail d ON s.shipment_id = d.shipment_id
+                WHERE {where_clause}
+            """
+            cursor.execute(count_sql, tuple(params))
+            total = cursor.fetchone()["total"]
+
+            offset = (page - 1) * page_size
+            sql = f"""
+                SELECT
+                    s.inbound_plan_id,
+                    s.shipment_id,
+                    s.status AS shipment_status,
+                    s.sync_time AS shipment_sync_time,
+                    d.shipment_confirmation_id,
+                    d.amazon_reference_id,
+                    d.name AS shipment_name,
+                    d.status AS detail_status,
+                    d.placement_option_id,
+                    d.selected_transportation_option_id,
+                    d.destination_warehouse_id,
+                    d.destination_type,
+                    d.destination_address_json,
+                    d.source_type,
+                    d.source_address_json,
+                    d.selected_delivery_window_json,
+                    d.tracking_details_json,
+                    d.dates_json,
+                    d.sync_time AS detail_sync_time
+                FROM amazon_inbound_shipments s
+                LEFT JOIN amazon_inbound_shipments_detail d ON s.shipment_id = d.shipment_id
+                WHERE {where_clause}
+                ORDER BY s.sync_time DESC
+                LIMIT %s OFFSET %s
+            """
+            cursor.execute(sql, tuple(params + [page_size, offset]))
+            rows = cursor.fetchall()
 
             return {
                 "list": rows,

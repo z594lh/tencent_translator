@@ -282,10 +282,10 @@ def list_waybills():
                 offset = (page - 1) * page_size
                 sql = f"""
                     SELECT w.*, p.name as provider_name,
-                           s.shipment_name, s.destination_fulfillment_center_id, s.shipment_status
+                           s.name as shipment_name, s.destination_warehouse_id as destination_fulfillment_center_id, s.status as shipment_status
                     FROM logistics_waybills w
                     LEFT JOIN logistics_providers p ON w.provider_id = p.id
-                    LEFT JOIN amazon_shipments s ON w.shipment_id = s.shipment_id
+                    LEFT JOIN amazon_inbound_shipments_detail s ON w.shipment_id = s.shipment_confirmation_id
                     WHERE {where_clause}
                     ORDER BY w.id DESC
                     LIMIT %s OFFSET %s
@@ -319,10 +319,10 @@ def get_waybill(waybill_id):
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT w.*, p.name as provider_name,
-                           s.shipment_name, s.destination_fulfillment_center_id, s.shipment_status
+                           s.name as shipment_name, s.destination_warehouse_id as destination_fulfillment_center_id, s.status as shipment_status
                     FROM logistics_waybills w
                     LEFT JOIN logistics_providers p ON w.provider_id = p.id
-                    LEFT JOIN amazon_shipments s ON w.shipment_id = s.shipment_id
+                    LEFT JOIN amazon_inbound_shipments_detail s ON w.shipment_id = s.shipment_confirmation_id
                     WHERE w.id = %s
                 """, (waybill_id,))
                 row = cursor.fetchone()
@@ -533,19 +533,19 @@ def list_available_shipments():
                 params = []
 
                 placeholders = ', '.join(['%s'] * len(statuses))
-                conditions.append(f"shipment_status IN ({placeholders})")
+                conditions.append(f"status IN ({placeholders})")
                 params.extend(statuses)
 
                 if keyword:
                     conditions.append(
-                        "(shipment_id LIKE %s OR shipment_name LIKE %s OR destination_fulfillment_center_id LIKE %s)"
+                        "(shipment_confirmation_id LIKE %s OR name LIKE %s OR destination_warehouse_id LIKE %s)"
                     )
                     like_val = f"%{keyword}%"
                     params.extend([like_val, like_val, like_val])
 
                 # 排除已被其他运单绑定的货件
                 exclude_sub = """
-                    shipment_id NOT IN (
+                    shipment_confirmation_id NOT IN (
                         SELECT shipment_id FROM logistics_waybills
                         WHERE shipment_id IS NOT NULL
                     )
@@ -553,11 +553,11 @@ def list_available_shipments():
                 if exclude_waybill_id:
                     exclude_sub = """
                         (
-                            shipment_id NOT IN (
+                            shipment_confirmation_id NOT IN (
                                 SELECT shipment_id FROM logistics_waybills
                                 WHERE shipment_id IS NOT NULL AND id != %s
                             )
-                            OR shipment_id = (SELECT shipment_id FROM logistics_waybills WHERE id = %s)
+                            OR shipment_confirmation_id = (SELECT shipment_id FROM logistics_waybills WHERE id = %s)
                         )
                     """
                     params.extend([exclude_waybill_id, exclude_waybill_id])
@@ -566,8 +566,8 @@ def list_available_shipments():
                 where_clause = " AND ".join(conditions)
 
                 sql = f"""
-                    SELECT shipment_id, shipment_name, shipment_status, destination_fulfillment_center_id
-                    FROM amazon_shipments
+                    SELECT shipment_confirmation_id as shipment_id, name as shipment_name, status as shipment_status, destination_warehouse_id as destination_fulfillment_center_id
+                    FROM amazon_inbound_shipments_detail
                     WHERE {where_clause}
                     ORDER BY sync_time DESC
                     LIMIT 500

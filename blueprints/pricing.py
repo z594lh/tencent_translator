@@ -120,20 +120,40 @@ def _get_purchase_cost(cursor, seller_sku):
 
 def _get_freight_allocation(cursor, seller_sku):
     """计算单个 SKU 的头程运费分摊（人民币）"""
-    cursor.execute("""
-        SELECT si.shipment_id, si.quantity_shipped
-        FROM amazon_shipment_items si
-        INNER JOIN amazon_shipments s ON si.shipment_id = s.shipment_id
-        WHERE si.seller_sku = %s AND s.shipment_status != 'CANCELLED'
-        ORDER BY si.sync_time DESC
-        LIMIT 1
-    """, (seller_sku,))
-    item = cursor.fetchone()
-    if not item:
-        return 0.0, {"note": "未找到该 SKU 有效的亚马逊货件记录（已排除 CANCELLED）", "shipment_id": None}
-    shipment_id = item['shipment_id']
-    qty = int(item.get('quantity_shipped') or 0)
+    import json
 
+    # 1. 从 amazon_inbound_plan_boxes 的 items_json 中找包含该 SKU 的最新有效货件
+    like_pattern = f'%%"msku": "{seller_sku}"%%'
+    cursor.execute("""
+        SELECT DISTINCT b.shipment_id, s.sync_time
+        FROM amazon_inbound_plan_boxes b
+        INNER JOIN amazon_inbound_shipments_detail s ON b.shipment_id = s.shipment_confirmation_id
+        WHERE b.items_json LIKE %s AND s.status != 'CANCELLED'
+        ORDER BY s.sync_time DESC
+        LIMIT 1
+    """, (like_pattern,))
+    row = cursor.fetchone()
+    if not row:
+        return 0.0, {"note": "未找到该 SKU 有效的亚马逊货件记录（已排除 CANCELLED）", "shipment_id": None}
+    shipment_id = row['shipment_id']
+
+    # 2. 查该货件下所有箱子，解析 items_json 精确汇总该 SKU 数量
+    cursor.execute("""
+        SELECT items_json
+        FROM amazon_inbound_plan_boxes
+        WHERE shipment_id = %s
+    """, (shipment_id,))
+    boxes = cursor.fetchall()
+
+    qty = 0
+    for box in boxes:
+        items = json.loads(box.get("items_json") or "[]")
+        if isinstance(items, list):
+            for it in items:
+                if it.get("msku") == seller_sku:
+                    qty += int(it.get("quantity") or 0)
+
+    # 3. 查这个货件绑定的运单运费
     cursor.execute("""
         SELECT total_cost_cny
         FROM logistics_waybills
@@ -146,6 +166,7 @@ def _get_freight_allocation(cursor, seller_sku):
         return 0.0, {"note": "货件未绑定运单或运单无费用", "shipment_id": shipment_id}
     total_cost_cny = float(waybill['total_cost_cny'])
 
+    # 4. 查这个货件下所有箱子的重量
     cursor.execute("""
         SELECT weight_value, weight_unit
         FROM amazon_inbound_plan_boxes
