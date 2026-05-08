@@ -17,14 +17,15 @@ from blueprints.amazon.inventory import amazon_inventory_bp
 from blueprints.amazon.shipments import amazon_shipments_bp
 from blueprints.amazon.inbound_plans import amazon_inbound_plans_bp
 from blueprints.amazon.invoice_export import amazon_invoice_export_bp
+from blueprints.amazon.orders import amazon_orders_bp
 from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
 from blueprints.logistics import logistics_bp
 from blueprints.pricing import pricing_bp
 
 # APScheduler 定时任务
-from services.scheduler import start_scheduler
-scheduler = start_scheduler()
+# from services.scheduler import start_scheduler
+# scheduler = start_scheduler()
 
 def getConfigUrl():
     """从配置中读取链接"""
@@ -128,6 +129,7 @@ app.register_blueprint(amazon_inventory_bp)
 app.register_blueprint(amazon_shipments_bp)
 app.register_blueprint(amazon_inbound_plans_bp)
 app.register_blueprint(amazon_invoice_export_bp)
+app.register_blueprint(amazon_orders_bp)
 
 # 注册供应商管理路由
 app.register_blueprint(supplier_bp)

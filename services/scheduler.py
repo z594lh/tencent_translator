@@ -2,10 +2,14 @@
 APScheduler 定时任务调度器
 统一存放所有后台定时同步任务，避免 app.py 臃肿
 """
+import os
+import time
 import requests
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from services.mysql_service import get_db_connection
+
+MARKETPLACE_ID = os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")
 
 
 # ==================== 汇率同步 ====================
@@ -130,7 +134,105 @@ def start_scheduler():
         print(f"[{now}] [Scheduler] 入库计划货件详情同步完成: {total_detail_synced} 条"
               f"{f', 错误: {detail_errors}' if detail_errors else ''}")
 
-    # ==================== 4. 汇率同步：每天上午 9 点 ====================
+    # ==================== 4. 订单同步（三层梯度）====================
+    from blueprints.amazon.orders import _sync_orders, _sync_order_items
+
+    def _get_recent_order_ids(hours):
+        """查询最近 N 小时内有更新的订单ID"""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                since = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute("""
+                    SELECT amazon_order_id FROM amazon_orders
+                    WHERE last_update_date >= %s AND marketplace_id = %s
+                    ORDER BY last_update_date DESC
+                """, (since, MARKETPLACE_ID))
+                return [row['amazon_order_id'] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def _sync_order_items_batch(order_ids, label=""):
+        """批量同步订单商品，返回统计信息"""
+        items_total = 0
+        items_errors = []
+        for oid in order_ids:
+            try:
+                result = _sync_order_items(oid)
+                items_total += result.get('synced_count', 0)
+                if result.get('error'):
+                    items_errors.append({"order_id": oid, "error": result['error']})
+            except Exception as e:
+                items_errors.append({"order_id": oid, "error": str(e)})
+            time.sleep(0.3)
+        return items_total, items_errors
+
+    # 任务4a：每15分钟，同步最近24小时内有更新的订单（列表+商品）
+    def job_orders_recent():
+        now = datetime.now()
+        now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{now_str}] [Scheduler] 开始近期订单同步(24h)...")
+        try:
+            last_updated_after = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result = _sync_orders(last_updated_after=last_updated_after)
+            print(f"[{now_str}] [Scheduler] 近期订单列表同步完成: fetched={result.get('total_fetched', 0)}, synced={result.get('synced_count', 0)}")
+
+            order_ids = _get_recent_order_ids(24)
+            if order_ids:
+                print(f"[{now_str}] [Scheduler] 开始同步近期订单商品，共 {len(order_ids)} 单...")
+                items_total, items_errors = _sync_order_items_batch(order_ids, label="近期")
+                print(f"[{now_str}] [Scheduler] 近期订单商品同步完成: {items_total} 条"
+                      f"{f', 错误: {len(items_errors)}个' if items_errors else ''}")
+        except Exception as e:
+            print(f"[{now_str}] [Scheduler] 近期订单同步异常: {e}")
+
+    # 任务4b：每3小时，同步最近7天内有更新的订单（列表+商品）
+    def job_orders_week():
+        now = datetime.now()
+        now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{now_str}] [Scheduler] 开始本周订单同步(7d)...")
+        try:
+            last_updated_after = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result = _sync_orders(last_updated_after=last_updated_after)
+            print(f"[{now_str}] [Scheduler] 本周订单列表同步完成: fetched={result.get('total_fetched', 0)}, synced={result.get('synced_count', 0)}")
+
+            # 只同步 24h ~ 7d 这个区间的订单商品（24h内的已在近期任务处理过）
+            since_24h = (now - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+            since_7d = (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT amazon_order_id FROM amazon_orders
+                        WHERE last_update_date >= %s AND last_update_date < %s
+                          AND marketplace_id = %s
+                        ORDER BY last_update_date DESC
+                    """, (since_7d, since_24h, MARKETPLACE_ID))
+                    order_ids = [row['amazon_order_id'] for row in cursor.fetchall()]
+            finally:
+                conn.close()
+
+            if order_ids:
+                print(f"[{now_str}] [Scheduler] 开始同步本周订单商品(24h~7d)，共 {len(order_ids)} 单...")
+                items_total, items_errors = _sync_order_items_batch(order_ids, label="本周")
+                print(f"[{now_str}] [Scheduler] 本周订单商品同步完成: {items_total} 条"
+                      f"{f', 错误: {len(items_errors)}个' if items_errors else ''}")
+        except Exception as e:
+            print(f"[{now_str}] [Scheduler] 本周订单同步异常: {e}")
+
+    # 任务4c：每6小时，同步最近30天内有更新的订单（仅列表，不抓商品）
+    def job_orders_month():
+        now = datetime.now()
+        now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{now_str}] [Scheduler] 开始本月订单同步(30d,仅列表)...")
+        try:
+            last_updated_after = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result = _sync_orders(last_updated_after=last_updated_after)
+            print(f"[{now_str}] [Scheduler] 本月订单列表同步完成: fetched={result.get('total_fetched', 0)}, synced={result.get('synced_count', 0)}")
+        except Exception as e:
+            print(f"[{now_str}] [Scheduler] 本月订单同步异常: {e}")
+
+    # ==================== 5. 汇率同步：每天上午 9 点 ====================
     def job_exchange_rate():
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{now}] [Scheduler] 开始汇率同步...")
@@ -146,6 +248,9 @@ def start_scheduler():
     # 注册任务
     scheduler.add_job(job_inventory, 'cron', minute=0, id='inventory_hourly', replace_existing=True)
     scheduler.add_job(job_inbound, 'cron', hour='0,3,6,9,12,15,18,21', minute=15, id='inbound_3h', replace_existing=True)
+    scheduler.add_job(job_orders_recent, 'cron', minute='0,15,30,45', id='orders_recent_15m', replace_existing=True)
+    scheduler.add_job(job_orders_week, 'cron', hour='1,4,7,10,13,16,19,22', minute=10, id='orders_week_3h', replace_existing=True)
+    scheduler.add_job(job_orders_month, 'cron', hour='2,8,14,20', minute=20, id='orders_month_6h', replace_existing=True)
     scheduler.add_job(job_exchange_rate, 'cron', hour=9, minute=0, id='exchange_rate_daily', replace_existing=True)
 
     scheduler.start()
