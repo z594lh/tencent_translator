@@ -18,6 +18,7 @@ from blueprints.amazon.shipments import amazon_shipments_bp
 from blueprints.amazon.inbound_plans import amazon_inbound_plans_bp
 from blueprints.amazon.invoice_export import amazon_invoice_export_bp
 from blueprints.amazon.orders import amazon_orders_bp
+from blueprints.amazon.listing import amazon_listing_bp
 from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
 from blueprints.logistics import logistics_bp
@@ -130,6 +131,7 @@ app.register_blueprint(amazon_shipments_bp)
 app.register_blueprint(amazon_inbound_plans_bp)
 app.register_blueprint(amazon_invoice_export_bp)
 app.register_blueprint(amazon_orders_bp)
+app.register_blueprint(amazon_listing_bp)
 
 # 注册供应商管理路由
 app.register_blueprint(supplier_bp)

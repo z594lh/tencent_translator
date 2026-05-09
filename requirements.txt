@@ -21,3 +21,4 @@ PyMuPDF>=1.23.0
 requests
 requests-aws4auth
 apscheduler
+oss2>=2.18.1

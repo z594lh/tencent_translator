@@ -24,4 +24,6 @@ static/fbatag/*
 static/products/*
 
 .claude/
+doc/
+sql/
 test.py

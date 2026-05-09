@@ -59,6 +59,7 @@ _AMAZON_ACCESS_KEY = os.getenv("AMAZON_ACCESS_KEY", "")
 _AMAZON_SECRET_KEY = os.getenv("AMAZON_SECRET_KEY", "")
 _AMAZON_MARKETPLACE_ID = os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")
 _AMAZON_REGION = os.getenv("AMAZON_REGION", "na").lower()
+_AMAZON_SELLER_ID = os.getenv("AMAZON_SELLER_ID", "")
 
 
 def _build_proxies():
@@ -91,6 +92,7 @@ class AmazonSpApiClient:
         secret_key: str = None,
         marketplace_id: str = None,
         region: str = None,
+        seller_id: str = None,
         proxies: dict = None,
     ):
         self.client_id = client_id or _AMAZON_CLIENT_ID
@@ -100,6 +102,7 @@ class AmazonSpApiClient:
         self.secret_key = secret_key or _AMAZON_SECRET_KEY
         self.marketplace_id = marketplace_id or _AMAZON_MARKETPLACE_ID
         self.region = (region or _AMAZON_REGION).lower()
+        self.seller_id = seller_id or _AMAZON_SELLER_ID
         self.base_url = SP_API_ENDPOINTS.get(self.region, SP_API_ENDPOINTS["na"])
         self.aws_region = AWS_SIGN_REGIONS.get(self.region, "us-east-1")
         self.proxies = proxies if proxies is not None else _build_proxies()
@@ -522,21 +525,83 @@ class AmazonSpApiClient:
 
     # -------------------- Listings Items API --------------------
 
+    def _listings_base_path(self, sku: str = None) -> str:
+        """构建 Listings API 基础路径（含 sellerId）"""
+        if not self.seller_id:
+            raise ValueError("缺少 seller_id / AMAZON_SELLER_ID，Listings API 必须提供卖家标识符")
+        if sku:
+            return f"/listings/2021-08-01/items/{self.seller_id}/{sku}"
+        return f"/listings/2021-08-01/items/{self.seller_id}"
+
     def get_listings_item(self, sku: str, included_data: list = None) -> dict:
         """获取商品Listing详情"""
         params = {"marketplaceIds": self.marketplace_id}
         if included_data:
             params["includedData"] = ",".join(included_data)
 
-        return self._request("GET", f"/listings/2021-08-01/items/{sku}", params=params)
+        return self._request("GET", self._listings_base_path(sku), params=params)
 
-    def get_listings_items(self, included_data: list = None) -> dict:
+    def get_listings_items(self, included_data: list = None, page_size: int = None, next_token: str = None) -> dict:
         """获取所有商品Listing列表"""
         params = {"marketplaceIds": self.marketplace_id}
         if included_data:
             params["includedData"] = ",".join(included_data)
+        if page_size:
+            params["pageSize"] = page_size
+        if next_token:
+            params["nextToken"] = next_token
 
-        return self._request("GET", "/listings/2021-08-01/items", params=params)
+        return self._request("GET", self._listings_base_path(), params=params)
+
+    def put_listings_item(
+        self,
+        sku: str,
+        product_type: str,
+        attributes: dict,
+        requirements: str = "LISTING",
+        condition_type: str = None,
+    ) -> dict:
+        """
+        创建或更新 Listing（完全覆盖式）
+        https://developer-docs.amazon.com/sp-api/docs/listings-items-api-v2021-08-01-reference#putlistingsitem
+
+        :param sku: 卖家 SKU
+        :param product_type: 亚马逊商品类型，如 "LUGGAGE", "PRODUCT", "HOME" 等
+        :param attributes: 商品属性字典，如 {"item_name": [{"value": "..."}], ...}
+        :param requirements: LISTING(默认) | LISTING_PRODUCT_ONLY | LISTING_OFFER_ONLY
+        :param condition_type: 商品状况，如 "new", "used_like_new" 等
+        """
+        body = {
+            "productType": product_type,
+            "requirements": requirements,
+            "attributes": attributes,
+        }
+        if condition_type:
+            body["conditionType"] = condition_type
+
+        return self._request("PUT", self._listings_base_path(sku), json_data=body)
+
+    def delete_listings_item(self, sku: str, marketplace_ids: list = None) -> dict:
+        """
+        删除 Listing
+        https://developer-docs.amazon.com/sp-api/docs/listings-items-api-v2021-08-01-reference#deletelistingsitem
+        """
+        params = {"marketplaceIds": ",".join(marketplace_ids) if marketplace_ids else self.marketplace_id}
+        return self._request("DELETE", self._listings_base_path(sku), params=params)
+
+    def patch_listings_item(self, sku: str, patches: list, product_type: str = None) -> dict:
+        """
+        部分更新 Listing（PATCH）
+        https://developer-docs.amazon.com/sp-api/docs/listings-items-api-v2021-08-01-reference#patchlistingsitem
+
+        :param patches: JSON Patch 操作列表
+        :param product_type: 可选，亚马逊商品类型
+        """
+        body = {"patches": patches}
+        if product_type:
+            body["productType"] = product_type
+
+        return self._request("PATCH", self._listings_base_path(sku), json_data=body)
 
 
 # ==================== 快捷函数（单例风格）====================
