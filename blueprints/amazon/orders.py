@@ -1,6 +1,8 @@
 """
-Amazon 订单模块
+Amazon 订单模块（多店铺支持版）
 提供订单查询与同步路由，以及底层数据库操作
+
+注意：所有接口必须传入 shop_id，不传直接返回 400
 """
 import os
 import time
@@ -8,20 +10,32 @@ import json
 
 from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required
-from services.amazon_sp_client import AmazonSpApiClient
+from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
 
 amazon_orders_bp = Blueprint('amazon_orders', __name__, url_prefix='/api')
 
-MARKETPLACE_ID = os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")
+
+def _require_shop_id() -> int:
+    """强制获取 shop_id，不传则抛异常"""
+    shop_id = request.args.get('shop_id', '').strip() or None
+    if not shop_id:
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except ValueError:
+        raise ValueError("shop_id 必须是整数")
 
 
-def _get_client(marketplace_id=None, region=None):
-    """获取 Amazon SP-API 客户端实例"""
-    return AmazonSpApiClient(
-        marketplace_id=marketplace_id or MARKETPLACE_ID,
-        region=region
-    )
+def _require_shop_id_from_body(data: dict) -> int:
+    """从请求体中强制获取 shop_id，不传则抛异常"""
+    shop_id = data.get('shop_id')
+    if shop_id is None or shop_id == '':
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except (ValueError, TypeError):
+        raise ValueError("shop_id 必须是整数")
 
 
 # ==================== 路由（前端调用）====================
@@ -31,16 +45,19 @@ def _get_client(marketplace_id=None, region=None):
 def amazon_orders():
     """
     从数据库分页查询订单列表
-    查询参数:
-        order_status       - 按订单状态筛选，如 Pending, Unshipped, Shipped, Canceled
+    查询参数（必填）:
+        shop_id            - 店铺ID
+    查询参数（可选）:
+        order_status       - 按订单状态筛选
         amazon_order_id    - 按订单号精确筛选
         buyer_name         - 按买家姓名模糊筛选
-        purchase_date_from - 下单开始日期，格式 YYYY-MM-DD
-        purchase_date_to   - 下单结束日期，格式 YYYY-MM-DD
+        purchase_date_from - 下单开始日期
+        purchase_date_to   - 下单结束日期
         page               - 页码，默认 1
         page_size          - 每页数量，默认 20
     """
     try:
+        shop_id = _require_shop_id()
         order_status = request.args.get('order_status', '').strip() or None
         amazon_order_id = request.args.get('amazon_order_id', '').strip() or None
         buyer_name = request.args.get('buyer_name', '').strip() or None
@@ -55,6 +72,7 @@ def amazon_orders():
             page_size = 20
 
         result = _get_orders(
+            shop_id=shop_id,
             order_status=order_status,
             amazon_order_id=amazon_order_id,
             buyer_name=buyer_name,
@@ -69,6 +87,8 @@ def amazon_orders():
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Orders DB] 查询异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -79,9 +99,15 @@ def amazon_orders():
 def amazon_order_detail(order_id):
     """
     从数据库查询单个订单详情（含商品列表）
+    查询参数（必填）:
+        shop_id  - 店铺ID
     """
     try:
-        result = _get_order_detail(order_id=order_id)
+        shop_id = _require_shop_id()
+        result = _get_order_detail(
+            shop_id=shop_id,
+            order_id=order_id
+        )
 
         if not result:
             return jsonify({"status": "error", "message": "订单不存在"}), 404
@@ -91,6 +117,8 @@ def amazon_order_detail(order_id):
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Order Detail DB] 查询异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -101,21 +129,27 @@ def amazon_order_detail(order_id):
 def sync_amazon_orders():
     """
     手动触发订单数据同步（从 API 写入数据库）
-    请求体可选:
-        created_after      - 创建开始时间，ISO8601，默认 30 天前
-        created_before     - 创建结束时间，ISO8601
-        order_statuses     - 状态列表，如 ["Unshipped", "Shipped"]
+    请求体（必填）:
+        shop_id  - 店铺ID
+    请求体（可选）:
+        created_after      - 创建开始时间
+        created_before     - 创建结束时间
+        last_updated_after - 最后更新时间
+        order_statuses     - 状态列表
         marketplace_ids    - 市场ID列表
     """
     try:
         data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
 
         from datetime import datetime, timedelta
         default_after = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         result = _sync_orders(
+            shop_id=shop_id,
             created_after=data.get('created_after', default_after),
             created_before=data.get('created_before'),
+            last_updated_after=data.get('last_updated_after'),
             order_statuses=data.get('order_statuses'),
             marketplace_ids=data.get('marketplace_ids')
         )
@@ -126,6 +160,8 @@ def sync_amazon_orders():
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Sync] 订单同步异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -135,10 +171,18 @@ def sync_amazon_orders():
 @login_required
 def sync_amazon_order_items(order_id):
     """
-    手动触发指定订单的商品数据同步（从 API 写入数据库）
+    手动触发指定订单的商品数据同步
+    请求体（必填）:
+        shop_id  - 店铺ID
     """
     try:
-        result = _sync_order_items(order_id)
+        data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
+
+        result = _sync_order_items(
+            shop_id=shop_id,
+            order_id=order_id
+        )
 
         return jsonify({
             "status": "success",
@@ -146,6 +190,8 @@ def sync_amazon_order_items(order_id):
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Sync] 订单商品同步异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -156,15 +202,18 @@ def sync_amazon_order_items(order_id):
 def sync_amazon_orders_all():
     """
     一键同步订单及其商品数据
-    先同步订单列表，再同步所有订单的商品明细
+    请求体（必填）:
+        shop_id  - 店铺ID
     """
     try:
         data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
 
         from datetime import datetime, timedelta
         default_after = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         orders_result = _sync_orders(
+            shop_id=shop_id,
             created_after=data.get('created_after', default_after),
             created_before=data.get('created_before'),
             order_statuses=data.get('order_statuses'),
@@ -172,6 +221,7 @@ def sync_amazon_orders_all():
         )
 
         order_ids = _get_order_ids(
+            shop_id=shop_id,
             order_statuses=data.get('order_statuses')
         )
 
@@ -179,7 +229,7 @@ def sync_amazon_orders_all():
         items_errors = []
 
         for oid in order_ids:
-            result = _sync_order_items(oid)
+            result = _sync_order_items(shop_id=shop_id, order_id=oid)
             items_total += result.get('synced_count', 0)
             if result.get('error'):
                 items_errors.append({"order_id": oid, "error": result['error']})
@@ -195,19 +245,18 @@ def sync_amazon_orders_all():
             }
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Sync] 订单全量同步异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 分割线 ====================
-
-
 # ==================== 同步与数据库操作 ====================
 
-def _sync_orders(created_after=None, created_before=None, last_updated_after=None, order_statuses=None, marketplace_ids=None):
+def _sync_orders(shop_id, created_after=None, created_before=None, last_updated_after=None, order_statuses=None, marketplace_ids=None):
     """同步订单列表（自动处理分页）"""
-    client = _get_client()
+    client = get_sp_api_client(shop_id=shop_id)
     all_orders = []
     next_token = None
     page = 0
@@ -215,7 +264,7 @@ def _sync_orders(created_after=None, created_before=None, last_updated_after=Non
     try:
         while True:
             page += 1
-            print(f"[Orders Sync] 正在获取第 {page} 页...")
+            print(f"[Orders Sync][shop_id={shop_id}] 正在获取第 {page} 页...")
 
             result = client.get_orders(
                 created_after=created_after,
@@ -237,7 +286,7 @@ def _sync_orders(created_after=None, created_before=None, last_updated_after=Non
 
             time.sleep(0.5)
 
-        synced_count, error = sync_orders_to_db(MARKETPLACE_ID, all_orders)
+        synced_count, error = sync_orders_to_db(shop_id, client.marketplace_id, all_orders)
 
         return {
             "synced_count": synced_count,
@@ -255,9 +304,9 @@ def _sync_orders(created_after=None, created_before=None, last_updated_after=Non
         }
 
 
-def _sync_order_items(order_id):
+def _sync_order_items(shop_id, order_id):
     """同步指定订单的商品列表（自动处理分页）"""
-    client = _get_client()
+    client = get_sp_api_client(shop_id=shop_id)
     all_items = []
     next_token = None
     page = 0
@@ -265,7 +314,7 @@ def _sync_order_items(order_id):
     try:
         while True:
             page += 1
-            print(f"[Order Items Sync] Order {order_id} 正在获取第 {page} 页...")
+            print(f"[Order Items Sync][shop_id={shop_id}] Order {order_id} 正在获取第 {page} 页...")
 
             result = client.get_order_items(order_id)
             payload = result.get('payload', {})
@@ -278,7 +327,7 @@ def _sync_order_items(order_id):
 
             time.sleep(0.5)
 
-        synced_count, error = sync_order_items_to_db(order_id, MARKETPLACE_ID, all_items)
+        synced_count, error = sync_order_items_to_db(shop_id, order_id, client.marketplace_id, all_items)
 
         return {
             "synced_count": synced_count,
@@ -294,11 +343,11 @@ def _sync_order_items(order_id):
         }
 
 
-def _get_orders(order_status=None, amazon_order_id=None, buyer_name=None,
+def _get_orders(shop_id, order_status=None, amazon_order_id=None, buyer_name=None,
                 purchase_date_from=None, purchase_date_to=None, page=1, page_size=20):
     """从数据库查询订单列表（支持分页）"""
     return get_orders_from_db(
-        marketplace_id=MARKETPLACE_ID,
+        shop_id=shop_id,
         order_status=order_status,
         amazon_order_id=amazon_order_id,
         buyer_name=buyer_name,
@@ -309,14 +358,20 @@ def _get_orders(order_status=None, amazon_order_id=None, buyer_name=None,
     )
 
 
-def _get_order_detail(order_id):
+def _get_order_detail(shop_id, order_id):
     """从数据库查询订单详情（含商品）"""
-    return get_order_detail_from_db(order_id=order_id)
+    return get_order_detail_from_db(
+        shop_id=shop_id,
+        order_id=order_id
+    )
 
 
-def _get_order_ids(order_statuses=None):
+def _get_order_ids(shop_id, order_statuses=None):
     """从数据库获取所有订单ID列表"""
-    return get_order_ids_from_db(marketplace_id=MARKETPLACE_ID, order_statuses=order_statuses)
+    return get_order_ids_from_db(
+        shop_id=shop_id,
+        order_statuses=order_statuses
+    )
 
 
 # ==================== 数据库操作 ====================
@@ -339,7 +394,7 @@ def _parse_money(money_obj):
     return money_obj.get('CurrencyCode'), money_obj.get('Amount')
 
 
-def sync_orders_to_db(marketplace_id, orders):
+def sync_orders_to_db(shop_id, marketplace_id, orders):
     """
     同步订单列表到数据库
     """
@@ -363,7 +418,7 @@ def sync_orders_to_db(marketplace_id, orders):
 
                 sql = """
                     INSERT INTO amazon_orders (
-                        amazon_order_id, marketplace_id, seller_order_id,
+                        shop_id, amazon_order_id, marketplace_id, seller_order_id,
                         purchase_date, last_update_date, order_status,
                         fulfillment_channel, sales_channel, order_channel,
                         ship_service_level, shipment_service_level_category, order_type,
@@ -392,7 +447,7 @@ def sync_orders_to_db(marketplace_id, orders):
                         cba_displayable_shipping_label, regulated_information,
                         sync_time
                     ) VALUES (
-                        %s, %s, %s,
+                        %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
@@ -413,9 +468,9 @@ def sync_orders_to_db(marketplace_id, orders):
                         %s, %s,
                         %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         NOW()
@@ -492,6 +547,7 @@ def sync_orders_to_db(marketplace_id, orders):
                 regulated_info = order.get('RegulatedInformation', {})
 
                 params = (
+                    shop_id,
                     order.get('AmazonOrderId'),
                     marketplace_id,
                     order.get('SellerOrderId'),
@@ -571,7 +627,7 @@ def sync_orders_to_db(marketplace_id, orders):
     return count, None
 
 
-def sync_order_items_to_db(order_id, marketplace_id, items):
+def sync_order_items_to_db(shop_id, order_id, marketplace_id, items):
     """
     同步订单商品列表到数据库
     """
@@ -611,7 +667,7 @@ def sync_order_items_to_db(order_id, marketplace_id, items):
 
                 sql = """
                     INSERT INTO amazon_order_items (
-                        amazon_order_id, order_item_id, marketplace_id,
+                        shop_id, amazon_order_id, order_item_id, marketplace_id,
                         asin, seller_sku, title,
                         quantity_ordered, quantity_shipped,
                         item_price_currency_code, item_price_amount,
@@ -633,9 +689,8 @@ def sync_order_items_to_db(order_id, marketplace_id, items):
                         scheduled_delivery_start_date, scheduled_delivery_end_date,
                         sync_time
                     ) VALUES (
+                        %s, %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s,
                         %s, %s,
                         %s, %s,
                         %s, %s,
@@ -707,6 +762,7 @@ def sync_order_items_to_db(order_id, marketplace_id, items):
                 promotion_ids = item.get('PromotionIds', [])
 
                 params = (
+                    shop_id,
                     order_id,
                     item.get('OrderItemId'),
                     marketplace_id,
@@ -750,8 +806,8 @@ def sync_order_items_to_db(order_id, marketplace_id, items):
 
             # 更新订单的 items_sync_time
             cursor.execute(
-                "UPDATE amazon_orders SET items_sync_time = NOW() WHERE amazon_order_id = %s",
-                (order_id,)
+                "UPDATE amazon_orders SET items_sync_time = NOW() WHERE shop_id = %s AND amazon_order_id = %s",
+                (shop_id, order_id)
             )
 
             conn.commit()
@@ -764,7 +820,7 @@ def sync_order_items_to_db(order_id, marketplace_id, items):
     return count, None
 
 
-def get_orders_from_db(marketplace_id=None, order_status=None, amazon_order_id=None,
+def get_orders_from_db(shop_id, order_status=None, amazon_order_id=None,
                        buyer_name=None, purchase_date_from=None, purchase_date_to=None,
                        page=1, page_size=20):
     """
@@ -773,12 +829,9 @@ def get_orders_from_db(marketplace_id=None, order_status=None, amazon_order_id=N
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = ["1=1"]
-            params = []
+            conditions = ["shop_id = %s"]
+            params = [shop_id]
 
-            if marketplace_id:
-                conditions.append("marketplace_id = %s")
-                params.append(marketplace_id)
             if order_status:
                 conditions.append("order_status = %s")
                 params.append(order_status)
@@ -804,7 +857,7 @@ def get_orders_from_db(marketplace_id=None, order_status=None, amazon_order_id=N
             sql = f"""
                 SELECT
                     o.*,
-                    (SELECT COUNT(*) FROM amazon_order_items i WHERE i.amazon_order_id = o.amazon_order_id) as item_count
+                    (SELECT COUNT(*) FROM amazon_order_items i WHERE i.shop_id = o.shop_id AND i.amazon_order_id = o.amazon_order_id) as item_count
                 FROM amazon_orders o
                 WHERE {where_clause}
                 ORDER BY o.purchase_date DESC
@@ -823,7 +876,7 @@ def get_orders_from_db(marketplace_id=None, order_status=None, amazon_order_id=N
         conn.close()
 
 
-def get_order_detail_from_db(order_id):
+def get_order_detail_from_db(shop_id, order_id):
     """
     从数据库查询单个订单详情（含商品列表）
     """
@@ -831,8 +884,8 @@ def get_order_detail_from_db(order_id):
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT * FROM amazon_orders WHERE amazon_order_id = %s
-            """, (order_id,))
+                SELECT * FROM amazon_orders WHERE shop_id = %s AND amazon_order_id = %s
+            """, (shop_id, order_id))
             order_row = cursor.fetchone()
 
             if not order_row:
@@ -847,9 +900,9 @@ def get_order_detail_from_db(order_id):
                     p.image_url as local_image_url
                 FROM amazon_order_items i
                 LEFT JOIN products p ON i.seller_sku = p.seller_sku
-                WHERE i.amazon_order_id = %s
+                WHERE i.shop_id = %s AND i.amazon_order_id = %s
                 ORDER BY i.id ASC
-            """, (order_id,))
+            """, (shop_id, order_id))
             items = cursor.fetchall()
 
             order_row['items'] = items
@@ -858,29 +911,24 @@ def get_order_detail_from_db(order_id):
         conn.close()
 
 
-def get_order_ids_from_db(marketplace_id=None, order_statuses=None):
+def get_order_ids_from_db(shop_id, order_statuses=None):
     """
     从数据库获取所有订单ID列表
     """
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = []
-            params = []
-            if marketplace_id:
-                conditions.append("marketplace_id = %s")
-                params.append(marketplace_id)
+            conditions = ["shop_id = %s"]
+            params = [shop_id]
+
             if order_statuses:
                 placeholders = ','.join(['%s'] * len(order_statuses))
                 conditions.append(f"order_status IN ({placeholders})")
                 params.extend(order_statuses)
-            if conditions:
-                where_clause = "WHERE " + " AND ".join(conditions)
-                sql = f"SELECT amazon_order_id FROM amazon_orders {where_clause} ORDER BY purchase_date DESC"
-                cursor.execute(sql, tuple(params))
-            else:
-                sql = "SELECT amazon_order_id FROM amazon_orders ORDER BY purchase_date DESC"
-                cursor.execute(sql)
+
+            where_clause = " AND ".join(conditions)
+            sql = f"SELECT amazon_order_id FROM amazon_orders WHERE {where_clause} ORDER BY purchase_date DESC"
+            cursor.execute(sql, tuple(params))
             return [row['amazon_order_id'] for row in cursor.fetchall()]
     finally:
         conn.close()

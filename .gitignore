@@ -25,5 +25,7 @@ static/products/*
 
 .claude/
 doc/
+docs/
 sql/
+migrations/
 test.py

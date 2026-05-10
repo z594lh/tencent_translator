@@ -510,12 +510,10 @@ def delete_waybill(waybill_id):
 def list_available_shipments():
     """
     查询可供绑定的 FBA 货件列表
-    - 默认返回 shipment_status 为 WORKING / SHIPPED 的货件
-    - 自动排除已被其他运单占用的货件（编辑时可传 exclude_waybill_id 保留当前运单自己的货件）
-    查询参数:
+    查询参数（可选）:
         status_list       - 逗号分隔的状态，默认 WORKING,SHIPPED
         keyword           - 搜索 shipment_id / shipment_name / destination_fulfillment_center_id
-        exclude_waybill_id- 可选，当前正在编辑的运单ID，其已绑定货件仍可出现
+        exclude_waybill_id- 可选，当前正在编辑的运单ID
     """
     try:
         status_list = request.args.get('status_list', 'WORKING,SHIPPED').strip()

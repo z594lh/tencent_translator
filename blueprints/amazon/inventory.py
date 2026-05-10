@@ -1,6 +1,8 @@
 """
-Amazon 库存模块
+Amazon 库存模块（多店铺支持版）
 提供库存查询与同步路由，以及底层数据库操作
+
+注意：所有接口必须传入 shop_id，不传直接返回 400
 """
 import os
 import time
@@ -8,20 +10,37 @@ import json
 
 from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required
-from services.amazon_sp_client import AmazonSpApiClient
+from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
 
 amazon_inventory_bp = Blueprint('amazon_inventory', __name__, url_prefix='/api')
 
-MARKETPLACE_ID = os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")
+
+def _require_shop_id() -> int:
+    """
+    强制获取 shop_id，不传则抛异常
+    用于路由层参数校验
+    """
+    shop_id = request.args.get('shop_id', '').strip() or None
+    if not shop_id:
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except ValueError:
+        raise ValueError("shop_id 必须是整数")
 
 
-def _get_client(marketplace_id=None, region=None):
-    """获取 Amazon SP-API 客户端实例"""
-    return AmazonSpApiClient(
-        marketplace_id=marketplace_id or MARKETPLACE_ID,
-        region=region
-    )
+def _require_shop_id_from_body(data: dict) -> int:
+    """
+    从请求体中强制获取 shop_id，不传则抛异常
+    """
+    shop_id = data.get('shop_id')
+    if shop_id is None or shop_id == '':
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except (ValueError, TypeError):
+        raise ValueError("shop_id 必须是整数")
 
 
 # ==================== 路由（前端调用）====================
@@ -31,13 +50,16 @@ def _get_client(marketplace_id=None, region=None):
 def amazon_inventory():
     """
     从数据库分页查询库存汇总数据
-    查询参数:
+    查询参数（必填）:
+        shop_id      - 店铺ID
+    查询参数（可选）:
         seller_sku   - 按卖家SKU筛选
         asin         - 按ASIN筛选
         page         - 页码，默认 1
         page_size    - 每页数量，默认 20
     """
     try:
+        shop_id = _require_shop_id()
         seller_sku = request.args.get('seller_sku', '').strip() or None
         asin = request.args.get('asin', '').strip() or None
         page = int(request.args.get('page', 1))
@@ -49,6 +71,7 @@ def amazon_inventory():
             page_size = 20
 
         result = _get_inventory(
+            shop_id=shop_id,
             seller_sku=seller_sku,
             asin=asin,
             page=page,
@@ -60,6 +83,8 @@ def amazon_inventory():
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Inventory DB] 查询异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -70,14 +95,18 @@ def amazon_inventory():
 def sync_amazon_inventory():
     """
     手动触发库存数据同步（从 API 写入数据库）
-    请求体可选:
+    请求体（必填）:
+        shop_id          - 店铺ID
+    请求体（可选）:
         seller_skus      - SKU列表，如 ["SKU1", "SKU2"]
         start_date_time  - 开始时间，ISO8601
     """
     try:
         data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
 
         result = _sync_inventory(
+            shop_id=shop_id,
             seller_skus=data.get('seller_skus'),
             start_date_time=data.get('start_date_time'),
             details=True
@@ -89,19 +118,22 @@ def sync_amazon_inventory():
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Sync] 库存同步异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 分割线 ====================
-
-
 # ==================== 同步与数据库操作 ====================
 
-def _sync_inventory(seller_skus=None, start_date_time=None, details=True):
-    """同步库存汇总数据（自动处理分页）"""
-    client = _get_client()
+def _sync_inventory(shop_id, seller_skus=None, start_date_time=None, details=True):
+    """
+    同步库存汇总数据（自动处理分页）
+    参数:
+        shop_id: 店铺ID（必填）
+    """
+    client = get_sp_api_client(shop_id=shop_id)
     all_items = []
     next_token = None
     page = 0
@@ -109,7 +141,7 @@ def _sync_inventory(seller_skus=None, start_date_time=None, details=True):
     try:
         while True:
             page += 1
-            print(f"[Inventory Sync] 正在获取第 {page} 页...")
+            print(f"[Inventory Sync][shop_id={shop_id}] 正在获取第 {page} 页...")
 
             result = client.get_inventory_summaries(
                 seller_skus=seller_skus,
@@ -128,7 +160,7 @@ def _sync_inventory(seller_skus=None, start_date_time=None, details=True):
 
             time.sleep(0.5)
 
-        synced_count, error = sync_inventory_summaries_to_db(MARKETPLACE_ID, all_items)
+        synced_count, error = sync_inventory_summaries_to_db(shop_id, client.marketplace_id, all_items)
 
         return {
             "synced_count": synced_count,
@@ -146,10 +178,10 @@ def _sync_inventory(seller_skus=None, start_date_time=None, details=True):
         }
 
 
-def _get_inventory(seller_sku=None, asin=None, page=1, page_size=20):
+def _get_inventory(shop_id, seller_sku=None, asin=None, page=1, page_size=20):
     """从数据库查询库存数据（支持分页）"""
     return get_inventory_summaries_from_db(
-        marketplace_id=MARKETPLACE_ID,
+        shop_id=shop_id,
         seller_sku=seller_sku,
         asin=asin,
         page=page,
@@ -157,9 +189,11 @@ def _get_inventory(seller_sku=None, asin=None, page=1, page_size=20):
     )
 
 
-def sync_inventory_summaries_to_db(marketplace_id, inventory_items):
+def sync_inventory_summaries_to_db(shop_id, marketplace_id, inventory_items):
     """
-    同步库存汇总数据到数据库
+    同步库存汇总数据到数据库（多店铺版）
+    注意：需要确保 amazon_inventory 表有 (shop_id, seller_sku) 的唯一索引，
+          否则不同店铺相同 SKU 会触发 ON DUPLICATE KEY 冲突。
     """
     if not inventory_items:
         return 0, None
@@ -179,7 +213,7 @@ def sync_inventory_summaries_to_db(marketplace_id, inventory_items):
 
                 sql = """
                     INSERT INTO amazon_inventory (
-                        marketplace_id, asin, fn_sku, seller_sku, condition_status,
+                        shop_id, marketplace_id, asin, fn_sku, seller_sku, condition_status,
                         fulfillable_quantity, inbound_working_quantity, inbound_shipped_quantity,
                         inbound_receiving_quantity, reserved_total, reserved_pending_customer_order,
                         reserved_pending_transshipment, reserved_fc_processing,
@@ -190,7 +224,7 @@ def sync_inventory_summaries_to_db(marketplace_id, inventory_items):
                         future_supply_reserved, future_supply_buyable,
                         last_updated_time, product_name, total_quantity, stores, sync_time
                     ) VALUES (
-                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s,
@@ -238,6 +272,7 @@ def sync_inventory_summaries_to_db(marketplace_id, inventory_items):
                 stores_json = json.dumps(stores) if stores else '[]'
 
                 params = (
+                    shop_id,
                     marketplace_id,
                     item.get('asin'),
                     item.get('fnSku'),
@@ -281,36 +316,36 @@ def sync_inventory_summaries_to_db(marketplace_id, inventory_items):
     return count, None
 
 
-def get_inventory_summaries_from_db(marketplace_id=None, seller_sku=None, asin=None, page=1, page_size=20):
+def get_inventory_summaries_from_db(shop_id, marketplace_id=None, seller_sku=None, asin=None, page=1, page_size=20):
     """
-    从数据库分页查询库存汇总数据
+    从数据库分页查询库存汇总数据（多店铺版）
     """
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = ["1=1"]
-            params = []
+            conditions = ["shop_id = %s"]
+            params = [shop_id]
 
             if marketplace_id:
-                conditions.append("marketplace_id = %s")
+                conditions.append("i.marketplace_id = %s")
                 params.append(marketplace_id)
             if seller_sku:
-                conditions.append("seller_sku = %s")
+                conditions.append("i.seller_sku = %s")
                 params.append(seller_sku)
             if asin:
-                conditions.append("asin = %s")
+                conditions.append("i.asin = %s")
                 params.append(asin)
 
             where_clause = " AND ".join(conditions)
 
-            cursor.execute(f"SELECT COUNT(*) as total FROM amazon_inventory WHERE {where_clause}", tuple(params))
+            cursor.execute(f"SELECT COUNT(*) as total FROM amazon_inventory i WHERE {where_clause}", tuple(params))
             total = cursor.fetchone()['total']
 
             offset = (page - 1) * page_size
             sql = f"""
                 SELECT
                     i.*,
-                    p.product_name,
+                    p.product_name as local_product_name,
                     p.declare_name_cn,
                     p.declare_name_en
                 FROM amazon_inventory i

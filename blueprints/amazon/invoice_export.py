@@ -9,7 +9,7 @@ import urllib.request
 from decimal import Decimal
 from urllib.parse import urlparse
 
-from flask import Blueprint, jsonify, send_file
+from flask import Blueprint, request, jsonify, send_file
 from blueprints.user_auth import login_required
 from services.mysql_service import get_db_connection
 from openpyxl import Workbook
@@ -47,16 +47,26 @@ def _convert_weight(value, unit):
     return float(value)
 
 
-def _fetch_shipment_invoice_data(shipment_id):
+def _require_shop_id() -> int:
+    """强制获取 shop_id，不传则抛异常"""
+    shop_id = request.args.get('shop_id', '').strip() or None
+    if not shop_id:
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except ValueError:
+        raise ValueError("shop_id 必须是整数")
+
+
+def _fetch_shipment_invoice_data(shop_id, shipment_id):
     """获取指定 shipment_id 的发票数据"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             # 1. 查 shipment 仓库代码和亚马逊参考号
-            # 注意：前端传入的 shipment_id 是老版 FBA 货件号（shipment_confirmation_id）
             cursor.execute(
-                "SELECT destination_warehouse_id, amazon_reference_id FROM amazon_inbound_shipments_detail WHERE shipment_confirmation_id = %s",
-                (shipment_id,),
+                "SELECT destination_warehouse_id, amazon_reference_id FROM amazon_inbound_shipments_detail WHERE shop_id = %s AND shipment_confirmation_id = %s",
+                (shop_id, shipment_id),
             )
             shipment_row = cursor.fetchone()
             warehouse_id = (
@@ -74,10 +84,10 @@ def _fetch_shipment_invoice_data(shipment_id):
             cursor.execute(
                 """
                 SELECT * FROM amazon_inbound_plan_boxes
-                WHERE shipment_id = %s
+                WHERE shop_id = %s AND shipment_id = %s
                 ORDER BY id ASC
                 """,
-                (shipment_id,),
+                (shop_id, shipment_id),
             )
             boxes = cursor.fetchall()
 
@@ -407,9 +417,12 @@ def _build_excel(data):
 def export_shipment_invoice(shipment_id):
     """
     根据货件编号导出发票模板 xlsx
+    查询参数（必填）:
+        shop_id  - 店铺ID
     """
     try:
-        warehouse_id, data = _fetch_shipment_invoice_data(shipment_id)
+        shop_id = _require_shop_id()
+        warehouse_id, data = _fetch_shipment_invoice_data(shop_id=shop_id, shipment_id=shipment_id)
         if not data:
             return jsonify({"status": "error", "message": "该货件没有箱子数据"}), 404
 
@@ -423,6 +436,8 @@ def export_shipment_invoice(shipment_id):
             download_name=filename,
         )
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Invoice Export] 导出异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500

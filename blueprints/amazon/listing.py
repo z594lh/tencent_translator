@@ -1,31 +1,44 @@
 """
-Amazon Listing 模块
+Amazon Listing 模块（多店铺支持版）
 提供 Listing 抓取、上架、修改、删除路由
 以及数据库同步、分页查询（供前端展示）
 
 上架/修改时图片 URL 通过阿里云 OSS 上传服务获取
+
+注意：所有接口必须传入 shop_id，不传直接返回 400
 """
 import json
-import os
 import time
 
 from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required
-from services.amazon_sp_client import AmazonSpApiClient
+from services.shop_service import get_sp_api_client
 from services.oss_uploader import upload_image_for_listing
 from services.mysql_service import get_db_connection
 
 amazon_listing_bp = Blueprint('amazon_listing', __name__, url_prefix='/api')
 
-MARKETPLACE_ID = os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")
+
+def _require_shop_id() -> int:
+    """强制获取 shop_id，不传则抛异常"""
+    shop_id = request.args.get('shop_id', '').strip() or None
+    if not shop_id:
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except ValueError:
+        raise ValueError("shop_id 必须是整数")
 
 
-def _get_client(marketplace_id=None, region=None):
-    """获取 Amazon SP-API 客户端实例"""
-    return AmazonSpApiClient(
-        marketplace_id=marketplace_id or MARKETPLACE_ID,
-        region=region
-    )
+def _require_shop_id_from_body(data: dict) -> int:
+    """从请求体中强制获取 shop_id，不传则抛异常"""
+    shop_id = data.get('shop_id')
+    if shop_id is None or shop_id == '':
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except (ValueError, TypeError):
+        raise ValueError("shop_id 必须是整数")
 
 
 # ========================
@@ -36,8 +49,10 @@ def _get_client(marketplace_id=None, region=None):
 @login_required
 def get_listings():
     """
-    从数据库分页查询 Listing 列表（默认走数据库，减少 SP-API 请求）
-    查询参数:
+    从数据库分页查询 Listing 列表
+    查询参数（必填）:
+        shop_id       - 店铺ID
+    查询参数（可选）:
         sku           - 按 SKU 精确筛选
         asin          - 按 ASIN 筛选
         product_type  - 按商品类型筛选
@@ -48,6 +63,7 @@ def get_listings():
         page_size     - 每页数量，默认 20
     """
     try:
+        shop_id = _require_shop_id()
         sku = request.args.get('sku', '').strip() or None
         asin = request.args.get('asin', '').strip() or None
         product_type = request.args.get('product_type', '').strip() or None
@@ -63,6 +79,7 @@ def get_listings():
             page_size = 20
 
         result = _get_listings_from_db(
+            shop_id=shop_id,
             sku=sku, asin=asin, product_type=product_type,
             status=status, parent_sku=parent_sku, keyword=keyword,
             page=page, page_size=page_size
@@ -73,6 +90,8 @@ def get_listings():
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing DB] 查询异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -83,10 +102,12 @@ def get_listings():
 def get_listing_detail(sku):
     """
     从数据库查询单个 Listing 详情（含子表数据：图片、五点、issues、报价）
-    如需强制刷新，可调用同步接口
+    查询参数（必填）:
+        shop_id  - 店铺ID
     """
     try:
-        result = _get_listing_detail_from_db(sku=sku, marketplace_id=MARKETPLACE_ID)
+        shop_id = _require_shop_id()
+        result = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
         if not result:
             return jsonify({"status": "error", "message": "Listing 不存在"}), 404
 
@@ -95,6 +116,8 @@ def get_listing_detail(sku):
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing DB] 详情查询异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -105,16 +128,20 @@ def get_listing_detail(sku):
 def sync_listings():
     """
     手动触发 Listing 同步（从 SP-API 写入数据库）
-    请求体可选:
+    请求体（必填）:
+        shop_id  - 店铺ID
+    请求体（可选）:
         included_data  - 额外包含数据，默认 ["summaries", "attributes", "issues"]
         page_size      - 每页拉取数量，默认 20
     """
     try:
         data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
         included_data = data.get('included_data', ["summaries", "attributes", "issues"])
         page_size = data.get('page_size', 20)
 
         result = _sync_listings(
+            shop_id=shop_id,
             included_data=included_data,
             page_size=page_size
         )
@@ -125,6 +152,8 @@ def sync_listings():
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing Sync] 同步异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -139,16 +168,19 @@ def sync_listings():
 def get_listing_detail_spapi(sku):
     """
     实时从 SP-API 抓取单个 Listing 详情（不走数据库缓存）
-    查询参数:
+    查询参数（必填）:
+        shop_id  - 店铺ID
+    查询参数（可选）:
         included_data  - 额外包含数据
     """
     try:
+        shop_id = _require_shop_id()
         included_data = request.args.get('included_data', '').strip() or None
         included_data_list = None
         if included_data:
             included_data_list = [x.strip() for x in included_data.split(',') if x.strip()]
 
-        client = _get_client()
+        client = get_sp_api_client(shop_id=shop_id)
         result = client.get_listings_item(sku=sku, included_data=included_data_list)
 
         return jsonify({
@@ -156,6 +188,8 @@ def get_listing_detail_spapi(sku):
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing SP-API] 实时抓取异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -166,11 +200,12 @@ def get_listing_detail_spapi(sku):
 def create_listing():
     """
     上架 Listing（创建新商品）
-    请求体 JSON:
-        sku, product_type, attributes, requirements, condition_type
+    请求体（必填）:
+        shop_id, sku, product_type, attributes
     """
     try:
         data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
         sku = data.get('sku', '').strip()
         product_type = data.get('product_type', '').strip()
         attributes = data.get('attributes')
@@ -184,7 +219,7 @@ def create_listing():
         if not attributes or not isinstance(attributes, dict):
             return jsonify({"status": "error", "message": "缺少必填字段: attributes（必须为对象）"}), 400
 
-        client = _get_client()
+        client = get_sp_api_client(shop_id=shop_id)
         result = client.put_listings_item(
             sku=sku,
             product_type=product_type,
@@ -199,6 +234,8 @@ def create_listing():
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing] 上架异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -209,11 +246,12 @@ def create_listing():
 def update_listing(sku):
     """
     修改 Listing（完全覆盖式更新）
-    请求体 JSON:
-        product_type, attributes, requirements, condition_type
+    请求体（必填）:
+        shop_id, product_type, attributes
     """
     try:
         data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
         product_type = data.get('product_type', '').strip()
         attributes = data.get('attributes')
         requirements = data.get('requirements', 'LISTING')
@@ -224,7 +262,7 @@ def update_listing(sku):
         if not attributes or not isinstance(attributes, dict):
             return jsonify({"status": "error", "message": "缺少必填字段: attributes（必须为对象）"}), 400
 
-        client = _get_client()
+        client = get_sp_api_client(shop_id=shop_id)
         result = client.put_listings_item(
             sku=sku,
             product_type=product_type,
@@ -239,6 +277,8 @@ def update_listing(sku):
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing] 更新异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -249,18 +289,19 @@ def update_listing(sku):
 def patch_listing(sku):
     """
     部分更新 Listing（JSON Patch）
-    请求体 JSON:
-        patches, product_type
+    请求体（必填）:
+        shop_id, patches
     """
     try:
         data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
         patches = data.get('patches')
         product_type = data.get('product_type')
 
         if not patches or not isinstance(patches, list):
             return jsonify({"status": "error", "message": "缺少必填字段: patches（必须为数组）"}), 400
 
-        client = _get_client()
+        client = get_sp_api_client(shop_id=shop_id)
         result = client.patch_listings_item(
             sku=sku,
             patches=patches,
@@ -273,6 +314,8 @@ def patch_listing(sku):
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing] 部分更新异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -283,16 +326,19 @@ def patch_listing(sku):
 def delete_listing(sku):
     """
     删除 Listing
-    查询参数:
+    查询参数（必填）:
+        shop_id  - 店铺ID
+    查询参数（可选）:
         marketplace_ids - 可选，逗号分隔
     """
     try:
+        shop_id = _require_shop_id()
         marketplace_ids = request.args.get('marketplace_ids', '').strip() or None
         marketplace_ids_list = None
         if marketplace_ids:
             marketplace_ids_list = [x.strip() for x in marketplace_ids.split(',') if x.strip()]
 
-        client = _get_client()
+        client = get_sp_api_client(shop_id=shop_id)
         result = client.delete_listings_item(sku=sku, marketplace_ids=marketplace_ids_list)
 
         return jsonify({
@@ -301,6 +347,8 @@ def delete_listing(sku):
             "data": result
         })
 
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing] 删除异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -349,10 +397,10 @@ def upload_listing_image():
 @login_required
 def delete_listing_image():
     """
-    删除 OSS 上的 Listing 图片（前端点击删除时立即调用，防止冗余）
+    删除 OSS 上的 Listing 图片
     请求方式: application/json
     字段（二选一）:
-        oss_key - OSS 对象键，如 amazon/listing/images/20260509/abc123.jpg
+        oss_key - OSS 对象键
         url     - 完整 HTTPS URL
     """
     try:
@@ -392,13 +440,12 @@ def cleanup_listing_images():
     """
     清理 OSS 中未被任何 Listing 引用的孤儿图片（兜底机制）
     请求体可选:
-        dry_run - 默认 true，只统计不真正删除。设为 false 时执行真实删除
+        dry_run - 默认 true，只统计不真正删除
     """
     try:
         data = request.get_json() or {}
         dry_run = data.get('dry_run', True)
 
-        # 允许传字符串 "false" 或布尔值 false
         if isinstance(dry_run, str):
             dry_run = dry_run.lower() not in ('false', '0', 'no', 'off')
 
@@ -428,6 +475,9 @@ def cleanup_listing_images():
 # ========================
 # 数据库同步与查询函数
 # ========================
+
+# （后半部分：_parse_listing_item、_sync_listings、sync_listings_to_db、_get_listings_from_db、_get_listing_detail_from_db）
+
 
 def _extract_first_lang_value(attr_list):
     """从属性数组中提取第一个带 language_tag 的 value"""
@@ -459,24 +509,20 @@ def _extract_first_media_location(attr_list):
     return None
 
 
-def _parse_listing_item(item, marketplace_id, seller_id):
+def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
     """解析单个 Listing item，返回主表数据和子表数据"""
     sku = item.get('sku', '')
     summaries = item.get('summaries', [])
     attributes = item.get('attributes', {})
     issues = item.get('issues', [])
 
-    # 取第一个 summary
     summary = summaries[0] if summaries and isinstance(summaries, list) else {}
 
-    # 状态数组转字符串
     status_list = summary.get('status', []) or []
     status_str = ','.join(status_list) if isinstance(status_list, list) else str(status_list)
 
-    # 图片
     main_image = summary.get('mainImage', {}) or {}
 
-    # 从 attributes 提取常见字段
     brand = _extract_first_lang_value(attributes.get('brand'))
     item_name = _extract_first_lang_value(attributes.get('item_name'))
     product_description = _extract_first_lang_value(attributes.get('product_description'))
@@ -487,7 +533,6 @@ def _parse_listing_item(item, marketplace_id, seller_id):
     if attributes.get('variation_theme') and isinstance(attributes['variation_theme'], list):
         variation_theme = attributes['variation_theme'][0].get('name')
 
-    # 变体关系
     parent_sku = None
     parentage_level = None
     child_relationship_type = None
@@ -498,7 +543,6 @@ def _parse_listing_item(item, marketplace_id, seller_id):
         parentage_level = _extract_first_plain_value(attributes.get('parentage_level'))
         child_relationship_type = rel.get('child_relationship_type')
 
-    # 价格
     list_price = None
     list_price_currency = None
     lp_list = attributes.get('list_price', [])
@@ -506,8 +550,8 @@ def _parse_listing_item(item, marketplace_id, seller_id):
         list_price = lp_list[0].get('value')
         list_price_currency = lp_list[0].get('currency')
 
-    # 主表数据
     main_row = {
+        'shop_id': shop_id,
         'marketplace_id': marketplace_id,
         'seller_id': seller_id,
         'sku': sku,
@@ -537,13 +581,13 @@ def _parse_listing_item(item, marketplace_id, seller_id):
         'issues_json': json.dumps(issues, ensure_ascii=False) if issues else '[]',
     }
 
-    # 子表：五点描述
     bullets = []
     bp_list = attributes.get('bullet_point', [])
     if bp_list and isinstance(bp_list, list):
         for idx, bp in enumerate(bp_list):
             if isinstance(bp, dict) and bp.get('value'):
                 bullets.append({
+                    'shop_id': shop_id,
                     'sku': sku,
                     'marketplace_id': marketplace_id,
                     'sort_order': idx,
@@ -551,7 +595,6 @@ def _parse_listing_item(item, marketplace_id, seller_id):
                     'language_tag': bp.get('language_tag', 'en_US')
                 })
 
-    # 子表：图片
     images = []
     img_keys = ['main_product_image_locator', 'other_product_image_locator_1',
                 'other_product_image_locator_2', 'other_product_image_locator_3',
@@ -562,6 +605,7 @@ def _parse_listing_item(item, marketplace_id, seller_id):
             if loc:
                 img_type = 'main' if key == 'main_product_image_locator' else key.replace('other_product_image_locator_', 'other_')
                 images.append({
+                    'shop_id': shop_id,
                     'sku': sku,
                     'marketplace_id': marketplace_id,
                     'image_type': img_type,
@@ -569,12 +613,12 @@ def _parse_listing_item(item, marketplace_id, seller_id):
                     'sort_order': sort_idx
                 })
 
-    # 子表：issues
     issue_rows = []
     if issues and isinstance(issues, list):
         for iss in issues:
             if isinstance(iss, dict):
                 issue_rows.append({
+                    'shop_id': shop_id,
                     'sku': sku,
                     'marketplace_id': marketplace_id,
                     'issue_code': iss.get('code'),
@@ -582,7 +626,6 @@ def _parse_listing_item(item, marketplace_id, seller_id):
                     'severity': iss.get('severity')
                 })
 
-    # 子表：报价
     offers = []
     offer_list = attributes.get('purchasable_offer', [])
     if offer_list and isinstance(offer_list, list):
@@ -596,6 +639,7 @@ def _parse_listing_item(item, marketplace_id, seller_id):
                         our_price = sched[0].get('value_with_tax')
 
                 offers.append({
+                    'shop_id': shop_id,
                     'sku': sku,
                     'marketplace_id': marketplace_id,
                     'currency': off.get('currency'),
@@ -608,11 +652,11 @@ def _parse_listing_item(item, marketplace_id, seller_id):
     return main_row, bullets, images, issue_rows, offers
 
 
-def _sync_listings(included_data=None, page_size=20):
+def _sync_listings(shop_id, included_data=None, page_size=20):
     """
     同步 Listing 数据到数据库（自动处理分页）
     """
-    client = _get_client()
+    client = get_sp_api_client(shop_id=shop_id)
     seller_id = client.seller_id or ''
     marketplace_id = client.marketplace_id
 
@@ -624,7 +668,7 @@ def _sync_listings(included_data=None, page_size=20):
     try:
         while True:
             page += 1
-            print(f"[Listing Sync] 正在获取第 {page} 页...")
+            print(f"[Listing Sync][shop_id={shop_id}] 正在获取第 {page} 页...")
 
             result = client.get_listings_items(
                 included_data=included_data,
@@ -646,8 +690,7 @@ def _sync_listings(included_data=None, page_size=20):
 
             time.sleep(0.5)
 
-        # 写入数据库
-        synced_count, error = sync_listings_to_db(marketplace_id, seller_id, all_items)
+        synced_count, error = sync_listings_to_db(shop_id, marketplace_id, seller_id, all_items)
 
         return {
             "synced_count": synced_count,
@@ -665,7 +708,7 @@ def _sync_listings(included_data=None, page_size=20):
         }
 
 
-def sync_listings_to_db(marketplace_id, seller_id, items):
+def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
     """
     批量同步 Listing 数据到数据库（含子表）
     """
@@ -678,7 +721,7 @@ def sync_listings_to_db(marketplace_id, seller_id, items):
         with conn.cursor() as cursor:
             for item in items:
                 main_row, bullets, images, issues, offers = _parse_listing_item(
-                    item, marketplace_id, seller_id
+                    item, shop_id, marketplace_id, seller_id
                 )
 
                 sku = main_row['sku']
@@ -686,7 +729,7 @@ def sync_listings_to_db(marketplace_id, seller_id, items):
                 # 1. 写入/更新主表
                 sql_main = """
                     INSERT INTO amazon_listings (
-                        marketplace_id, seller_id, sku, asin, product_type, condition_type,
+                        shop_id, marketplace_id, seller_id, sku, asin, product_type, condition_type,
                         status, fn_sku, item_name, brand, created_date, last_updated_date,
                         main_image_url, main_image_height, main_image_width,
                         list_price, list_price_currency, number_of_items,
@@ -694,7 +737,7 @@ def sync_listings_to_db(marketplace_id, seller_id, items):
                         country_of_origin, manufacturer, product_description,
                         attributes_json, issues_json, sync_time
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
@@ -730,7 +773,7 @@ def sync_listings_to_db(marketplace_id, seller_id, items):
                         sync_time = NOW()
                 """
                 cursor.execute(sql_main, (
-                    main_row['marketplace_id'], main_row['seller_id'], main_row['sku'],
+                    main_row['shop_id'], main_row['marketplace_id'], main_row['seller_id'], main_row['sku'],
                     main_row['asin'], main_row['product_type'], main_row['condition_type'],
                     main_row['status'], main_row['fn_sku'], main_row['item_name'],
                     main_row['brand'], main_row['created_date'], main_row['last_updated_date'],
@@ -742,53 +785,53 @@ def sync_listings_to_db(marketplace_id, seller_id, items):
                     main_row['attributes_json'], main_row['issues_json']
                 ))
 
-                # 2. 清空并重建子表数据
+                # 2. 清空并重建子表数据（带 shop_id）
                 cursor.execute(
-                    "DELETE FROM amazon_listing_bullets WHERE sku = %s AND marketplace_id = %s",
-                    (sku, marketplace_id)
+                    "DELETE FROM amazon_listing_bullets WHERE shop_id = %s AND sku = %s AND marketplace_id = %s",
+                    (shop_id, sku, marketplace_id)
                 )
                 for b in bullets:
                     cursor.execute(
                         """INSERT INTO amazon_listing_bullets
-                           (sku, marketplace_id, sort_order, content, language_tag)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (b['sku'], b['marketplace_id'], b['sort_order'], b['content'], b['language_tag'])
+                           (shop_id, sku, marketplace_id, sort_order, content, language_tag)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (b['shop_id'], b['sku'], b['marketplace_id'], b['sort_order'], b['content'], b['language_tag'])
                     )
 
                 cursor.execute(
-                    "DELETE FROM amazon_listing_images WHERE sku = %s AND marketplace_id = %s",
-                    (sku, marketplace_id)
+                    "DELETE FROM amazon_listing_images WHERE shop_id = %s AND sku = %s AND marketplace_id = %s",
+                    (shop_id, sku, marketplace_id)
                 )
                 for img in images:
                     cursor.execute(
                         """INSERT INTO amazon_listing_images
-                           (sku, marketplace_id, image_type, media_location, sort_order)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (img['sku'], img['marketplace_id'], img['image_type'], img['media_location'], img['sort_order'])
+                           (shop_id, sku, marketplace_id, image_type, media_location, sort_order)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (img['shop_id'], img['sku'], img['marketplace_id'], img['image_type'], img['media_location'], img['sort_order'])
                     )
 
                 cursor.execute(
-                    "DELETE FROM amazon_listing_issues WHERE sku = %s AND marketplace_id = %s",
-                    (sku, marketplace_id)
+                    "DELETE FROM amazon_listing_issues WHERE shop_id = %s AND sku = %s AND marketplace_id = %s",
+                    (shop_id, sku, marketplace_id)
                 )
                 for iss in issues:
                     cursor.execute(
                         """INSERT INTO amazon_listing_issues
-                           (sku, marketplace_id, issue_code, message, severity)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (iss['sku'], iss['marketplace_id'], iss['issue_code'], iss['message'], iss['severity'])
+                           (shop_id, sku, marketplace_id, issue_code, message, severity)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (iss['shop_id'], iss['sku'], iss['marketplace_id'], iss['issue_code'], iss['message'], iss['severity'])
                     )
 
                 cursor.execute(
-                    "DELETE FROM amazon_listing_offers WHERE sku = %s AND marketplace_id = %s",
-                    (sku, marketplace_id)
+                    "DELETE FROM amazon_listing_offers WHERE shop_id = %s AND sku = %s AND marketplace_id = %s",
+                    (shop_id, sku, marketplace_id)
                 )
                 for off in offers:
                     cursor.execute(
                         """INSERT INTO amazon_listing_offers
-                           (sku, marketplace_id, currency, audience, our_price, start_at, end_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                        (off['sku'], off['marketplace_id'], off['currency'], off['audience'],
+                           (shop_id, sku, marketplace_id, currency, audience, our_price, start_at, end_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (off['shop_id'], off['sku'], off['marketplace_id'], off['currency'], off['audience'],
                          off['our_price'], off['start_at'], off['end_at'])
                     )
 
@@ -804,14 +847,14 @@ def sync_listings_to_db(marketplace_id, seller_id, items):
     return count, None
 
 
-def _get_listings_from_db(sku=None, asin=None, product_type=None, status=None,
+def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, status=None,
                           parent_sku=None, keyword=None, page=1, page_size=20):
     """从数据库分页查询 Listing 列表"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = ["1=1"]
-            params = []
+            conditions = ["shop_id = %s"]
+            params = [shop_id]
 
             if sku:
                 conditions.append("sku = %s")
@@ -841,7 +884,7 @@ def _get_listings_from_db(sku=None, asin=None, product_type=None, status=None,
             offset = (page - 1) * page_size
             sql = f"""
                 SELECT
-                    id, marketplace_id, seller_id, sku, asin, product_type,
+                    id, shop_id, marketplace_id, seller_id, sku, asin, product_type,
                     condition_type, status, fn_sku, item_name, brand,
                     created_date, last_updated_date,
                     main_image_url, main_image_height, main_image_width,
@@ -867,54 +910,50 @@ def _get_listings_from_db(sku=None, asin=None, product_type=None, status=None,
         conn.close()
 
 
-def _get_listing_detail_from_db(sku, marketplace_id):
+def _get_listing_detail_from_db(shop_id, sku):
     """从数据库查询单个 Listing 详情（含子表）"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT * FROM amazon_listings
-                WHERE sku = %s AND marketplace_id = %s
-            """, (sku, marketplace_id))
+                WHERE shop_id = %s AND sku = %s
+            """, (shop_id, sku))
             row = cursor.fetchone()
 
             if not row:
                 return None
 
-            # 五点描述
             cursor.execute("""
                 SELECT sort_order, content, language_tag
                 FROM amazon_listing_bullets
-                WHERE sku = %s AND marketplace_id = %s
+                WHERE shop_id = %s AND sku = %s
                 ORDER BY sort_order ASC
-            """, (sku, marketplace_id))
+            """, (shop_id, sku))
             row['bullets'] = cursor.fetchall()
 
-            # 图片
             cursor.execute("""
                 SELECT image_type, media_location, sort_order
                 FROM amazon_listing_images
-                WHERE sku = %s AND marketplace_id = %s
+                WHERE shop_id = %s AND sku = %s
                 ORDER BY sort_order ASC
-            """, (sku, marketplace_id))
+            """, (shop_id, sku))
             row['images'] = cursor.fetchall()
 
-            # Issues
             cursor.execute("""
                 SELECT issue_code, message, severity
                 FROM amazon_listing_issues
-                WHERE sku = %s AND marketplace_id = %s
+                WHERE shop_id = %s AND sku = %s
                 ORDER BY id ASC
-            """, (sku, marketplace_id))
+            """, (shop_id, sku))
             row['issues'] = cursor.fetchall()
 
-            # 报价
             cursor.execute("""
                 SELECT currency, audience, our_price, start_at, end_at
                 FROM amazon_listing_offers
-                WHERE sku = %s AND marketplace_id = %s
+                WHERE shop_id = %s AND sku = %s
                 ORDER BY id ASC
-            """, (sku, marketplace_id))
+            """, (shop_id, sku))
             row['offers'] = cursor.fetchall()
 
             return row
@@ -930,7 +969,6 @@ def _iso_to_datetime(iso_str):
         iso_str = iso_str.replace('Z', '')
         if '+' in iso_str:
             iso_str = iso_str.split('+')[0]
-        # 截断毫秒部分（MySQL DATETIME 默认不支持小数秒，或最多 6 位）
         if '.' in iso_str:
             iso_str = iso_str.split('.')[0]
     return iso_str

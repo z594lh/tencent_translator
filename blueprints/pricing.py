@@ -17,6 +17,9 @@ def _get_conn():
     return get_db_connection()
 
 
+
+
+
 def _lb_to_kg(lb):
     """磅转千克"""
     return lb * 0.45359237
@@ -122,12 +125,12 @@ def _get_freight_allocation(cursor, seller_sku):
     """计算单个 SKU 的头程运费分摊（人民币）"""
     import json
 
-    # 1. 从 amazon_inbound_plan_boxes 的 items_json 中找包含该 SKU 的最新有效货件
+    # 1. 从 amazon_inbound_plan_boxes 的 items_json 中找包含该 SKU 的最新有效货件（跨店铺）
     like_pattern = f'%%"msku": "{seller_sku}"%%'
     cursor.execute("""
         SELECT DISTINCT b.shipment_id, s.sync_time
         FROM amazon_inbound_plan_boxes b
-        INNER JOIN amazon_inbound_shipments_detail s ON b.shipment_id = s.shipment_confirmation_id
+        INNER JOIN amazon_inbound_shipments_detail s ON b.shipment_id = s.shipment_confirmation_id AND s.shop_id = b.shop_id
         WHERE b.items_json LIKE %s AND s.status != 'CANCELLED'
         ORDER BY s.sync_time DESC
         LIMIT 1
@@ -212,7 +215,7 @@ def _get_freight_allocation(cursor, seller_sku):
 def calculate_price():
     """
     SKU 售价反算接口
-    请求体（前端只传这 4 个字段）:
+    请求体:
       seller_sku           必填  SKU
       target_profit_rate   必填  目标利润率(小数)
       ad_rate              必填  广告费率(ACoS)
