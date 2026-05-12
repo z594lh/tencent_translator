@@ -101,12 +101,13 @@ def edit_pdf():
     请求: multipart/form-data
       - file: 原始 PDF
       - operations: JSON字符串 [{"type":"crop","page":0,"bbox":[left,top,width,height],"scale":1.5}, ...]
-    返回: 裁剪后的 PDF 文件流
+    返回: 裁剪后的 PDF 文件流（FBA标签自动提取FBA号+SKU命名，非FBA标签返回原文件名）
     """
     if 'file' not in request.files:
         return jsonify({"status": "error", "message": "请上传 PDF 文件"}), 400
 
     file = request.files['file']
+    original_filename = file.filename or 'cropped.pdf'
     operations_raw = request.form.get('operations', '[]')
     try:
         operations = json.loads(operations_raw)
@@ -114,12 +115,33 @@ def edit_pdf():
         return jsonify({"status": "error", "message": "参数格式错误"}), 400
 
     try:
-        output = crop_pdf(file.read(), operations)
+        file_bytes = file.read()
+
+        # 尝试提取 FBA 信息，用于自定义文件名
+        download_name = original_filename
+        try:
+            doc_temp = fitz.open(stream=file_bytes, filetype="pdf")
+            # 取第一个被裁剪页面的文本
+            crop_page = operations[0].get('page', 0) if operations else 0
+            if crop_page < len(doc_temp):
+                text = doc_temp[crop_page].get_text()
+                fba_id, sku = _extract_fba_info_from_text(text)
+                if fba_id and sku:
+                    name_map = _get_product_names_by_skus([sku])
+                    name = name_map.get(sku) or ''
+                    safe_name = re.sub(r'[\\/:*?"<>|]', '', name)
+                    safe_sku = re.sub(r'[\\/:*?"<>|]', '', sku)
+                    download_name = f"{fba_id}{safe_name}{safe_sku}.pdf"
+            doc_temp.close()
+        except Exception as e:
+            print(f"[PDF Crop] 提取FBA信息失败: {e}")
+
+        output = crop_pdf(file_bytes, operations)
         return send_file(
             output,
             mimetype='application/pdf',
             as_attachment=True,
-            download_name='cropped.pdf'
+            download_name=download_name
         )
     except Exception as e:
         return jsonify({"status": "error", "message": f"裁剪失败: {str(e)}"}), 500
