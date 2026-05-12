@@ -51,6 +51,9 @@ def create_fba_label():
         if not sku:
             return jsonify({"status": "error", "message": "sku 不能为空"}), 400
 
+        # 打印前端传参，方便调试
+        print(f"[FBA Label] 前端参数: fnsku={fnsku!r}, sku={sku!r}, product_name={product_name!r}, extra_info={extra_info!r}, width_mm={width_mm}, height_mm={height_mm}")
+
         # 数值校验
         try:
             width_mm = float(width_mm)

@@ -28,7 +28,9 @@ def generate_amazon_label_v4(
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    file_name = f"Label-{sku}-{fnsku}.pdf"
+    from datetime import datetime
+    ts = datetime.now().strftime('%Y%m%d%H%M%S')
+    file_name = f"Label-{sku}-{fnsku}-{ts}.pdf"
     output_path = os.path.join(output_dir, file_name)
 
     # --- 1. 画布设置 ---
