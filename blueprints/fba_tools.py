@@ -131,7 +131,7 @@ def edit_pdf():
                     name = name_map.get(sku) or ''
                     safe_name = re.sub(r'[\\/:*?"<>|]', '', name)
                     safe_sku = re.sub(r'[\\/:*?"<>|]', '', sku)
-                    download_name = f"{fba_id}{safe_name}{safe_sku}.pdf"
+                    download_name = f"{fba_id}_{safe_sku}.pdf"
             doc_temp.close()
         except Exception as e:
             print(f"[PDF Crop] 提取FBA信息失败: {e}")
