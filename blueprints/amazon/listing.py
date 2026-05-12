@@ -160,6 +160,185 @@ def sync_listings():
 
 
 # ========================
+# 路由：同步 Listing 到产品表
+# ========================
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/sync-to-product', methods=['POST'])
+@login_required
+def sync_listing_to_product(sku):
+    """
+    将指定 Listing 同步到 products 表：sku 存在则更新，不存在则新增。
+    请求体（必填）:
+        shop_id  - 店铺ID
+    """
+    try:
+        data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
+
+        # 1. 获取 Listing 详情（含子表）
+        listing = _get_listing_detail_from_db(shop_id, sku)
+        if not listing:
+            return jsonify({"status": "error", "message": f"Listing {sku} 不存在"}), 404
+
+        # 2. 解析 attributes_json 获取重量和尺寸
+        attrs = {}
+        raw = listing.get('attributes_json', '{}')
+        if raw and raw != '{}':
+            try:
+                attrs = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        weight_kg = _parse_weight_kg(attrs)
+        dimensions_cm = _parse_dimensions_cm(attrs)
+
+        # 3. 拼接多图 URL
+        images = listing.get('images', []) or []
+        image_urls_list = [img['media_location'] for img in images
+                           if img.get('media_location') and img.get('image_type') != 'main']
+        image_urls = json.dumps(image_urls_list, ensure_ascii=False) if image_urls_list else None
+
+        # 4. 构造 ASIN 链接
+        asin = (listing.get('asin') or '').strip()
+        sales_url = f"https://www.amazon.com/dp/{asin}" if asin else ''
+
+        # 5. 检查 products 表是否已有此 SKU
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM products WHERE seller_sku = %s", (sku,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    # —— 更新 ——
+                    cursor.execute("""
+                        UPDATE products SET
+                            product_name = %s,
+                            brand = %s,
+                            declare_value = %s,
+                            currency = %s,
+                            asin = %s,
+                            fnsku = %s,
+                            image_url = %s,
+                            image_urls = %s,
+                            weight_kg = %s,
+                            dimensions_cm = %s,
+                            sales_url = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                    """, (
+                        listing.get('item_name') or '',
+                        listing.get('brand') or '',
+                        listing.get('list_price'),
+                        listing.get('list_price_currency', 'USD'),
+                        asin,
+                        listing.get('fn_sku') or '',
+                        listing.get('main_image_url') or '',
+                        image_urls,
+                        weight_kg,
+                        dimensions_cm,
+                        sales_url,
+                        existing['id']
+                    ))
+                    conn.commit()
+                    return jsonify({
+                        "status": "success",
+                        "message": f"产品 {sku} 已更新",
+                        "data": {"id": existing['id'], "action": "updated"}
+                    })
+                else:
+                    # —— 新增 ——
+                    cursor.execute("""
+                        INSERT INTO products
+                            (seller_sku, product_name, brand,
+                             declare_value, currency, asin, fnsku,
+                             image_url, image_urls, weight_kg, dimensions_cm, sales_url,
+                             status)
+                        VALUES
+                            (%s, %s, %s,
+                             %s, %s, %s, %s,
+                             %s, %s, %s, %s, %s,
+                             1)
+                    """, (
+                        sku,
+                        listing.get('item_name') or '',
+                        listing.get('brand') or '',
+                        listing.get('list_price'),
+                        listing.get('list_price_currency', 'USD'),
+                        asin,
+                        listing.get('fn_sku') or '',
+                        listing.get('main_image_url') or '',
+                        image_urls,
+                        weight_kg,
+                        dimensions_cm,
+                        sales_url,
+                    ))
+                    conn.commit()
+                    new_id = cursor.lastrowid
+                    return jsonify({
+                        "status": "success",
+                        "message": f"产品 {sku} 已创建",
+                        "data": {"id": new_id, "action": "created"}
+                    })
+        finally:
+            conn.close()
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Sync to Product] 同步异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _parse_weight_kg(attrs):
+    """从 attributes 中提取重量并转换为 kg"""
+    item_weight = attrs.get('item_weight') or attrs.get('item_package_weight')
+    if item_weight and isinstance(item_weight, list) and len(item_weight) > 0:
+        w = item_weight[0]
+        if isinstance(w, dict):
+            value = w.get('value')
+            unit = (w.get('unit') or '').lower()
+            if value is not None:
+                value = float(value)
+                if unit == 'pounds':
+                    return round(value * 0.453592, 3)
+                elif unit == 'kg':
+                    return round(value, 3)
+                return value
+    return None
+
+
+def _parse_dimensions_cm(attrs):
+    """从 attributes 中提取长宽高并转换为 cm，返回 'L*W*H' 格式字符串"""
+    dims = attrs.get('item_length_width_height') or attrs.get('item_package_dimensions')
+    if dims and isinstance(dims, list) and len(dims) > 0:
+        d = dims[0]
+        if isinstance(d, dict):
+            length = _get_dim_value(d.get('length'))
+            width = _get_dim_value(d.get('width'))
+            height = _get_dim_value(d.get('height'))
+            if length and width and height:
+                return f"{length}*{width}*{height}"
+    return None
+
+
+def _get_dim_value(dim):
+    """解析单维度值，统一转换为 cm"""
+    if not isinstance(dim, dict):
+        return None
+    value = dim.get('value')
+    unit = (dim.get('unit') or '').lower()
+    if value is not None:
+        value = float(value)
+        if unit == 'inches':
+            return round(value * 2.54, 2)
+        elif unit == 'cm':
+            return round(value, 2)
+        return value
+    return None
+
+
+# ========================
 # 路由：SP-API 直连操作
 # ========================
 
@@ -470,6 +649,310 @@ def cleanup_listing_images():
     except Exception as e:
         print(f"[Amazon Listing] 清理异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ========================
+# 路由：上架工作流辅助接口
+# ========================
+
+@amazon_listing_bp.route('/amazon/catalog/search', methods=['GET'])
+@login_required
+def search_catalog():
+    """
+    搜索亚马逊目录，检查商品是否已存在（上架流程 Step 1）
+    查询参数（必填）:
+        shop_id  - 店铺ID
+    查询参数（至少一个）:
+        keywords  - 关键词搜索
+        upc       - UPC 条码
+        ean       - EAN 条码
+    """
+    try:
+        shop_id = _require_shop_id()
+        keywords = request.args.get('keywords', '').strip() or None
+        upc = request.args.get('upc', '').strip() or None
+        ean = request.args.get('ean', '').strip() or None
+
+        if not keywords and not upc and not ean:
+            return jsonify({"status": "error", "message": "请提供 keywords / upc / ean 至少一个参数"}), 400
+
+        client = get_sp_api_client(shop_id=shop_id)
+
+        # 构建搜索关键词
+        search_keywords = []
+        if keywords:
+            search_keywords.append(keywords)
+        if upc:
+            search_keywords.append(upc)
+        if ean:
+            search_keywords.append(ean)
+
+        result = client.search_catalog_items(
+            keywords=search_keywords,
+            included_data=["summaries"]
+        )
+
+        items = result.get('items', [])
+        simplified = []
+        for item in items:
+            s = (item.get('summaries', [{}]) or [{}])[0]
+            simplified.append({
+                "asin": item.get('asin', ''),
+                "title": s.get('itemName', ''),
+                "brand": s.get('brand', ''),
+                "product_type": s.get('productType', ''),
+                "main_image_url": (s.get('mainImage') or {}).get('link', ''),
+            })
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "items": simplified,
+                "total_results": len(simplified)
+            }
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Catalog Search] 异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_listing_bp.route('/amazon/product-types/search', methods=['GET'])
+@login_required
+def search_product_types():
+    """
+    搜索 Product Type 分类（上架流程 Step 2）
+    查询参数（必填）:
+        shop_id   - 店铺ID
+        keywords  - 搜索关键词，如 "pool vacuum"
+    查询参数（可选）:
+        item_name - 按商品名称搜索
+    """
+    try:
+        shop_id = _require_shop_id()
+        keywords = request.args.get('keywords', '').strip()
+        item_name = request.args.get('item_name', '').strip() or None
+
+        if not keywords:
+            return jsonify({"status": "error", "message": "缺少必填参数: keywords"}), 400
+
+        client = get_sp_api_client(shop_id=shop_id)
+        result = client.search_product_types(keywords=keywords, item_name=item_name)
+
+        product_types = result.get('productTypes', [])
+        simplified = []
+        for pt in product_types:
+            simplified.append({
+                "name": pt.get('name', ''),
+                "display_name": pt.get('displayName', ''),
+                "marketplace_ids": pt.get('marketplaceIds', []),
+            })
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "product_types": simplified,
+                "total_results": len(simplified)
+            }
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Product Type Search] 异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_listing_bp.route('/amazon/product-types/<product_type>/schema', methods=['GET'])
+@login_required
+def get_product_type_schema(product_type):
+    """
+    获取分类 Schema（精简版，供前端动态表单渲染）（上架流程 Step 3）
+    路径参数:
+        product_type - 如 POOL_VACUUM
+    查询参数（必填）:
+        shop_id - 店铺ID
+    """
+    try:
+        shop_id = _require_shop_id()
+        client = get_sp_api_client(shop_id=shop_id)
+
+        # 1. 获取 product type 定义（含 S3 schema 链接 + propertyGroups）
+        definition = client.get_product_type_definition(product_type)
+
+        # 2. 从 S3 下载完整 JSON Schema
+        import requests as req
+        schema_link = definition.get('schema', {}).get('link', {}).get('resource', '')
+        full_schema = {}
+        if schema_link:
+            try:
+                resp = req.get(schema_link, timeout=30)
+                resp.raise_for_status()
+                full_schema = resp.json()
+            except Exception as e:
+                print(f"[Schema Download] S3 下载失败: {e}")
+
+        # 3. 解析：收集所有字段定义和必填字段
+        prop_schemas = {}
+        req_attrs = set()
+        defs = full_schema.get('$defs', {})
+
+        # 从顶层 properties 收集
+        top_props = full_schema.get('properties', {})
+        prop_schemas.update(top_props)
+        req_attrs.update(full_schema.get('required', []))
+
+        # 从 allOf 收集（包括 $ref 引用和内联 properties/required）
+        all_of = full_schema.get('allOf', [])
+        for node in all_of:
+            # 1) $ref 引用 → 跟踪定义
+            ref = node.get('$ref', '')
+            if ref.startswith('#/$defs/'):
+                def_name = ref.split('#/$defs/')[1]
+                d = defs.get(def_name, {})
+                prop_schemas.update(d.get('properties', {}))
+                req_attrs.update(d.get('required', []))
+            # 2) 内联 properties / required
+            if 'properties' in node:
+                prop_schemas.update(node['properties'])
+            if 'required' in node:
+                req_attrs.update(node['required'])
+            # 3) if/then 条件规则中的 required
+            for key in ('if', 'then', 'else'):
+                cond = node.get(key, {})
+                if isinstance(cond, dict):
+                    cond_all_of = cond.get('allOf', [])
+                    for cn in cond_all_of:
+                        for sk in ('required',):
+                            if sk in cn:
+                                req_attrs.update(cn[sk])
+                        cn_props = cn.get('properties', {})
+                        prop_schemas.update(cn_props)
+                        # 嵌套 definitions ref
+                        cn_ref = cn.get('$ref', '')
+                        if cn_ref.startswith('#/$defs/'):
+                            cn_def = defs.get(cn_ref.split('#/$defs/')[1], {})
+                            prop_schemas.update(cn_def.get('properties', {}))
+                            req_attrs.update(cn_def.get('required', []))
+                    # then 块可能有 required
+                    cond_req = cond.get('required', [])
+                    req_attrs.update(cond_req)
+
+        # 4. 构建精简字段列表
+        fields = {}
+        for name, defn in prop_schemas.items():
+            info = _simplify_field_schema(name, defn, defs)
+            if info:
+                info['required'] = name in req_attrs
+                fields[name] = info
+
+        # 5. propertyGroups
+        groups_raw = definition.get('propertyGroups', {})
+        groups = {}
+        for gk, gv in groups_raw.items():
+            groups[gk] = {
+                "title": gv.get('title', gk),
+                "description": gv.get('description', ''),
+                "fields": gv.get('propertyNames', [])
+            }
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "product_type": product_type,
+                "display_name": definition.get('displayName', ''),
+                "requirements_enforced": definition.get('requirementsEnforced', ''),
+                "required": sorted(req_attrs),
+                "fields": fields,
+                "groups": groups
+            }
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Product Type Schema] 异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _simplify_field_schema(name, defn, defs):
+    """
+    将单个字段的 JSON Schema 定义精简为前端可用格式。
+    递归跟踪 items.$ref 链提取 enum / maxLength / type。
+    """
+    if not isinstance(defn, dict):
+        return None
+
+    info = {
+        "name": name,
+        "label": defn.get('title', name),
+        "description": defn.get('description', ''),
+    }
+
+    # 递归提取深层 value schema
+    value_schema = _extract_value_schema(defn, defs)
+
+    json_type = value_schema.get('type', defn.get('type', 'string'))
+    if 'enum' in value_schema:
+        info['enum'] = value_schema['enum']
+        info['enum_names'] = value_schema.get('enumNames', value_schema['enum'])
+    if 'maxLength' in value_schema:
+        info['max_length'] = value_schema['maxLength']
+    if 'examples' in value_schema or 'examples' in defn:
+        info['examples'] = value_schema.get('examples') or defn.get('examples')
+
+    # 映射前端控件类型
+    if any(kw in name for kw in ('media_locator', 'image_locator')):
+        info['type'] = 'image'
+    elif any(kw in name for kw in ('dimensions', 'length_width_height')):
+        info['type'] = 'dimensions'
+    elif 'weight' in name:
+        info['type'] = 'weight'
+    elif 'price' in name:
+        info['type'] = 'price'
+    elif 'enum' in info:
+        info['type'] = 'select'
+    elif json_type in ('boolean',):
+        info['type'] = 'boolean'
+    elif name.startswith(('is_', 'has_')) or 'batteries' in name:
+        info['type'] = 'boolean'
+    elif json_type in ('integer', 'number'):
+        info['type'] = json_type
+    else:
+        info['type'] = 'string'
+
+    return info
+
+
+def _extract_value_schema(defn, defs):
+    """
+    递归跟踪 items.$ref 链，直到找到 value 属性定义。
+    处理两级 ref: field → items:$ref → properties.value
+    """
+    items = defn.get('items', {})
+    if not isinstance(items, dict):
+        return {}
+
+    # 情况1：items 直接有 properties.value
+    iprops = items.get('properties', {})
+    if 'value' in iprops and isinstance(iprops['value'], dict):
+        return iprops['value']
+
+    # 情况2：items.$ref → 定义 → properties.value
+    iref = items.get('$ref', '')
+    if iref.startswith('#/$defs/'):
+        ref_def = defs.get(iref.split('#/$defs/')[1], {})
+        rprops = ref_def.get('properties', {})
+        if 'value' in rprops and isinstance(rprops['value'], dict):
+            return rprops['value']
+
+    # 情况3：items.properties.value 本身有 enum
+    if 'value' in iprops:
+        return iprops['value'] if isinstance(iprops['value'], dict) else {}
+
+    return {}
 
 
 # ========================

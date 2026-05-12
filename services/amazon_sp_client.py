@@ -571,6 +571,7 @@ class AmazonSpApiClient:
         :param requirements: LISTING(默认) | LISTING_PRODUCT_ONLY | LISTING_OFFER_ONLY
         :param condition_type: 商品状况，如 "new", "used_like_new" 等
         """
+        params = {"marketplaceIds": self.marketplace_id}
         body = {
             "productType": product_type,
             "requirements": requirements,
@@ -579,7 +580,7 @@ class AmazonSpApiClient:
         if condition_type:
             body["conditionType"] = condition_type
 
-        return self._request("PUT", self._listings_base_path(sku), json_data=body)
+        return self._request("PUT", self._listings_base_path(sku), params=params, json_data=body)
 
     def delete_listings_item(self, sku: str, marketplace_ids: list = None) -> dict:
         """
@@ -597,11 +598,59 @@ class AmazonSpApiClient:
         :param patches: JSON Patch 操作列表
         :param product_type: 可选，亚马逊商品类型
         """
+        params = {"marketplaceIds": self.marketplace_id}
         body = {"patches": patches}
         if product_type:
             body["productType"] = product_type
 
-        return self._request("PATCH", self._listings_base_path(sku), json_data=body)
+        return self._request("PATCH", self._listings_base_path(sku), params=params, json_data=body)
+
+    # -------------------- Product Type Definitions API --------------------
+
+    def search_product_types(
+        self,
+        keywords: str = None,
+        item_name: str = None,
+        locale: str = "en_US",
+    ) -> dict:
+        """
+        搜索亚马逊商品分类（Product Type）
+        https://developer-docs.amazon.com/sp-api/docs/product-type-definitions-api-v2020-09-01-reference#searchdefinitionsproducttypes
+
+        :param keywords: 搜索关键词，如 "pool", "swimming"
+        :param item_name: 按商品名称搜索
+        :param locale: 地域语言，默认 en_US
+        """
+        params = {"marketplaceIds": self.marketplace_id}
+        if keywords:
+            params["keywords"] = keywords
+        if item_name:
+            params["itemName"] = item_name
+        if locale:
+            params["locale"] = locale
+
+        return self._request("GET", "/definitions/2020-09-01/productTypes", params=params)
+
+    def get_product_type_definition(
+        self,
+        product_type: str,
+        requirements: str = "LISTING",
+        locale: str = "en_US",
+    ) -> dict:
+        """
+        获取指定商品分类的 JSON Schema（包含必填属性、可选属性、枚举值等）
+        https://developer-docs.amazon.com/sp-api/docs/product-type-definitions-api-v2020-09-01-reference#getdefinitionsproducttype
+
+        :param product_type: 商品分类名称，如 "POOL_CLEANING_TOOLS"
+        :param requirements: LISTING | LISTING_PRODUCT_ONLY | LISTING_OFFER_ONLY
+        :param locale: 地域语言，默认 en_US
+        """
+        params = {
+            "marketplaceIds": self.marketplace_id,
+            "requirements": requirements,
+            "locale": locale,
+        }
+        return self._request("GET", f"/definitions/2020-09-01/productTypes/{product_type}", params=params)
 
 
 # ==================== 快捷函数（单例风格）====================
