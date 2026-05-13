@@ -105,11 +105,14 @@ def _parse_file_rows(file):
     image_map: {row_index: image_bytes}  仅 xlsx，从嵌入图片中提取
     """
     filename = (file.filename or '').lower()
+    print(f"[Product Board] 收到文件: {filename}", flush=True)
     raw = file.read()
+    print(f"[Product Board] 文件大小: {len(raw)} bytes", flush=True)
 
     if filename.endswith(('.xlsx', '.xls')):
-        # read_only 快读数据
+        print("[Product Board] 开始 openpyxl read_only 加载...", flush=True)
         wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        print("[Product Board] openpyxl 加载完成", flush=True)
         ws = wb.active
         rows_iter = ws.iter_rows()
         header_row = next(rows_iter, None)
@@ -117,17 +120,22 @@ def _parse_file_rows(file):
             wb.close()
             return None, None, "Excel 文件为空"
         headers = [str(c.value or '') for c in header_row]
+        print(f"[Product Board] 表头: {headers}", flush=True)
         rows = []
         for r in rows_iter:
             vals = [c.value for c in r]
             rows.append(dict(zip(headers, vals)))
         wb.close()
+        print(f"[Product Board] 读取到 {len(rows)} 行数据", flush=True)
 
         # 通过 zip 结构提取嵌入图片（避免 openpyxl 非 read_only 卡死）
+        print("[Product Board] 开始 zip 图片提取...", flush=True)
         image_map = _extract_images_from_xlsx(raw, len(rows))
+        print(f"[Product Board] 图片提取完成，共 {len(image_map)} 张", flush=True)
         return rows, image_map, None
 
     # CSV（无嵌入图片）
+    print("[Product Board] 尝试 CSV 解析...", flush=True)
     content = None
     for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb2312'):
         try:
@@ -137,7 +145,9 @@ def _parse_file_rows(file):
             continue
     if content is None:
         return None, None, "文件编码无法识别"
-    return list(csv.DictReader(io.StringIO(content))), {}, None
+    rows = list(csv.DictReader(io.StringIO(content)))
+    print(f"[Product Board] CSV 解析完成，共 {len(rows)} 行", flush=True)
+    return rows, {}, None
 
 
 def _extract_images_from_xlsx(raw, row_count):
@@ -150,29 +160,34 @@ def _extract_images_from_xlsx(raw, row_count):
 
     image_map = {}
     try:
+        print("[Product Board] 打开 zip...", flush=True)
         zf = zipfile.ZipFile(io.BytesIO(raw))
         names = zf.namelist()
+        print(f"[Product Board] zip 内共 {len(names)} 个文件", flush=True)
 
         # 找到 sheet1 的 drawing 文件，从中读图片锚点行号
         drawing_path = 'xl/drawings/drawing1.xml'
         drawing_rels_path = 'xl/drawings/_rels/drawing1.xml.rels'
 
         if drawing_path not in names:
-            print("[Product Board] xlsx 无 drawing 文件，没有嵌入图片")
+            print("[Product Board] xlsx 无 drawing 文件，没有嵌入图片", flush=True)
             zf.close()
             return image_map
 
         # 解析 drawing rels：rId → 图片文件路径
         rels = {}
         if drawing_rels_path in names:
+            print("[Product Board] 解析 drawing rels...", flush=True)
             rel_xml = ElementTree.fromstring(zf.read(drawing_rels_path))
             ns = '{http://schemas.openxmlformats.org/package/2006/relationships}'
             for rel in rel_xml:
                 rid = rel.get('Id')
                 target = rel.get('Target', '')
                 rels[rid] = target.replace('../', 'xl/')
+            print(f"[Product Board] 找到 {len(rels)} 个 rel 映射", flush=True)
 
         # 解析 drawing：提取每个图片的锚点行号
+        print("[Product Board] 解析 drawing XML...", flush=True)
         draw_xml = ElementTree.fromstring(zf.read(drawing_path))
         # 命名空间
         nsmap = {
@@ -181,8 +196,10 @@ def _extract_images_from_xlsx(raw, row_count):
             'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
         }
 
+        anchor_count = 0
         for anchor in draw_xml.iter():
             if 'oneCellAnchor' in anchor.tag or 'twoCellAnchor' in anchor.tag:
+                anchor_count += 1
                 from_el = anchor.find('xdr:from', nsmap)
                 if from_el is None:
                     continue
@@ -206,9 +223,9 @@ def _extract_images_from_xlsx(raw, row_count):
                         image_map[data_row_idx] = zf.read(img_path)
 
         zf.close()
-        print(f"[Product Board] 从 xlsx 提取到 {len(image_map)} 张嵌入图片")
+        print(f"[Product Board] 遍历 {anchor_count} 个锚点，提取到 {len(image_map)} 张嵌入图片", flush=True)
     except Exception as e:
-        print(f"[Product Board] xlsx 图片提取失败: {e}")
+        print(f"[Product Board] xlsx 图片提取失败: {e}", flush=True)
 
     return image_map
 
@@ -267,6 +284,7 @@ def import_product_board():
     Excel 支持提取嵌入图片；新 ASIN 或没图片的旧 ASIN 会自动保存图片并补全历史批次。
     """
     batch = datetime.now().strftime('%Y%m%d%H%M%S')
+    print(f"[Product Board] ====== 开始导入 batch={batch} ======", flush=True)
     inserted = 0
     skipped = 0
     errors = []
@@ -274,6 +292,7 @@ def import_product_board():
     try:
         image_map = {}
         if 'file' in request.files:
+            print("[Product Board] 检测到文件上传，开始解析...", flush=True)
             rows, image_map, err = _parse_file_rows(request.files['file'])
             if err:
                 return jsonify({"status": "error", "message": err}), 400
@@ -282,11 +301,14 @@ def import_product_board():
             rows = body.get('data', [])
             if not rows:
                 return jsonify({"status": "error", "message": "请上传文件或传入 data 数组"}), 400
+            print(f"[Product Board] JSON 模式，{len(rows)} 条数据", flush=True)
 
         if not rows:
             return jsonify({"status": "error", "message": "无数据"}), 400
 
+        print("[Product Board] 获取数据库连接...", flush=True)
         conn = _get_conn()
+        print("[Product Board] 数据库连接成功", flush=True)
         image_saved = 0
         asins_got_image = set()  # 记录本次拿到图片的 ASIN
         try:
