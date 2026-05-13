@@ -76,7 +76,7 @@ except AttributeError:
 
 @app.before_request
 def log_request():
-    pass  # 只用于触发 after_request
+    print(f"[Request] {request.method} {request.path} - Content-Length: {request.content_length}", flush=True)
 
 @app.after_request
 def log_response(response):

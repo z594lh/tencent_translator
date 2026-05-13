@@ -311,15 +311,26 @@ def import_product_board():
         print("[Product Board] 数据库连接成功", flush=True)
         image_saved = 0
         asins_got_image = set()  # 记录本次拿到图片的 ASIN
+        listed_skipped = 0
         try:
             with conn.cursor() as cursor:
                 asins_with_image = _get_asins_with_image(cursor)
+
+                # 查出所有已上架的 ASIN，导入时直接跳过
+                cursor.execute("SELECT DISTINCT asin FROM product_board WHERE is_listed = 1")
+                listed_asins = {r['asin'] for r in cursor.fetchall()}
+                if listed_asins:
+                    print(f"[Product Board] 已上架 ASIN {len(listed_asins)} 个，将跳过导入", flush=True)
 
                 for i, row in enumerate(rows):
                     mapped = _map_row(row)
                     asin = mapped.get('asin')
                     if not asin:
                         skipped += 1
+                        continue
+
+                    if asin in listed_asins:
+                        listed_skipped += 1
                         continue
 
                     # 图片来源1：Excel 嵌入图片
@@ -384,8 +395,8 @@ def import_product_board():
 
         return jsonify({
             "status": "success",
-            "message": f"导入完成：新增 {inserted} 条，保存图片 {image_saved} 张，跳过 {skipped} 条",
-            "data": {"inserted": inserted, "image_saved": image_saved, "skipped": skipped, "batch": batch, "errors": errors[:20]}
+            "message": f"导入完成：新增 {inserted} 条，保存图片 {image_saved} 张，跳过 {skipped} 条，已上架跳过 {listed_skipped} 条",
+            "data": {"inserted": inserted, "image_saved": image_saved, "skipped": skipped, "listed_skipped": listed_skipped, "batch": batch, "errors": errors[:20]}
         })
 
     except Exception as e:
@@ -444,6 +455,7 @@ def list_product_board():
         batch = request.args.get('batch', '').strip() or None
         min_sales = request.args.get('min_sales', '').strip() or None
         min_margin = request.args.get('min_margin', '').strip() or None
+        is_listed = request.args.get('is_listed', '').strip() or None
         sort_by = request.args.get('sort_by', 'sales_30d')
         sort_dir = request.args.get('sort_dir', 'desc')
         page = int(request.args.get('page', 1))
@@ -490,6 +502,10 @@ def list_product_board():
                 if min_margin:
                     conditions.append("profit_margin_30d >= %s")
                     params.append(float(min_margin))
+
+                if is_listed is not None:
+                    conditions.append("is_listed = %s")
+                    params.append(1 if is_listed.lower() in ('true', '1') else 0)
 
                 where_clause = " AND ".join(conditions)
 
@@ -665,6 +681,43 @@ def batch_delete_product_board():
             conn.close()
     except Exception as e:
         print(f"[Product Board] 批量删除异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ==================== 是否上架 ====================
+
+@product_board_bp.route('/product-board/toggle-listed', methods=['POST'])
+@login_required
+def toggle_listed():
+    """切换 ASIN 的上架状态（同步更新该 ASIN 所有批次）"""
+    try:
+        data = request.get_json() or {}
+        asin = (data.get('asin') or '').strip()
+        is_listed = data.get('is_listed', None)
+
+        if not asin:
+            return jsonify({"status": "error", "message": "asin 不能为空"}), 400
+        if is_listed is None:
+            return jsonify({"status": "error", "message": "is_listed 不能为空"}), 400
+
+        is_listed = 1 if is_listed else 0
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE product_board SET is_listed = %s WHERE asin = %s
+                """, (is_listed, asin))
+                conn.commit()
+                return jsonify({
+                    "status": "success",
+                    "message": f"已{'上架' if is_listed else '取消上架'} {asin}，更新 {cursor.rowcount} 条记录",
+                    "data": {"asin": asin, "is_listed": bool(is_listed), "updated_rows": cursor.rowcount}
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Product Board] 切换上架状态异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
