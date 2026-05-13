@@ -24,6 +24,7 @@ from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
 from blueprints.logistics import logistics_bp
 from blueprints.pricing import pricing_bp
+from blueprints.product_board import product_board_bp
 
 # APScheduler 定时任务
 from services.scheduler import start_scheduler
@@ -148,6 +149,9 @@ app.register_blueprint(logistics_bp)
 
 # 注册定价计算路由
 app.register_blueprint(pricing_bp)
+
+# 注册选品看板路由
+app.register_blueprint(product_board_bp)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
