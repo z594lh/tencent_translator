@@ -108,56 +108,23 @@ def _parse_file_rows(file):
     raw = file.read()
 
     if filename.endswith(('.xlsx', '.xls')):
-        # read_only 模式拿不到图片，改用普通模式
-        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        # read_only 快读数据
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
         ws = wb.active
-
-        # 读数据行
         rows_iter = ws.iter_rows()
         header_row = next(rows_iter, None)
         if not header_row:
             wb.close()
             return None, None, "Excel 文件为空"
         headers = [str(c.value or '') for c in header_row]
-
-        # 找到"图片"列索引
-        image_col_idx = None
-        for i, h in enumerate(headers):
-            if h == '图片':
-                image_col_idx = i
-                break
-
         rows = []
-        data_start_row = 2  # 第1行是表头，数据从第2行开始
         for r in rows_iter:
             vals = [c.value for c in r]
             rows.append(dict(zip(headers, vals)))
-
-        # 提取嵌入图片，按锚点行号定位
-        image_map = {}  # row_index -> image_bytes
-        if hasattr(ws, '_images') and ws._images:
-            for img in ws._images:
-                try:
-                    anchor = img.anchor
-                    if hasattr(anchor, '_from'):
-                        img_row = anchor._from.row  # 0-based
-                    elif hasattr(anchor, 'row'):
-                        img_row = anchor.row
-                    else:
-                        continue
-                    # 转为 0-based 数据行索引（跳过表头）
-                    data_row_idx = img_row - 1  # 表头占一行
-                    if 0 <= data_row_idx < len(rows):
-                        # 只有数据里没有图片URL时才从图像提取
-                        existing_url = rows[data_row_idx].get('图片', '')
-                        if not existing_url or str(existing_url).strip() == '':
-                            image_map[data_row_idx] = img.image if hasattr(img, 'image') else None
-                            if image_map[data_row_idx] is None:
-                                image_map[data_row_idx] = img._data()
-                except Exception as e:
-                    print(f"[Product Board] 提取图片位置失败: {e}")
-
         wb.close()
+
+        # 通过 zip 结构提取嵌入图片（避免 openpyxl 非 read_only 卡死）
+        image_map = _extract_images_from_xlsx(raw, len(rows))
         return rows, image_map, None
 
     # CSV（无嵌入图片）
@@ -171,6 +138,79 @@ def _parse_file_rows(file):
     if content is None:
         return None, None, "文件编码无法识别"
     return list(csv.DictReader(io.StringIO(content))), {}, None
+
+
+def _extract_images_from_xlsx(raw, row_count):
+    """从 xlsx zip 包中直接提取嵌入图片，按锚点行号映射到数据行
+
+    返回: {data_row_index: image_bytes}
+    """
+    import zipfile
+    from xml.etree import ElementTree
+
+    image_map = {}
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        names = zf.namelist()
+
+        # 找到 sheet1 的 drawing 文件，从中读图片锚点行号
+        drawing_path = 'xl/drawings/drawing1.xml'
+        drawing_rels_path = 'xl/drawings/_rels/drawing1.xml.rels'
+
+        if drawing_path not in names:
+            print("[Product Board] xlsx 无 drawing 文件，没有嵌入图片")
+            zf.close()
+            return image_map
+
+        # 解析 drawing rels：rId → 图片文件路径
+        rels = {}
+        if drawing_rels_path in names:
+            rel_xml = ElementTree.fromstring(zf.read(drawing_rels_path))
+            ns = '{http://schemas.openxmlformats.org/package/2006/relationships}'
+            for rel in rel_xml:
+                rid = rel.get('Id')
+                target = rel.get('Target', '')
+                rels[rid] = target.replace('../', 'xl/')
+
+        # 解析 drawing：提取每个图片的锚点行号
+        draw_xml = ElementTree.fromstring(zf.read(drawing_path))
+        # 命名空间
+        nsmap = {
+            'xdr': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing',
+            'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+            'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        }
+
+        for anchor in draw_xml.iter():
+            if 'oneCellAnchor' in anchor.tag or 'twoCellAnchor' in anchor.tag:
+                from_el = anchor.find('xdr:from', nsmap)
+                if from_el is None:
+                    continue
+                row_el = from_el.find('xdr:row', nsmap)
+                if row_el is None or row_el.text is None:
+                    continue
+                anchor_row = int(row_el.text)  # 0-based 行号，含表头
+
+                # 找图片引用 rId
+                blip = anchor.find('.//a:blip', nsmap)
+                if blip is None:
+                    continue
+                embed = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                if not embed or embed not in rels:
+                    continue
+
+                img_path = rels[embed]
+                if img_path in names:
+                    data_row_idx = anchor_row - 1  # 去掉表头
+                    if 0 <= data_row_idx < row_count:
+                        image_map[data_row_idx] = zf.read(img_path)
+
+        zf.close()
+        print(f"[Product Board] 从 xlsx 提取到 {len(image_map)} 张嵌入图片")
+    except Exception as e:
+        print(f"[Product Board] xlsx 图片提取失败: {e}")
+
+    return image_map
 
 
 def _map_row(row):
