@@ -39,7 +39,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
-CORS(app)
+CORS(app, expose_headers=['Content-Disposition'])
 
 # 自定义 JSON 序列化：datetime 统一返回 %Y-%m-%d %H:%M:%S
 try:
