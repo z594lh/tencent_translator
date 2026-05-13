@@ -125,7 +125,9 @@ def edit_pdf():
             crop_page = operations[0].get('page', 0) if operations else 0
             if crop_page < len(doc_temp):
                 text = doc_temp[crop_page].get_text()
+                print(f"[PDF Crop] 第{crop_page}页文本前500字: {text[:500]!r}")
                 fba_id, sku = _extract_fba_info_from_text(text)
+                print(f"[PDF Crop] 提取结果: fba_id={fba_id!r}, sku={sku!r}")
                 if fba_id and sku:
                     name_map = _get_product_names_by_skus([sku])
                     name = name_map.get(sku) or ''
