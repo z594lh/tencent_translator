@@ -276,6 +276,7 @@ def import_product_board():
         conn = _get_conn()
         image_saved = 0
         asins_got_image = set()
+        updated = 0
         try:
             with conn.cursor() as cursor:
                 # 预取所有已有本地图片的 ASIN → image_url
@@ -287,6 +288,17 @@ def import_product_board():
                 for r in cursor.fetchall():
                     if r['asin'] not in existing_images:
                         existing_images[r['asin']] = r['image_url']
+
+                # 预取已上架的 ASIN
+                cursor.execute("SELECT DISTINCT asin FROM product_board WHERE is_listed = 1")
+                listed_asins = {r['asin'] for r in cursor.fetchall()}
+
+                # 预取今日已有数据的 ASIN → id，用于同日期覆盖
+                cursor.execute("""
+                    SELECT asin, id FROM product_board
+                    WHERE DATE(created_at) = CURDATE()
+                """)
+                today_ids = {r['asin']: r['id'] for r in cursor.fetchall()}
 
                 for i, row in enumerate(rows):
                     mapped = _map_row(row)
@@ -306,14 +318,22 @@ def import_product_board():
                             asins_got_image.add(asin)
                             existing_images[asin] = local_url
 
+                    # 上架状态：新数据继承老数据的上架状态
+                    if asin in listed_asins:
+                        mapped['is_listed'] = 1
+
+                    # 同日期覆盖：今日已有该 ASIN → UPDATE；否则 INSERT
                     columns = [k for k in mapped.keys() if k in ALL_COLUMNS]
-                    placeholders = ', '.join(['%s'] * len(columns))
-                    sql = f"INSERT INTO product_board ({', '.join(columns)}) VALUES ({placeholders})"
-                    try:
-                        cursor.execute(sql, [mapped.get(c) for c in columns])
+                    if asin in today_ids:
+                        set_clause = ', '.join([f"{c} = %s" for c in columns])
+                        sql = f"UPDATE product_board SET {set_clause} WHERE id = %s"
+                        cursor.execute(sql, [mapped[c] for c in columns] + [today_ids[asin]])
+                        updated += 1
+                    else:
+                        placeholders = ', '.join(['%s'] * len(columns))
+                        sql = f"INSERT INTO product_board ({', '.join(columns)}) VALUES ({placeholders})"
+                        cursor.execute(sql, [mapped[c] for c in columns])
                         inserted += 1
-                    except Exception as e:
-                        errors.append(f"{asin}: {str(e)}")
 
                 # 新图片：补全该 ASIN 历史行中空的 image_url
                 for asin in asins_got_image:
@@ -328,8 +348,8 @@ def import_product_board():
 
         return jsonify({
             "status": "success",
-            "message": f"导入完成：新增 {inserted} 条，保存图片 {image_saved} 张，跳过 {skipped} 条",
-            "data": {"inserted": inserted, "image_saved": image_saved, "skipped": skipped, "errors": errors[:20]}
+            "message": f"导入完成：新增 {inserted} 条，更新 {updated} 条，保存图片 {image_saved} 张，跳过 {skipped} 条",
+            "data": {"inserted": inserted, "updated": updated, "image_saved": image_saved, "skipped": skipped, "errors": errors[:20]}
         })
 
     except Exception as e:
