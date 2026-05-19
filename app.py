@@ -26,6 +26,7 @@ from blueprints.logistics import logistics_bp
 from blueprints.pricing import pricing_bp
 from blueprints.product_board import product_board_bp
 from blueprints.reports import reports_bp
+from blueprints.cron import cron_bp
 
 # 定时任务已迁移到 Ubuntu crontab，通过 scripts/cron_jobs.py 执行
 # 不再使用 APScheduler，避免与系统计划任务重复运行
@@ -156,6 +157,9 @@ app.register_blueprint(product_board_bp)
 
 # 注册数据报表路由
 app.register_blueprint(reports_bp)
+
+# 注册计划任务看板路由
+app.register_blueprint(cron_bp)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
