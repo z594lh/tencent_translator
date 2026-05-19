@@ -25,10 +25,20 @@ from blueprints.products import products_bp
 from blueprints.logistics import logistics_bp
 from blueprints.pricing import pricing_bp
 from blueprints.product_board import product_board_bp
+from blueprints.reports import reports_bp
 
 # APScheduler 定时任务
-from services.scheduler import start_scheduler
-scheduler = start_scheduler()
+# 从 .env 读取 ENV，测试环境不启动定时任务
+from dotenv import load_dotenv
+load_dotenv(override=True)
+ENV = os.getenv("ENV", "production").lower()
+
+if ENV in ("test", "testing", "development", "dev"):
+    print(f"[App] 当前环境为 {ENV}，跳过启动 APScheduler 定时任务")
+    scheduler = None
+else:
+    from services.scheduler import start_scheduler
+    scheduler = start_scheduler()
 
 def getConfigUrl():
     """从配置中读取链接"""
@@ -152,6 +162,9 @@ app.register_blueprint(pricing_bp)
 
 # 注册选品看板路由
 app.register_blueprint(product_board_bp)
+
+# 注册数据报表路由
+app.register_blueprint(reports_bp)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

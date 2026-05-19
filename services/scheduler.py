@@ -292,5 +292,57 @@ def start_scheduler():
     scheduler.add_job(job_orders_month, 'cron', hour='2,8,14,20', minute=20, id='orders_month_6h', replace_existing=True)
     scheduler.add_job(job_exchange_rate, 'cron', hour=9, minute=0, id='exchange_rate_daily', replace_existing=True)
 
+    # ==================== 6. 报表生成任务 ====================
+    from services.report_generator import (
+        generate_business_daily,
+        generate_business_weekly,
+        generate_business_monthly,
+        generate_sku_profit,
+        generate_inventory_turnover,
+        generate_yesterday_reports,
+    )
+
+    def job_reports_daily():
+        """每日凌晨生成昨日报表（日报+SKU利润+库存周转）"""
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{now}] [Scheduler] 开始生成昨日报表...")
+        try:
+            results = generate_yesterday_reports()
+            print(f"[{now}] [Scheduler] 昨日报表生成完成: {results}")
+        except Exception as e:
+            print(f"[{now}] [Scheduler] 昨日报表生成异常: {e}")
+
+    def job_reports_weekly():
+        """每周一凌晨生成本周周报（周一~周日）"""
+        now = datetime.now()
+        now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        yesterday = now - timedelta(days=1)  # 昨天周日
+        week_start = (yesterday - timedelta(days=6)).strftime('%Y-%m-%d')  # 本周一
+        week_end = yesterday.strftime('%Y-%m-%d')  # 本周日
+        week_label = f"{week_start}~{week_end}"
+        print(f"[{now_str}] [Scheduler] 开始生成周报 {week_label}...")
+        try:
+            result = generate_business_weekly(week_start, week_end)
+            print(f"[{now_str}] [Scheduler] 周报生成完成: {result}")
+        except Exception as e:
+            print(f"[{now_str}] [Scheduler] 周报生成异常: {e}")
+
+    def job_reports_monthly():
+        """每月1号凌晨生成本月月报"""
+        now = datetime.now()
+        now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        month_str = (now - timedelta(days=1)).strftime('%Y-%m')  # 上月
+        print(f"[{now_str}] [Scheduler] 开始生成月报 {month_str}...")
+        try:
+            result = generate_business_monthly(month_str)
+            print(f"[{now_str}] [Scheduler] 月报生成完成: {result}")
+        except Exception as e:
+            print(f"[{now_str}] [Scheduler] 月报生成异常: {e}")
+
+    # 注册报表任务
+    scheduler.add_job(job_reports_daily, 'cron', hour=2, minute=0, id='reports_daily', replace_existing=True)
+    scheduler.add_job(job_reports_weekly, 'cron', day_of_week='mon', hour=3, minute=0, id='reports_weekly', replace_existing=True)
+    scheduler.add_job(job_reports_monthly, 'cron', day=1, hour=4, minute=0, id='reports_monthly', replace_existing=True)
+
     scheduler.start()
     return scheduler

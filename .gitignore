@@ -28,5 +28,6 @@ static/product_board/*
 doc/
 docs/
 sql/
+scripts/
 migrations/
 test.py
