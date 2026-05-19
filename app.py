@@ -27,18 +27,9 @@ from blueprints.pricing import pricing_bp
 from blueprints.product_board import product_board_bp
 from blueprints.reports import reports_bp
 
-# APScheduler 定时任务
-# 从 .env 读取 ENV，测试环境不启动定时任务
-from dotenv import load_dotenv
-load_dotenv(override=True)
-ENV = os.getenv("ENV", "production").lower()
-
-if ENV in ("test", "testing", "development", "dev"):
-    print(f"[App] 当前环境为 {ENV}，跳过启动 APScheduler 定时任务")
-    scheduler = None
-else:
-    from services.scheduler import start_scheduler
-    scheduler = start_scheduler()
+# 定时任务已迁移到 Ubuntu crontab，通过 scripts/cron_jobs.py 执行
+# 不再使用 APScheduler，避免与系统计划任务重复运行
+# 如需查看原 APScheduler 代码，参考 services/scheduler.py
 
 def getConfigUrl():
     """从配置中读取链接"""

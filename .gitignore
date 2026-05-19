@@ -28,6 +28,7 @@ static/product_board/*
 doc/
 docs/
 sql/
-scripts/
+scripts/*
+!scripts/cron_jobs.py
 migrations/
 test.py
