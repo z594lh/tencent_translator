@@ -1383,14 +1383,24 @@ def get_inbound_plan_shipments_from_db(shop_id, inbound_plan_id=None, page=1, pa
 
             where_clause = " AND ".join(conditions)
 
-            cursor.execute(f"SELECT COUNT(*) as total FROM amazon_inbound_shipments WHERE {where_clause}", tuple(params))
+            count_sql = f"""
+                SELECT COUNT(*) as total
+                FROM amazon_inbound_shipments s
+                LEFT JOIN amazon_inbound_plans p ON s.inbound_plan_id = p.inbound_plan_id AND s.shop_id = p.shop_id
+                WHERE {where_clause}
+            """
+            cursor.execute(count_sql, tuple(params))
             total = cursor.fetchone()["total"]
 
             offset = (page - 1) * page_size
             sql = f"""
-                SELECT * FROM amazon_inbound_shipments
+                SELECT
+                    s.*,
+                    p.created_at AS plan_created_at
+                FROM amazon_inbound_shipments s
+                LEFT JOIN amazon_inbound_plans p ON s.inbound_plan_id = p.inbound_plan_id AND s.shop_id = p.shop_id
                 WHERE {where_clause}
-                ORDER BY sync_time DESC
+                ORDER BY s.sync_time DESC
                 LIMIT %s OFFSET %s
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
@@ -1454,6 +1464,7 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
                 SELECT COUNT(*) as total
                 FROM amazon_inbound_shipments s
                 LEFT JOIN amazon_inbound_shipments_detail d ON s.shipment_id = d.shipment_id AND d.shop_id = s.shop_id
+                LEFT JOIN amazon_inbound_plans p ON s.inbound_plan_id = p.inbound_plan_id AND s.shop_id = p.shop_id
                 WHERE {where_clause}
             """
             cursor.execute(count_sql, tuple(params))
@@ -1480,9 +1491,11 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
                     d.selected_delivery_window_json,
                     d.tracking_details_json,
                     d.dates_json,
-                    d.sync_time AS detail_sync_time
+                    d.sync_time AS detail_sync_time,
+                    p.created_at AS plan_created_at
                 FROM amazon_inbound_shipments s
                 LEFT JOIN amazon_inbound_shipments_detail d ON s.shipment_id = d.shipment_id AND d.shop_id = s.shop_id
+                LEFT JOIN amazon_inbound_plans p ON s.inbound_plan_id = p.inbound_plan_id AND s.shop_id = p.shop_id
                 WHERE {where_clause}
                 ORDER BY s.sync_time DESC
                 LIMIT %s OFFSET %s
