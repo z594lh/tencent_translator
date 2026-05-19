@@ -29,6 +29,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# 加载 .env 配置（crontab 不会自动加载环境变量）
+from dotenv import load_dotenv
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
+
 from datetime import datetime, timedelta
 from services.mysql_service import get_db_connection
 from services.shop_service import get_all_active_shops
