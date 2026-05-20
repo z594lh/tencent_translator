@@ -12,7 +12,7 @@ from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
 from services.report_generator import (
     generate_business_daily,
@@ -76,6 +76,7 @@ def _get_shop_id_optional():
 
 @reports_bp.route('/reports/business', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def list_business_reports():
     """查询经营报表列表（日/周/月报）"""
     try:
@@ -139,6 +140,7 @@ def list_business_reports():
 
 @reports_bp.route('/reports/business/summary', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def business_summary():
     """经营报表汇总统计"""
     try:
@@ -196,6 +198,7 @@ def business_summary():
 
 @reports_bp.route('/reports/business/trend', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def business_trend():
     """经营趋势（按时间维度返回销售额、毛利、头程占比走势）"""
     try:
@@ -262,6 +265,7 @@ def business_trend():
 
 @reports_bp.route('/reports/business/generate', methods=['POST'])
 @login_required
+@permission_required('reports:generate')
 def trigger_business_report():
     """手动触发经营报表生成"""
     try:
@@ -300,6 +304,7 @@ def trigger_business_report():
 
 @reports_bp.route('/reports/sku-profit', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def list_sku_profit():
     """查询 SKU 利润表列表"""
     try:
@@ -370,6 +375,7 @@ def list_sku_profit():
 
 @reports_bp.route('/reports/sku-profit/summary', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def sku_profit_summary():
     """SKU 利润汇总统计"""
     try:
@@ -421,6 +427,7 @@ def sku_profit_summary():
 
 @reports_bp.route('/reports/sku-profit/top', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def sku_profit_top():
     """SKU 利润 Top / Bottom 排行"""
     try:
@@ -487,6 +494,7 @@ def sku_profit_top():
 
 @reports_bp.route('/reports/sku-profit/generate', methods=['POST'])
 @login_required
+@permission_required('reports:generate')
 def trigger_sku_profit():
     """手动触发 SKU 利润表生成"""
     try:
@@ -509,6 +517,7 @@ def trigger_sku_profit():
 
 @reports_bp.route('/reports/inventory-turnover', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def list_inventory_turnover():
     """查询库存周转列表"""
     try:
@@ -573,6 +582,7 @@ def list_inventory_turnover():
 
 @reports_bp.route('/reports/inventory-turnover/stats', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def inventory_turnover_stats():
     """库存周转统计"""
     try:
@@ -632,6 +642,7 @@ def inventory_turnover_stats():
 
 @reports_bp.route('/reports/inventory-turnover/generate', methods=['POST'])
 @login_required
+@permission_required('reports:generate')
 def trigger_inventory_turnover():
     """手动触发库存周转生成"""
     try:
@@ -646,6 +657,7 @@ def trigger_inventory_turnover():
 
 @reports_bp.route('/reports/inventory-turnover/batch-update-status', methods=['POST'])
 @login_required
+@permission_required('reports:edit')
 def batch_update_inventory_status():
     """批量更新库存状态（根据当前库存和日均销量自动计算）"""
     try:
@@ -689,6 +701,7 @@ def batch_update_inventory_status():
 
 @reports_bp.route('/reports/ad-spend/import', methods=['POST'])
 @login_required
+@permission_required('reports:edit')
 def import_ad_spend():
     """导入广告费明细（JSON数组或单条），兼容 Amazon Advertising API 字段格式"""
     try:
@@ -776,6 +789,7 @@ def import_ad_spend():
 
 @reports_bp.route('/reports/refund/import', methods=['POST'])
 @login_required
+@permission_required('reports:edit')
 def import_refund_records():
     """导入退款明细（JSON数组或单条）"""
     try:
@@ -841,6 +855,7 @@ def import_refund_records():
 
 @reports_bp.route('/reports/generation-logs', methods=['GET'])
 @login_required
+@permission_required('reports:page')
 def list_generation_logs():
     """查询报表生成日志"""
     try:
@@ -895,6 +910,7 @@ def list_generation_logs():
 
 @reports_bp.route('/reports/advertising', methods=['GET'])
 @login_required
+@permission_required('reports_advertising:page')
 def list_advertising_reports():
     """查询广告效果报表列表"""
     try:
@@ -973,6 +989,7 @@ def list_advertising_reports():
 
 @reports_bp.route('/reports/advertising/summary', methods=['GET'])
 @login_required
+@permission_required('reports_advertising:page')
 def advertising_summary():
     """广告效果汇总统计"""
     try:
@@ -1037,6 +1054,7 @@ def advertising_summary():
 
 @reports_bp.route('/reports/advertising/trend', methods=['GET'])
 @login_required
+@permission_required('reports_advertising:page')
 def advertising_trend():
     """广告效果趋势（按时间维度返回核心指标走势）"""
     try:
@@ -1106,6 +1124,7 @@ def advertising_trend():
 
 @reports_bp.route('/reports/advertising/generate', methods=['POST'])
 @login_required
+@permission_required('reports_advertising:generate')
 def trigger_advertising_report():
     """手动触发广告效果报表生成"""
     try:
@@ -1143,6 +1162,7 @@ def trigger_advertising_report():
 
 @reports_bp.route('/reports/generate-yesterday', methods=['POST'])
 @login_required
+@permission_required('reports:generate')
 def trigger_yesterday_reports():
     """手动触发昨日全部报表生成"""
     try:

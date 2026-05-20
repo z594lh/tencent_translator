@@ -9,7 +9,7 @@ import time
 import json
 
 from flask import Blueprint, request, jsonify
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
 
@@ -42,6 +42,7 @@ def _require_shop_id_from_body(data: dict) -> int:
 
 @amazon_orders_bp.route('/amazon/orders', methods=['GET'])
 @login_required
+@permission_required('amazon_orders:page')
 def amazon_orders():
     """
     从数据库分页查询订单列表
@@ -96,6 +97,7 @@ def amazon_orders():
 
 @amazon_orders_bp.route('/amazon/orders/<order_id>', methods=['GET'])
 @login_required
+@permission_required('amazon_orders:page')
 def amazon_order_detail(order_id):
     """
     从数据库查询单个订单详情（含商品列表）
@@ -126,6 +128,7 @@ def amazon_order_detail(order_id):
 
 @amazon_orders_bp.route('/amazon/sync/orders', methods=['POST'])
 @login_required
+@permission_required('amazon_orders:sync')
 def sync_amazon_orders():
     """
     手动触发订单数据同步（从 API 写入数据库）
@@ -169,6 +172,7 @@ def sync_amazon_orders():
 
 @amazon_orders_bp.route('/amazon/sync/orders/<order_id>/items', methods=['POST'])
 @login_required
+@permission_required('amazon_orders:sync')
 def sync_amazon_order_items(order_id):
     """
     手动触发指定订单的商品数据同步
@@ -199,6 +203,7 @@ def sync_amazon_order_items(order_id):
 
 @amazon_orders_bp.route('/amazon/sync/orders-all', methods=['POST'])
 @login_required
+@permission_required('amazon_orders:sync')
 def sync_amazon_orders_all():
     """
     一键同步订单及其商品数据

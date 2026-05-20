@@ -23,6 +23,7 @@ static/invoices/*
 static/fbatag/*
 static/products/*
 static/product_board/*
+static/avatars/*
 
 .claude/
 doc/

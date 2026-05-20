@@ -10,7 +10,7 @@ from decimal import Decimal
 from urllib.parse import urlparse
 
 from flask import Blueprint, request, jsonify, send_file
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, Border, Side
@@ -414,6 +414,7 @@ def _build_excel(data):
 
 @amazon_invoice_export_bp.route('/amazon/shipments/<shipment_id>/invoice/export', methods=['GET'])
 @login_required
+@permission_required('amazon_invoice_export:export')
 def export_shipment_invoice(shipment_id):
     """
     根据货件编号导出发票模板 xlsx

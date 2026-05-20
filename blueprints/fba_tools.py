@@ -5,7 +5,7 @@ from flask import Blueprint, request, jsonify, send_file
 import os
 from dotenv import load_dotenv
 
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.fbaFnSkuTag import generate_amazon_label_v4
 from services.pdf_editor import crop_pdf, split_pdf
 
@@ -26,6 +26,7 @@ BASE_URL = os.getenv("BASE_URL", "")
 
 @fba_tools_bp.route('/fba/label', methods=['POST'])
 @login_required
+@permission_required('fba_tools:generate')
 def create_fba_label():
     """
     生成亚马逊 FBA SKU 标签 PDF
@@ -95,6 +96,8 @@ def create_fba_label():
 
 
 @fba_tools_bp.route('/pdf/edit', methods=['POST'])
+@login_required
+@permission_required('fba_tools:generate')
 def edit_pdf():
     """
     裁剪 PDF 页面
@@ -187,7 +190,8 @@ def _get_product_names_by_skus(skus):
     finally:
         conn.close()
 
-
+@login_required
+@permission_required('fba_tools:generate')
 @fba_tools_bp.route('/pdf/split', methods=['POST'])
 def split_pdf_route():
     """

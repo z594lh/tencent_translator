@@ -9,7 +9,7 @@ import time
 import json
 
 from flask import Blueprint, request, jsonify
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
 
@@ -47,6 +47,7 @@ def _require_shop_id_from_body(data: dict) -> int:
 
 @amazon_inventory_bp.route('/amazon/inventory', methods=['GET'])
 @login_required
+@permission_required('amazon_inventory:page')
 def amazon_inventory():
     """
     从数据库分页查询库存汇总数据
@@ -92,6 +93,7 @@ def amazon_inventory():
 
 @amazon_inventory_bp.route('/amazon/sync/inventory', methods=['POST'])
 @login_required
+@permission_required('amazon_inventory:sync')
 def sync_amazon_inventory():
     """
     手动触发库存数据同步（从 API 写入数据库）

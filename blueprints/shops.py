@@ -3,7 +3,7 @@
 提供店铺的增删改查、设置默认等接口
 """
 from flask import Blueprint, request, jsonify
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_all_active_shops
 from services.mysql_service import get_db_connection
 
@@ -76,6 +76,7 @@ def _validate_shop_data(data: dict, is_update: bool = False) -> dict:
 
 @shops_bp.route('/shops', methods=['GET'])
 @login_required
+@permission_required('shops:page')
 def list_shops():
     """
     查询所有启用的店铺列表（用于前端下拉选择器）
@@ -105,6 +106,7 @@ def list_shops():
 
 @shops_bp.route('/shops/all', methods=['GET'])
 @login_required
+@permission_required('shops:page')
 def list_all_shops():
     """
     查询所有店铺（含禁用），用于管理后台
@@ -133,6 +135,7 @@ def list_all_shops():
 
 @shops_bp.route('/shops/<int:shop_id>', methods=['GET'])
 @login_required
+@permission_required('shops:page')
 def get_shop(shop_id):
     """
     查询单个店铺详情（含 refresh_token，用于编辑）
@@ -162,6 +165,7 @@ def get_shop(shop_id):
 
 @shops_bp.route('/shops', methods=['POST'])
 @login_required
+@permission_required('shops:create')
 def create_shop():
     """
     创建新店铺
@@ -223,6 +227,7 @@ def create_shop():
 
 @shops_bp.route('/shops/<int:shop_id>', methods=['PUT'])
 @login_required
+@permission_required('shops:edit')
 def update_shop(shop_id):
     """
     更新店铺信息
@@ -291,6 +296,7 @@ def update_shop(shop_id):
 
 @shops_bp.route('/shops/<int:shop_id>', methods=['DELETE'])
 @login_required
+@permission_required('shops:delete')
 def delete_shop(shop_id):
     """
     删除店铺（软删除：将 status 设为 0）
@@ -327,6 +333,7 @@ def delete_shop(shop_id):
 
 @shops_bp.route('/shops/<int:shop_id>/set-default', methods=['POST'])
 @login_required
+@permission_required('shops:set_default')
 def set_default_shop(shop_id):
     """
     设置默认店铺

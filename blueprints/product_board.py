@@ -4,7 +4,7 @@
 趋势查看同一 ASIN 所有历史记录。
 """
 from flask import Blueprint, request, jsonify, Response
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
 from dotenv import load_dotenv
 import json
@@ -251,6 +251,7 @@ def _save_image_bytes(asin, image_bytes):
 
 @product_board_bp.route('/product-board/import', methods=['POST'])
 @login_required
+@permission_required('product_board:import')
 def import_product_board():
     print(f"[Product Board] ====== 开始导入 ======", flush=True)
     inserted = 0
@@ -361,6 +362,7 @@ def import_product_board():
 
 @product_board_bp.route('/product-board', methods=['GET'])
 @login_required
+@permission_required('product_board:page')
 def list_product_board():
     try:
         keyword = request.args.get('keyword', '').strip() or None
@@ -448,6 +450,7 @@ def list_product_board():
 
 @product_board_bp.route('/product-board/trend', methods=['GET'])
 @login_required
+@permission_required('product_board:page')
 def product_board_trend():
     try:
         asins_raw = request.args.get('asins', '').strip()
@@ -516,6 +519,7 @@ def product_board_trend():
 
 @product_board_bp.route('/product-board/<int:product_id>', methods=['GET'])
 @login_required
+@permission_required('product_board:page')
 def get_product_board_detail(product_id):
     try:
         conn = _get_conn()
@@ -537,6 +541,7 @@ def get_product_board_detail(product_id):
 
 @product_board_bp.route('/product-board/<int:product_id>', methods=['DELETE'])
 @login_required
+@permission_required('product_board:delete')
 def delete_product_board(product_id):
     try:
         conn = _get_conn()
@@ -556,6 +561,7 @@ def delete_product_board(product_id):
 
 @product_board_bp.route('/product-board/batch-delete', methods=['POST'])
 @login_required
+@permission_required('product_board:batch_delete')
 def batch_delete_product_board():
     try:
         data = request.get_json() or {}
@@ -585,6 +591,7 @@ def batch_delete_product_board():
 
 @product_board_bp.route('/product-board/toggle-listed', methods=['POST'])
 @login_required
+@permission_required('product_board:toggle_listed')
 def toggle_listed():
     try:
         data = request.get_json() or {}
@@ -619,6 +626,7 @@ def toggle_listed():
 
 @product_board_bp.route('/product-board/filters', methods=['GET'])
 @login_required
+@permission_required('product_board:page')
 def product_board_filters():
     try:
         conn = _get_conn()
@@ -642,6 +650,7 @@ def product_board_filters():
 
 @product_board_bp.route('/product-board/stats', methods=['GET'])
 @login_required
+@permission_required('product_board:page')
 def product_board_stats():
     try:
         conn = _get_conn()
@@ -686,6 +695,7 @@ def product_board_stats():
 
 @product_board_bp.route('/product-board/export', methods=['GET'])
 @login_required
+@permission_required('product_board:export')
 def export_product_board():
     try:
         keyword = request.args.get('keyword', '').strip() or None

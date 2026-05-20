@@ -8,7 +8,7 @@ SKU 售价计算模块
 import re
 from flask import Blueprint, request, jsonify
 from services.mysql_service import get_db_connection
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 
 pricing_bp = Blueprint('pricing', __name__, url_prefix='/api')
 
@@ -212,6 +212,7 @@ def _get_freight_allocation(cursor, seller_sku):
 
 @pricing_bp.route('/pricing/calculate', methods=['POST'])
 @login_required
+@permission_required('pricing:calculate')
 def calculate_price():
     """
     SKU 售价反算接口

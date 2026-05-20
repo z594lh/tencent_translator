@@ -11,7 +11,7 @@ import json
 import time
 
 from flask import Blueprint, request, jsonify
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.oss_uploader import upload_image_for_listing
 from services.mysql_service import get_db_connection
@@ -47,6 +47,7 @@ def _require_shop_id_from_body(data: dict) -> int:
 
 @amazon_listing_bp.route('/amazon/listings', methods=['GET'])
 @login_required
+@permission_required('amazon_listings:page')
 def get_listings():
     """
     从数据库分页查询 Listing 列表
@@ -99,6 +100,7 @@ def get_listings():
 
 @amazon_listing_bp.route('/amazon/listings/<sku>', methods=['GET'])
 @login_required
+@permission_required('amazon_listings:page')
 def get_listing_detail(sku):
     """
     从数据库查询单个 Listing 详情（含子表数据：图片、五点、issues、报价）
@@ -125,6 +127,7 @@ def get_listing_detail(sku):
 
 @amazon_listing_bp.route('/amazon/sync/listings', methods=['POST'])
 @login_required
+@permission_required('amazon_listings:sync')
 def sync_listings():
     """
     手动触发 Listing 同步（从 SP-API 写入数据库）
@@ -165,6 +168,7 @@ def sync_listings():
 
 @amazon_listing_bp.route('/amazon/listings/<sku>/sync-to-product', methods=['POST'])
 @login_required
+@permission_required('amazon_listings:sync')
 def sync_listing_to_product(sku):
     """
     将指定 Listing 同步到 products 表：sku 存在则更新，不存在则新增。
@@ -344,6 +348,7 @@ def _get_dim_value(dim):
 
 @amazon_listing_bp.route('/amazon/listings/spapi/<sku>', methods=['GET'])
 @login_required
+@permission_required('amazon_listings:page')
 def get_listing_detail_spapi(sku):
     """
     实时从 SP-API 抓取单个 Listing 详情（不走数据库缓存）
@@ -376,6 +381,7 @@ def get_listing_detail_spapi(sku):
 
 @amazon_listing_bp.route('/amazon/listings', methods=['POST'])
 @login_required
+@permission_required('amazon_listings:create')
 def create_listing():
     """
     上架 Listing（创建新商品）
@@ -422,6 +428,7 @@ def create_listing():
 
 @amazon_listing_bp.route('/amazon/listings/<sku>', methods=['PUT'])
 @login_required
+@permission_required('amazon_listings:edit')
 def update_listing(sku):
     """
     修改 Listing（完全覆盖式更新）
@@ -465,6 +472,7 @@ def update_listing(sku):
 
 @amazon_listing_bp.route('/amazon/listings/<sku>', methods=['PATCH'])
 @login_required
+@permission_required('amazon_listings:edit')
 def patch_listing(sku):
     """
     部分更新 Listing（JSON Patch）
@@ -502,6 +510,7 @@ def patch_listing(sku):
 
 @amazon_listing_bp.route('/amazon/listings/<sku>', methods=['DELETE'])
 @login_required
+@permission_required('amazon_listings:delete')
 def delete_listing(sku):
     """
     删除 Listing
@@ -535,6 +544,7 @@ def delete_listing(sku):
 
 @amazon_listing_bp.route('/amazon/listings/upload-image', methods=['POST'])
 @login_required
+@permission_required('amazon_listings:upload_image')
 def upload_listing_image():
     """
     上传 Listing 图片到阿里云 OSS，返回可用于亚马逊 SP-API 的 HTTPS URL
@@ -574,6 +584,7 @@ def upload_listing_image():
 
 @amazon_listing_bp.route('/amazon/listings/delete-image', methods=['DELETE'])
 @login_required
+@permission_required('amazon_listings:delete_image')
 def delete_listing_image():
     """
     删除 OSS 上的 Listing 图片
@@ -615,6 +626,7 @@ def delete_listing_image():
 
 @amazon_listing_bp.route('/amazon/listings/cleanup-images', methods=['POST'])
 @login_required
+@permission_required('amazon_listings:delete_image')
 def cleanup_listing_images():
     """
     清理 OSS 中未被任何 Listing 引用的孤儿图片（兜底机制）
@@ -657,6 +669,7 @@ def cleanup_listing_images():
 
 @amazon_listing_bp.route('/amazon/catalog/search', methods=['GET'])
 @login_required
+@permission_required('amazon_listings:page')
 def search_catalog():
     """
     搜索亚马逊目录，检查商品是否已存在（上架流程 Step 1）
@@ -721,6 +734,7 @@ def search_catalog():
 
 @amazon_listing_bp.route('/amazon/product-types/search', methods=['GET'])
 @login_required
+@permission_required('amazon_listings:page')
 def search_product_types():
     """
     搜索 Product Type 分类（上架流程 Step 2）
@@ -767,6 +781,7 @@ def search_product_types():
 
 @amazon_listing_bp.route('/amazon/product-types/<product_type>/schema', methods=['GET'])
 @login_required
+@permission_required('amazon_listings:page')
 def get_product_type_schema(product_type):
     """
     获取分类 Schema（精简版，供前端动态表单渲染）（上架流程 Step 3）

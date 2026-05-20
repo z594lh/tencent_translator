@@ -7,6 +7,7 @@ import subprocess
 from datetime import datetime
 from flask import Blueprint, jsonify
 from croniter import croniter
+from blueprints.user_auth import login_required, permission_required
 
 cron_bp = Blueprint('cron', __name__, url_prefix='/api/cron')
 
@@ -175,6 +176,8 @@ def _paginate_and_filter(tasks, keyword, page, per_page):
 
 
 @cron_bp.route('/tasks', methods=['GET'])
+@login_required
+@permission_required('tasks:page')
 def get_tasks():
     """获取计划任务列表，支持搜索和分页"""
     from flask import request

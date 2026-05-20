@@ -11,7 +11,7 @@ from flask import Blueprint, request, jsonify
 from datetime import datetime
 from dotenv import load_dotenv
 
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
 
 products_bp = Blueprint('products', __name__, url_prefix='/api')
@@ -145,6 +145,7 @@ def _extract_product_data(data):
 # ==================== 独立上传接口 ====================
 @products_bp.route('/products/upload-image', methods=['POST'])
 @login_required
+@permission_required('products:upload_image')
 def upload_product_image():
     """独立上传产品图片，返回完整 URL
     请求: multipart/form-data, 字段名 image
@@ -173,6 +174,7 @@ def upload_product_image():
 # ==================== CRUD 接口 ====================
 @products_bp.route('/products', methods=['GET'])
 @login_required
+@permission_required('products:page')
 def list_products():
     """查询产品列表（支持分页、关键字搜索）"""
     try:
@@ -245,6 +247,7 @@ def list_products():
 
 @products_bp.route('/products/<int:product_id>', methods=['GET'])
 @login_required
+@permission_required('products:page')
 def get_product(product_id):
     """查询单个产品详情"""
     try:
@@ -271,6 +274,7 @@ def get_product(product_id):
 
 @products_bp.route('/products', methods=['POST'])
 @login_required
+@permission_required('products:create')
 def create_product():
     """创建产品（支持 multipart/form-data 图片上传）"""
     try:
@@ -344,6 +348,7 @@ def create_product():
 
 @products_bp.route('/products/<int:product_id>', methods=['PUT'])
 @login_required
+@permission_required('products:edit')
 def update_product(product_id):
     """更新产品（支持 multipart/form-data 图片上传替换）"""
     try:
@@ -495,6 +500,7 @@ def update_product(product_id):
 
 @products_bp.route('/products/<int:product_id>', methods=['DELETE'])
 @login_required
+@permission_required('products:delete')
 def delete_product(product_id):
     """删除产品"""
     try:
@@ -518,6 +524,7 @@ def delete_product(product_id):
 
 @products_bp.route('/products/categories', methods=['GET'])
 @login_required
+@permission_required('products_categories:page')
 def list_product_categories():
     """查询产品分类列表（支持分页、关键字搜索）"""
     try:
@@ -580,6 +587,7 @@ def list_product_categories():
 
 @products_bp.route('/products/categories/<int:category_id>', methods=['GET'])
 @login_required
+@permission_required('products_categories:page')
 def get_product_category(category_id):
     """查询单个分类详情"""
     try:
@@ -603,6 +611,7 @@ def get_product_category(category_id):
 
 @products_bp.route('/products/categories', methods=['POST'])
 @login_required
+@permission_required('products_categories:create')
 def create_product_category():
     """创建分类"""
     try:
@@ -640,6 +649,7 @@ def create_product_category():
 
 @products_bp.route('/products/categories/<int:category_id>', methods=['PUT'])
 @login_required
+@permission_required('products_categories:edit')
 def update_product_category(category_id):
     """更新分类"""
     try:
@@ -679,6 +689,7 @@ def update_product_category(category_id):
 
 @products_bp.route('/products/categories/<int:category_id>', methods=['DELETE'])
 @login_required
+@permission_required('products_categories:delete')
 def delete_product_category(category_id):
     """删除分类（有产品引用时禁止删除）"""
     try:

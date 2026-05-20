@@ -11,7 +11,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # 导入登录验证装饰器
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 
 # 导入数据库连接
 from services.mysql_service import get_db_connection
@@ -146,6 +146,7 @@ def save_base64_image(image_data):
 # ==================== 获取支出列表 ====================
 @expenses_bp.route('/expenses/list', methods=['GET'])
 @login_required
+@permission_required('expenses:page')
 def get_expense_list():
     """
     获取支出列表
@@ -235,6 +236,7 @@ def get_expense_list():
 # ==================== 新增支出记录 ====================
 @expenses_bp.route('/expenses/add', methods=['POST'])
 @login_required
+@permission_required('expenses:create')
 def create_expense():
     """
     新增支出记录
@@ -314,6 +316,7 @@ def create_expense():
 # ==================== 更新支出记录 ====================
 @expenses_bp.route('/expenses/<int:id>', methods=['PUT'])
 @login_required
+@permission_required('expenses:edit')
 def update_expense(id):
     """
     更新支出记录
@@ -417,6 +420,7 @@ def update_expense(id):
 # ==================== 切换私账报销状态 ====================
 @expenses_bp.route('/expenses/<int:id>/reimburse', methods=['PATCH'])
 @login_required
+@permission_required('expenses:reimburse')
 def toggle_reimburse_status(id):
     """
     切换私账报销状态（取反）
@@ -429,12 +433,10 @@ def toggle_reimburse_status(id):
             with conn.cursor() as cursor:
                 # 检查记录是否存在且属于当前用户
                 cursor.execute(
-                    "SELECT id, reimbursed FROM expenses WHERE id = %s AND user_id = %s",
-                    (id, user_id)
+                    "SELECT id, reimbursed FROM expenses WHERE id = %s ",
+                    (id)
                 )
                 row = cursor.fetchone()
-                if not row:
-                    return jsonify({"status": "error", "message": "记录不存在或无权修改"}), 404
 
                 new_status = 0 if row['reimbursed'] else 1
                 cursor.execute(
@@ -466,6 +468,7 @@ def toggle_reimburse_status(id):
 # ==================== 删除支出记录 ====================
 @expenses_bp.route('/expenses/<int:id>', methods=['DELETE'])
 @login_required
+@permission_required('expenses:delete')
 def delete_expense(id):
     """
     删除支出记录
@@ -520,6 +523,7 @@ def delete_expense(id):
 # ==================== 查询支出日志 ====================
 @expenses_bp.route('/expenses/<int:id>/logs', methods=['GET'])
 @login_required
+@permission_required('expenses:page')
 def get_expense_logs(id):
     """
     获取某笔支出的操作日志
@@ -556,6 +560,7 @@ def get_expense_logs(id):
 # ==================== 获取用户列表（用于筛选） ====================
 @expenses_bp.route('/expenses/users', methods=['GET'])
 @login_required
+@permission_required('expenses:page')
 def get_expense_users():
     """
     获取所有用户列表，用于支出筛选下拉框
@@ -585,6 +590,7 @@ def get_expense_users():
 # ==================== 上传发票图片 ====================
 @expenses_bp.route('/expenses/upload-invoice', methods=['POST'])
 @login_required
+@permission_required('expenses:upload_invoice')
 def upload_invoice_image():
     """
     上传发票图片（独立接口，返回图片URL）

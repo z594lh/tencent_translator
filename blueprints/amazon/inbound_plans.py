@@ -9,7 +9,7 @@ import json
 import re
 
 from flask import Blueprint, request, jsonify
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
 
@@ -42,6 +42,7 @@ def _require_shop_id_from_body(data: dict) -> int:
 
 @amazon_inbound_plans_bp.route('/amazon/inbound-plans', methods=['GET'])
 @login_required
+@permission_required('amazon_inbound_plans:page')
 def amazon_inbound_plans():
     """
     从数据库分页查询入库计划列表
@@ -84,6 +85,7 @@ def amazon_inbound_plans():
 
 @amazon_inbound_plans_bp.route('/amazon/inbound-plans/<plan_id>/boxes', methods=['GET'])
 @login_required
+@permission_required('amazon_inbound_plans:page')
 def amazon_inbound_plan_boxes(plan_id):
     """
     从数据库分页查询指定入库计划的箱子列表
@@ -124,6 +126,7 @@ def amazon_inbound_plan_boxes(plan_id):
 
 @amazon_inbound_plans_bp.route('/amazon/inbound-plan-boxes', methods=['GET'])
 @login_required
+@permission_required('amazon_inbound_plans:page')
 def amazon_inbound_plan_boxes_by_shipment():
     """
     根据货件编号查询入库计划箱子列表详情
@@ -169,6 +172,7 @@ def amazon_inbound_plan_boxes_by_shipment():
 
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans', methods=['POST'])
 @login_required
+@permission_required('amazon_inbound_plans:sync')
 def sync_amazon_inbound_plans():
     """
     手动触发入库计划数据同步（从 API 写入数据库）
@@ -196,6 +200,7 @@ def sync_amazon_inbound_plans():
 
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>/boxes', methods=['POST'])
 @login_required
+@permission_required('amazon_inbound_plans:sync')
 def sync_amazon_inbound_plan_boxes(plan_id):
     """
     手动触发指定入库计划的箱子数据同步（从 API 写入数据库）
@@ -223,6 +228,7 @@ def sync_amazon_inbound_plan_boxes(plan_id):
 
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans-all', methods=['POST'])
 @login_required
+@permission_required('amazon_inbound_plans:sync')
 def sync_amazon_inbound_plans_all():
     """
     一键同步所有入库计划及其箱子数据
@@ -252,6 +258,7 @@ def sync_amazon_inbound_plans_all():
 
 @amazon_inbound_plans_bp.route('/amazon/inbound-plans/<plan_id>/shipments', methods=['GET'])
 @login_required
+@permission_required('amazon_inbound_plans:page')
 def amazon_inbound_plan_shipments(plan_id):
     """
     从数据库分页查询指定入库计划的货件列表
@@ -292,6 +299,7 @@ def amazon_inbound_plan_shipments(plan_id):
 
 @amazon_inbound_plans_bp.route('/amazon/inbound-shipments/<shipment_id>/detail', methods=['GET'])
 @login_required
+@permission_required('amazon_inbound_plans:page')
 def amazon_inbound_shipment_detail(shipment_id):
     """
     从数据库查询指定货件的详情
@@ -322,6 +330,7 @@ def amazon_inbound_shipment_detail(shipment_id):
 
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>/shipments', methods=['POST'])
 @login_required
+@permission_required('amazon_inbound_plans:sync')
 def sync_amazon_inbound_plan_shipments(plan_id):
     """
     手动触发指定入库计划的货件列表同步（从 API 写入数据库）
@@ -349,6 +358,7 @@ def sync_amazon_inbound_plan_shipments(plan_id):
 
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>/shipments-all', methods=['POST'])
 @login_required
+@permission_required('amazon_inbound_plans:sync')
 def sync_amazon_inbound_plan_shipments_all(plan_id):
     """
     手动触发指定入库计划的货件列表及详情全量同步
@@ -376,6 +386,7 @@ def sync_amazon_inbound_plan_shipments_all(plan_id):
 
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-shipments', methods=['POST'])
 @login_required
+@permission_required('amazon_inbound_plans:sync')
 def sync_amazon_inbound_shipments():
     """
     一键同步 ACTIVE 状态的所有入库计划及其货件详情
@@ -404,6 +415,7 @@ def sync_amazon_inbound_shipments():
 
 @amazon_inbound_plans_bp.route('/amazon/inbound-shipments', methods=['GET'])
 @login_required
+@permission_required('amazon_inbound_plans:page')
 def amazon_inbound_shipments():
     """
     从数据库分页查询入库计划货件列表（连表详情）

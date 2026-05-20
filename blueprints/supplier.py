@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
 
 supplier_bp = Blueprint('supplier', __name__, url_prefix='/api')
@@ -27,6 +27,7 @@ def _get_conn():
 
 @supplier_bp.route('/suppliers', methods=['GET'])
 @login_required
+@permission_required('suppliers:page')
 def list_suppliers():
     """查询供应商列表（支持分页、搜索）"""
     try:
@@ -92,6 +93,7 @@ def list_suppliers():
 
 @supplier_bp.route('/suppliers/<int:supplier_id>', methods=['GET'])
 @login_required
+@permission_required('suppliers:page')
 def get_supplier(supplier_id):
     """查询单个供应商详情"""
     try:
@@ -118,6 +120,7 @@ def get_supplier(supplier_id):
 
 @supplier_bp.route('/suppliers', methods=['POST'])
 @login_required
+@permission_required('suppliers:create')
 def create_supplier():
     """创建供应商"""
     try:
@@ -157,6 +160,7 @@ def create_supplier():
 
 @supplier_bp.route('/suppliers/<int:supplier_id>', methods=['PUT'])
 @login_required
+@permission_required('suppliers:edit')
 def update_supplier(supplier_id):
     """更新供应商"""
     try:
@@ -200,6 +204,7 @@ def update_supplier(supplier_id):
 
 @supplier_bp.route('/suppliers/<int:supplier_id>', methods=['DELETE'])
 @login_required
+@permission_required('suppliers:delete')
 def delete_supplier(supplier_id):
     """删除供应商（有关联进货单时禁止删除）"""
     try:
@@ -231,6 +236,7 @@ def delete_supplier(supplier_id):
 
 @supplier_bp.route('/purchase-orders', methods=['GET'])
 @login_required
+@permission_required('purchase_orders:page')
 def list_purchase_orders():
     """查询进货单列表（支持分页、按供应商筛选）"""
     try:
@@ -309,6 +315,7 @@ def list_purchase_orders():
 
 @supplier_bp.route('/purchase-orders/<int:order_id>', methods=['GET'])
 @login_required
+@permission_required('purchase_orders:page')
 def get_purchase_order(order_id):
     """查询单个进货单详情（含明细）"""
     try:
@@ -349,6 +356,7 @@ def get_purchase_order(order_id):
 
 @supplier_bp.route('/purchase-orders', methods=['POST'])
 @login_required
+@permission_required('purchase_orders:create')
 def create_purchase_order():
     """创建进货单（含明细）"""
     try:
@@ -424,6 +432,7 @@ def create_purchase_order():
 
 @supplier_bp.route('/purchase-orders/<int:order_id>', methods=['PUT'])
 @login_required
+@permission_required('purchase_orders:edit')
 def update_purchase_order(order_id):
     """更新进货单（含明细：先删后插）"""
     try:
@@ -506,6 +515,7 @@ def update_purchase_order(order_id):
 
 @supplier_bp.route('/purchase-orders/<int:order_id>', methods=['DELETE'])
 @login_required
+@permission_required('purchase_orders:delete')
 def delete_purchase_order(order_id):
     """删除进货单（级联删除明细）"""
     try:

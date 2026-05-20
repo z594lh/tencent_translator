@@ -5,7 +5,7 @@
 """
 from flask import Blueprint, request, jsonify
 from services.mysql_service import get_db_connection
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 
 logistics_bp = Blueprint('logistics', __name__, url_prefix='/api')
 
@@ -27,6 +27,7 @@ def _val_or_none(val, cast_type=None):
 
 @logistics_bp.route('/logistics-providers', methods=['GET'])
 @login_required
+@permission_required('logistics_providers:page')
 def list_providers():
     """货代列表（分页 + 关键字搜索）"""
     try:
@@ -96,6 +97,7 @@ def list_providers():
 
 @logistics_bp.route('/logistics-providers/<int:provider_id>', methods=['GET'])
 @login_required
+@permission_required('logistics_providers:page')
 def get_provider(provider_id):
     """单个货代详情"""
     try:
@@ -121,6 +123,7 @@ def get_provider(provider_id):
 
 @logistics_bp.route('/logistics-providers', methods=['POST'])
 @login_required
+@permission_required('logistics_providers:create')
 def create_provider():
     """创建货代"""
     try:
@@ -164,6 +167,7 @@ def create_provider():
 
 @logistics_bp.route('/logistics-providers/<int:provider_id>', methods=['PUT'])
 @login_required
+@permission_required('logistics_providers:edit')
 def update_provider(provider_id):
     """更新货代"""
     try:
@@ -208,6 +212,7 @@ def update_provider(provider_id):
 
 @logistics_bp.route('/logistics-providers/<int:provider_id>', methods=['DELETE'])
 @login_required
+@permission_required('logistics_providers:delete')
 def delete_provider(provider_id):
     """删除货代（有关联运单时禁止删除）"""
     try:
@@ -234,6 +239,7 @@ def delete_provider(provider_id):
 
 @logistics_bp.route('/logistics-waybills', methods=['GET'])
 @login_required
+@permission_required('logistics_waybills:page')
 def list_waybills():
     """运单列表（分页 + 筛选）"""
     try:
@@ -311,6 +317,7 @@ def list_waybills():
 
 @logistics_bp.route('/logistics-waybills/<int:waybill_id>', methods=['GET'])
 @login_required
+@permission_required('logistics_waybills:page')
 def get_waybill(waybill_id):
     """单个运单详情（含货代名称与 FBA 货件信息）"""
     try:
@@ -339,6 +346,7 @@ def get_waybill(waybill_id):
 
 @logistics_bp.route('/logistics-waybills', methods=['POST'])
 @login_required
+@permission_required('logistics_waybills:create')
 def create_waybill():
     """创建运单"""
     try:
@@ -412,6 +420,7 @@ def create_waybill():
 
 @logistics_bp.route('/logistics-waybills/<int:waybill_id>', methods=['PUT'])
 @login_required
+@permission_required('logistics_waybills:edit')
 def update_waybill(waybill_id):
     """更新运单"""
     try:
@@ -485,6 +494,7 @@ def update_waybill(waybill_id):
 
 @logistics_bp.route('/logistics-waybills/<int:waybill_id>', methods=['DELETE'])
 @login_required
+@permission_required('logistics_waybills:delete')
 def delete_waybill(waybill_id):
     """删除运单"""
     try:

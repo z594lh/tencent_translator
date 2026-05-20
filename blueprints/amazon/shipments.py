@@ -5,7 +5,7 @@ Amazon 货件模块（多店铺支持版）
 注意：所有接口必须传入 shop_id，不传直接返回 400
 """
 from flask import Blueprint, request, jsonify
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client, get_shop_by_id
 from services.mysql_service import get_db_connection
 
@@ -27,6 +27,7 @@ def _require_shop_id() -> int:
 
 @amazon_shipments_bp.route('/amazon/warehouses', methods=['GET'])
 @login_required
+@permission_required('amazon_shipments:warehouses')
 def amazon_warehouses():
     """
     查询 FBA 目的仓库列表（用于前端下拉筛选）
@@ -51,6 +52,7 @@ def amazon_warehouses():
 
 @amazon_shipments_bp.route('/amazon/shipments/<shipment_id>/labels', methods=['GET'])
 @login_required
+@permission_required('amazon_shipments:labels')
 def amazon_shipment_labels(shipment_id):
     """
     获取指定货件的 FBA 箱贴标签

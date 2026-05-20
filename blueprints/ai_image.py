@@ -8,7 +8,7 @@ import uuid
 from dotenv import load_dotenv
 
 # 导入登录验证装饰器
-from blueprints.user_auth import login_required
+from blueprints.user_auth import login_required, permission_required
 
 # 导入AI服务
 from services.geminiAi import (
@@ -81,6 +81,7 @@ def get_text_image_service_by_model(model_name: str):
 # ============== 文生图接口 ==============
 @ai_image_bp.route('/chat-image', methods=['POST'])
 @login_required
+@permission_required('ai_image:create')
 def chat_image_endpoint():
     """新版统一AI接口文生图"""
     try:
@@ -134,6 +135,7 @@ def chat_image_endpoint():
 # ============== 图生图接口 ==============
 @ai_image_bp.route('/edit-image-v2', methods=['POST'])
 @login_required
+@permission_required('ai_image:create')
 def unified_edit_image_endpoint():
     """新版统一AI图生图/编辑接口"""
     try:
@@ -202,6 +204,7 @@ def unified_edit_image_endpoint():
 # ============== 图库接口 ==============
 @ai_image_bp.route('/gallery', methods=['GET'])
 @login_required
+@permission_required('ai_image:page')
 def get_gallery():
     """获取图库列表 - 只展示当前用户或user_id为空的图片"""
     try:
@@ -269,6 +272,7 @@ def get_gallery():
 
 @ai_image_bp.route('/gallery/<image_id>', methods=['DELETE'])
 @login_required
+@permission_required('ai_image:delete')
 def delete_gallery_image(image_id):
     """删除图库图片"""
     try:
@@ -304,6 +308,7 @@ def delete_gallery_image(image_id):
 # ============== 测试接口 ==============
 @ai_image_bp.route('/edit-image-test', methods=['POST'])
 @login_required
+@permission_required('ai_image:create')
 def edit_image_test_endpoint():
     """编辑图片测试接口 - 不调用AI，返回图库随机图片"""
     try:
