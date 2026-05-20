@@ -25,47 +25,49 @@ from blueprints.user_auth import login_required
 
 permissions_bp = Blueprint('permissions', __name__, url_prefix='/api')
 
-# ========== 管理员校验装饰器 ==========
+# ========== 权限校验装饰器 ==========
 
-def admin_required(f):
-    """管理员权限校验装饰器
-    逻辑：拥有 system:user_manage 权限 或 绑定 admin 角色 的管理员直接放行
+def _check_admin_role(user_id):
+    """兜底：检查用户是否绑定了 admin 角色"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT 1 FROM user_roles ur
+                INNER JOIN roles r ON ur.role_id = r.id
+                WHERE ur.user_id = %s AND r.code = 'admin' AND r.status = 1
+                LIMIT 1
+            """, (user_id,))
+            return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def require_permission(code):
+    """权限校验装饰器工厂：检查指定权限码，admin 角色兜底
+    用法: @require_permission('system:user_manage')
     """
     from functools import wraps
     from services.permissions_service import has_permission
 
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        user = request.current_user
-
-        # 1. 先检查权限码
-        if has_permission(user['id'], 'system:user_manage'):
-            return f(*args, **kwargs)
-
-        # 2. 兜底：检查是否绑定了 code='admin' 的角色（初始化阶段用）
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT 1 FROM user_roles ur
-                    INNER JOIN roles r ON ur.role_id = r.id
-                    WHERE ur.user_id = %s AND r.code = 'admin' AND r.status = 1
-                    LIMIT 1
-                """, (user['id'],))
-                if cursor.fetchone():
-                    return f(*args, **kwargs)
-        finally:
-            conn.close()
-
-        return jsonify({"status": "error", "message": "无权限访问，需要管理员权限"}), 403
-    return decorated_function
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user = request.current_user
+            if has_permission(user['id'], code):
+                return f(*args, **kwargs)
+            if _check_admin_role(user['id']):
+                return f(*args, **kwargs)
+            return jsonify({"status": "error", "message": "无权限访问"}), 403
+        return decorated_function
+    return decorator
 
 
 # ========== 权限定义管理 ==========
 
 @permissions_bp.route('/permissions', methods=['GET'])
 @login_required
-@admin_required
+@require_permission('system:permission_manage')
 def list_permissions():
     """获取全部权限列表，支持按模块分组"""
     try:
@@ -94,7 +96,7 @@ def list_permissions():
 
 @permissions_bp.route('/permissions', methods=['POST'])
 @login_required
-@admin_required
+@require_permission('system:permission_manage')
 def create_permission_endpoint():
     """创建权限定义"""
     try:
@@ -128,7 +130,7 @@ def create_permission_endpoint():
 
 @permissions_bp.route('/permissions/<int:perm_id>', methods=['PUT'])
 @login_required
-@admin_required
+@require_permission('system:permission_manage')
 def update_permission_endpoint(perm_id):
     """修改权限定义"""
     try:
@@ -147,7 +149,7 @@ def update_permission_endpoint(perm_id):
 
 @permissions_bp.route('/permissions/<int:perm_id>', methods=['DELETE'])
 @login_required
-@admin_required
+@require_permission('system:permission_manage')
 def delete_permission_endpoint(perm_id):
     """删除权限定义（同时清理角色关联和菜单关联）"""
     try:
@@ -164,7 +166,7 @@ def delete_permission_endpoint(perm_id):
 
 @permissions_bp.route('/roles', methods=['GET'])
 @login_required
-@admin_required
+@require_permission('system:role_manage')
 def list_roles():
     """获取角色列表"""
     try:
@@ -195,7 +197,7 @@ def list_roles():
 
 @permissions_bp.route('/roles', methods=['POST'])
 @login_required
-@admin_required
+@require_permission('system:role_manage')
 def create_role():
     """创建角色"""
     try:
@@ -240,7 +242,7 @@ def create_role():
 
 @permissions_bp.route('/roles/<int:role_id>', methods=['PUT'])
 @login_required
-@admin_required
+@require_permission('system:role_manage')
 def update_role(role_id):
     """修改角色信息"""
     try:
@@ -286,7 +288,7 @@ def update_role(role_id):
 
 @permissions_bp.route('/roles/<int:role_id>', methods=['DELETE'])
 @login_required
-@admin_required
+@require_permission('system:role_manage')
 def delete_role(role_id):
     """删除角色（同时清理关联数据）"""
     try:
@@ -312,7 +314,7 @@ def delete_role(role_id):
 
 @permissions_bp.route('/roles/<int:role_id>/permissions', methods=['GET'])
 @login_required
-@admin_required
+@require_permission('system:role_manage')
 def get_role_perm_list(role_id):
     """获取角色的权限ID列表"""
     try:
@@ -325,7 +327,7 @@ def get_role_perm_list(role_id):
 
 @permissions_bp.route('/roles/<int:role_id>/permissions', methods=['PUT'])
 @login_required
-@admin_required
+@require_permission('system:role_manage')
 def update_role_perm_list(role_id):
     """批量设置角色权限"""
     try:
@@ -347,7 +349,7 @@ def update_role_perm_list(role_id):
 
 @permissions_bp.route('/users', methods=['GET'])
 @login_required
-@admin_required
+@require_permission('system:user_manage')
 def list_users():
     """获取用户列表（含角色信息）"""
     try:
@@ -380,7 +382,7 @@ def list_users():
 
 @permissions_bp.route('/users/<int:user_id>/roles', methods=['PUT'])
 @login_required
-@admin_required
+@require_permission('system:user_manage')
 def update_user_roles(user_id):
     """设置用户角色（全量覆盖）"""
     try:
@@ -398,7 +400,7 @@ def update_user_roles(user_id):
 
 @permissions_bp.route('/users/<int:user_id>/permissions', methods=['GET'])
 @login_required
-@admin_required
+@require_permission('system:user_manage')
 def get_user_perm_detail(user_id):
     """获取用户最终权限详情"""
     try:
@@ -417,7 +419,7 @@ def get_user_perm_detail(user_id):
 
 @permissions_bp.route('/users/<int:user_id>/permissions/direct', methods=['GET'])
 @login_required
-@admin_required
+@require_permission('system:user_manage')
 def get_user_direct_perm_list(user_id):
     """获取用户直接授予的权限ID列表（不含角色继承）"""
     try:
@@ -430,7 +432,7 @@ def get_user_direct_perm_list(user_id):
 
 @permissions_bp.route('/users/<int:user_id>/permissions', methods=['PUT'])
 @login_required
-@admin_required
+@require_permission('system:user_manage')
 def update_user_perm_list(user_id):
     """设置用户直接权限（全量覆盖）"""
     try:
@@ -498,7 +500,7 @@ def get_menus():
 
 @permissions_bp.route('/menus/admin', methods=['GET'])
 @login_required
-@admin_required
+@require_permission('system:menu_manage')
 def list_menus_admin():
     """获取全部菜单列表（含权限信息，供管理端使用）"""
     try:
@@ -511,7 +513,7 @@ def list_menus_admin():
 
 @permissions_bp.route('/menus', methods=['POST'])
 @login_required
-@admin_required
+@require_permission('system:menu_manage')
 def create_menu_endpoint():
     """创建菜单"""
     try:
@@ -544,7 +546,7 @@ def create_menu_endpoint():
 
 @permissions_bp.route('/menus/<int:menu_id>', methods=['PUT'])
 @login_required
-@admin_required
+@require_permission('system:menu_manage')
 def update_menu_endpoint(menu_id):
     """修改菜单"""
     try:
@@ -561,7 +563,7 @@ def update_menu_endpoint(menu_id):
 
 @permissions_bp.route('/menus/<int:menu_id>', methods=['DELETE'])
 @login_required
-@admin_required
+@require_permission('system:menu_manage')
 def delete_menu_endpoint(menu_id):
     """删除菜单（级联删除所有子菜单）"""
     try:
@@ -574,7 +576,7 @@ def delete_menu_endpoint(menu_id):
 
 @permissions_bp.route('/users/<int:user_id>/status', methods=['PUT'])
 @login_required
-@admin_required
+@require_permission('system:user_manage')
 def update_user_status(user_id):
     """启用/禁用用户账号"""
     try:
