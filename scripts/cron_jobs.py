@@ -9,6 +9,7 @@ Crontab 定时任务入口脚本
 可用任务：
     inventory        库存同步（每小时）
     inbound          入库计划同步（每3小时）
+    listing          Listing同步（每3小时）
     orders-recent    近期订单同步 24h（每15分钟）
     orders-week      本周订单同步 7d（每3小时）
     orders-month     本月订单同步 30d（每6小时，仅列表）
@@ -133,7 +134,32 @@ def task_inbound():
               f"{f', 错误: {detail_errors}' if detail_errors else ''}")
 
 
-# ==================== 3. 订单同步 ====================
+# ==================== 3. Listing 同步 ====================
+
+def task_listing():
+    from blueprints.amazon.listing import _sync_listings
+    shops = get_all_active_shops()
+    if not shops:
+        print(f"[{_now_str()}] [Cron] 没有启用的店铺，跳过 Listing 同步")
+        return
+
+    for shop in shops:
+        shop_name = shop.get('shop_name', f"shop_{shop['id']}")
+        shop_id = shop['id']
+        print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始 Listing 同步...")
+        try:
+            result = _sync_listings(
+                shop_id=shop_id,
+                included_data=["summaries", "attributes", "issues"],
+                page_size=20
+            )
+            err_msg = f", error={result['error']}" if result.get('error') else ''
+            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] Listing 同步完成: synced={result.get('synced_count', 0)}, fetched={result.get('total_fetched', 0)}{err_msg}")
+        except Exception as e:
+            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] Listing 同步异常: {e}")
+
+
+# ==================== 4. 订单同步 ====================
 
 def _get_recent_order_ids(shop_id, hours):
     """查询最近 N 小时内有更新的订单ID"""
@@ -325,6 +351,7 @@ def task_reports_monthly():
 TASK_MAP = {
     'inventory': task_inventory,
     'inbound': task_inbound,
+    'listing': task_listing,
     'orders-recent': task_orders_recent,
     'orders-week': task_orders_week,
     'orders-month': task_orders_month,
