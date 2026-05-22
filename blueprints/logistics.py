@@ -3,6 +3,10 @@
 - logistics_providers      货代管理表 CRUD
 - logistics_waybills       货代运单表 CURD（一个运单对应一个 FBA 货件）
 """
+import io
+from datetime import datetime
+
+import openpyxl
 from flask import Blueprint, request, jsonify
 from services.mysql_service import get_db_connection
 from blueprints.user_auth import login_required, permission_required
@@ -510,6 +514,201 @@ def delete_waybill(waybill_id):
             conn.close()
     except Exception as e:
         print(f"[Logistics] 删除运单异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ==================== 导入货代账单 Excel ====================
+
+# Excel 列名 → 数据库字段 映射
+WAYBILL_IMPORT_COL_MAP = {
+    '原单号': 'waybill_no',
+    '收货日期': 'ship_date',
+    '运输方式': 'route_name',
+    '件数': 'total_cartons',
+    '收费重': 'total_weight_kg',
+    '单价': 'cost_per_kg',
+    '运费': 'freight_cost_cny',
+    '附加费': 'misc_cost_cny',
+    '总金额': 'total_cost_cny',
+    'FBA号码': 'shipment_id',
+}
+
+
+def _find_header_row(ws):
+    """扫描工作表找到表头行（包含"序号"和"原单号"），返回 (row_index, headers)"""
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True), 1):
+        vals = [str(v).strip() if v is not None else '' for v in row]
+        if '序号' in vals and '原单号' in vals:
+            return i, vals
+    return None, None
+
+
+def _build_col_indices(headers):
+    """根据表头建立 DB 字段 → 列索引 的映射"""
+    indices = {}
+    for idx, h in enumerate(headers):
+        h_clean = str(h).strip() if h else ''
+        for excel_key, db_field in WAYBILL_IMPORT_COL_MAP.items():
+            if excel_key in h_clean:
+                indices[db_field] = idx
+        if '仓库编码' in h_clean or '仓库' in h_clean:
+            indices['destination_warehouse'] = idx
+    return indices
+
+
+def _parse_date(val):
+    """将 Excel 日期值转为 'YYYY-MM-DD' 字符串"""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.strftime('%Y-%m-%d')
+    s = str(val).strip()
+    if not s:
+        return None
+    return s[:10]  # "2026-05-18 00:00:00" → "2026-05-18"
+
+
+def _parse_num(val, cast=float):
+    """安全地将值转为数字，失败返回 None"""
+    if val is None or val == '':
+        return None
+    try:
+        return cast(val)
+    except (ValueError, TypeError):
+        return None
+
+
+@logistics_bp.route('/logistics-waybills/import', methods=['POST'])
+@login_required
+@permission_required('logistics_waybills:import')
+def import_waybills():
+    """导入货代账单 Excel"""
+    try:
+        provider_id = request.form.get('provider_id', '').strip()
+        if not provider_id:
+            return jsonify({"status": "error", "message": "货代ID不能为空"}), 400
+        provider_id = int(provider_id)
+
+        if 'file' not in request.files:
+            return jsonify({"status": "error", "message": "请上传文件"}), 400
+
+        file = request.files['file']
+        filename = (file.filename or '').lower()
+        if not filename.endswith(('.xlsx', '.xls')):
+            return jsonify({"status": "error", "message": "仅支持 .xlsx / .xls 文件"}), 400
+
+        raw = file.read()
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        ws = wb.active
+
+        # 1. 找表头
+        header_row_idx, headers = _find_header_row(ws)
+        if header_row_idx is None:
+            wb.close()
+            return jsonify({"status": "error", "message": "未找到数据表头，表头需包含「序号」和「原单号」"}), 400
+
+        col_indices = _build_col_indices(headers)
+        if 'waybill_no' not in col_indices or 'shipment_id' not in col_indices:
+            wb.close()
+            return jsonify({"status": "error", "message": "表头缺少「原单号」或「FBA号码」列"}), 400
+
+        # 2. 解析数据行
+        data_rows = []
+        max_col = max(col_indices.values()) + 1
+        for row in ws.iter_rows(min_row=header_row_idx + 1, max_col=max_col, values_only=True):
+            first_val = str(row[0]).strip() if row and row[0] is not None else ''
+            if not first_val or '合计' in first_val:
+                break
+
+            mapped = {}
+            for db_field, col_idx in col_indices.items():
+                val = row[col_idx] if col_idx < len(row) else None
+                mapped[db_field] = val
+            mapped['provider_id'] = provider_id
+            data_rows.append(mapped)
+
+        wb.close()
+
+        if not data_rows:
+            return jsonify({"status": "error", "message": "未解析到任何数据行"}), 400
+
+        # 3. 校验货代存在，然后逐行写入
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id, name FROM logistics_providers WHERE id = %s", (provider_id,))
+                provider = cursor.fetchone()
+                if not provider:
+                    return jsonify({"status": "error", "message": "货代不存在"}), 400
+
+                inserted = 0
+                skipped = 0
+                errors = []
+
+                insert_fields = [
+                    'waybill_no', 'provider_id', 'shipment_id', 'route_name',
+                    'total_weight_kg', 'total_cartons', 'freight_cost_cny',
+                    'misc_cost_cny', 'total_cost_cny', 'cost_per_kg',
+                    'destination_warehouse', 'ship_date', 'status'
+                ]
+
+                for i, row in enumerate(data_rows):
+                    waybill_no = str(row.get('waybill_no', '')).strip() if row.get('waybill_no') else None
+                    shipment_id = str(row.get('shipment_id', '')).strip() if row.get('shipment_id') else None
+
+                    if not waybill_no:
+                        skipped += 1
+                        errors.append(f"第{i + 1}行：原单号为空")
+                        continue
+                    if not shipment_id:
+                        skipped += 1
+                        errors.append(f"第{i + 1}行({waybill_no})：FBA号码为空")
+                        continue
+
+                    cursor.execute("SELECT id FROM logistics_waybills WHERE waybill_no = %s", (waybill_no,))
+                    if cursor.fetchone():
+                        skipped += 1
+                        errors.append(f"第{i + 1}行({waybill_no})：运单号已存在")
+                        continue
+
+                    values = [
+                        waybill_no,
+                        provider_id,
+                        shipment_id,
+                        str(row.get('route_name', '')).strip() or None,
+                        _parse_num(row.get('total_weight_kg')),
+                        _parse_num(row.get('total_cartons'), int),
+                        _parse_num(row.get('freight_cost_cny')),
+                        _parse_num(row.get('misc_cost_cny')),
+                        _parse_num(row.get('total_cost_cny')),
+                        _parse_num(row.get('cost_per_kg')),
+                        str(row.get('destination_warehouse', '')).strip() or None,
+                        _parse_date(row.get('ship_date')),
+                        0,
+                    ]
+
+                    placeholders = ', '.join(['%s'] * len(insert_fields))
+                    sql = f"INSERT INTO logistics_waybills ({', '.join(insert_fields)}) VALUES ({placeholders})"
+                    cursor.execute(sql, tuple(values))
+                    inserted += 1
+
+                conn.commit()
+
+                return jsonify({
+                    "status": "success",
+                    "message": f"导入完成：新增 {inserted} 条，跳过 {skipped} 条",
+                    "data": {
+                        "inserted": inserted,
+                        "skipped": skipped,
+                        "provider_name": provider['name'],
+                        "errors": errors[:20]
+                    }
+                })
+        finally:
+            conn.close()
+
+    except Exception as e:
+        print(f"[Logistics] 导入运单异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
