@@ -370,6 +370,7 @@ def list_product_board():
         min_sales = request.args.get('min_sales', '').strip() or None
         min_margin = request.args.get('min_margin', '').strip() or None
         is_listed = request.args.get('is_listed', '').strip() or None
+        is_new_product = request.args.get('is_new_product', '').strip() or None
         sort_by = request.args.get('sort_by', 'sales_30d')
         sort_dir = request.args.get('sort_dir', 'desc')
         page = int(request.args.get('page', 1))
@@ -412,6 +413,18 @@ def list_product_board():
                     conditions.append("is_listed = %s")
                     params.append(1 if is_listed.lower() in ('true', '1') else 0)
 
+                new_product_expr = (
+                    "dev_time != '' AND STR_TO_DATE(dev_time, '%%Y-%%m-%%d') IS NOT NULL "
+                    "AND DATEDIFF(CURDATE(), STR_TO_DATE(dev_time, '%%Y-%%m-%%d')) BETWEEN 0 AND 90"
+                )
+
+                if is_new_product is not None:
+                    is_new = is_new_product.lower() in ('true', '1')
+                    if is_new:
+                        conditions.append(f"({new_product_expr})")
+                    else:
+                        conditions.append(f"NOT ({new_product_expr})")
+
                 where_clause = " AND ".join(conditions)
 
                 cursor.execute(
@@ -422,12 +435,14 @@ def list_product_board():
 
                 offset = (page - 1) * page_size
                 cursor.execute(f"""
-                    SELECT * FROM product_board
+                    SELECT *, ({new_product_expr}) AS is_new_product FROM product_board
                     WHERE {where_clause}
                     ORDER BY {sort_by} {sort_dir}
                     LIMIT %s OFFSET %s
                 """, tuple(params + [page_size, offset]))
                 rows = cursor.fetchall()
+                for row in rows:
+                    row['is_new_product'] = bool(row['is_new_product'])
 
                 return jsonify({
                     "status": "success",
