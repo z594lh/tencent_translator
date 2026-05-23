@@ -15,6 +15,7 @@ from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.oss_uploader import upload_image_for_listing
 from services.mysql_service import get_db_connection
+from services.deepseekAI import generate_declaration_info
 
 amazon_listing_bp = Blueprint('amazon_listing', __name__, url_prefix='/api')
 
@@ -196,6 +197,22 @@ def sync_listing_to_product(sku):
         weight_kg = _parse_weight_kg(attrs)
         dimensions_cm = _parse_dimensions_cm(attrs)
 
+        # 2.5 提取材质 → 调用 DeepSeek 生成申报信息
+        material_cn = _extract_material_cn(attrs)
+        product_description = listing.get('product_description', '') or ''
+        decl = generate_declaration_info(product_description, material_cn)
+
+        product_name = decl.get('name_cn') or ''
+        declare_name_cn = decl.get('name_cn') or ''
+        declare_name_en = decl.get('name_en') or ''
+        material_cn = decl.get('material_cn') or material_cn
+        material_en = decl.get('material_en') or ''
+
+        # 品牌处理：Generic → 无
+        brand = listing.get('brand') or ''
+        if brand.strip().lower() == 'generic':
+            brand = '无'
+
         # 3. 拼接多图 URL
         images = listing.get('images', []) or []
         image_urls_list = [img['media_location'] for img in images
@@ -219,6 +236,10 @@ def sync_listing_to_product(sku):
                         UPDATE products SET
                             product_name = %s,
                             brand = %s,
+                            declare_name_cn = %s,
+                            declare_name_en = %s,
+                            material_cn = %s,
+                            material_en = %s,
                             declare_value = %s,
                             currency = %s,
                             asin = %s,
@@ -231,8 +252,12 @@ def sync_listing_to_product(sku):
                             updated_at = NOW()
                         WHERE id = %s
                     """, (
-                        listing.get('item_name') or '',
-                        listing.get('brand') or '',
+                        product_name,
+                        brand,
+                        declare_name_cn,
+                        declare_name_en,
+                        material_cn,
+                        material_en,
                         listing.get('list_price'),
                         listing.get('list_price_currency', 'USD'),
                         asin,
@@ -255,18 +280,24 @@ def sync_listing_to_product(sku):
                     cursor.execute("""
                         INSERT INTO products
                             (seller_sku, product_name, brand,
+                             declare_name_cn, declare_name_en, material_cn, material_en,
                              declare_value, currency, asin, fnsku,
                              image_url, image_urls, weight_kg, dimensions_cm, sales_url,
                              status)
                         VALUES
                             (%s, %s, %s,
                              %s, %s, %s, %s,
+                             %s, %s, %s, %s,
                              %s, %s, %s, %s, %s,
                              1)
                     """, (
                         sku,
-                        listing.get('item_name') or '',
-                        listing.get('brand') or '',
+                        product_name,
+                        brand,
+                        declare_name_cn,
+                        declare_name_en,
+                        material_cn,
+                        material_en,
                         listing.get('list_price'),
                         listing.get('list_price_currency', 'USD'),
                         asin,
@@ -310,6 +341,15 @@ def _parse_weight_kg(attrs):
                     return round(value, 3)
                 return value
     return None
+
+
+def _extract_material_cn(attrs):
+    """从 attributes_json 解析出的 dict 中提取中文材质，多个用、连接"""
+    material_list = attrs.get('material', [])
+    if not material_list:
+        return ""
+    values = [item.get('value', '') for item in material_list if item.get('language_tag') == 'zh_CN']
+    return "、".join(values)
 
 
 def _parse_dimensions_cm(attrs):
