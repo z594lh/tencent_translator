@@ -53,6 +53,8 @@ HEADER_MAP = {
     '第一次到货时间': 'first_arrival_time',
     '最早到货时间': 'earliest_arrival_time',
     'FBA到货时间': 'fba_arrival_time',
+    '供应商参考': 'supplier_reference',
+    '竞品链接参考': 'competitor_link_reference',
 }
 
 ALL_COLUMNS = list(HEADER_MAP.values())
@@ -307,6 +309,12 @@ def import_product_board():
                     if not asin:
                         skipped += 1
                         continue
+
+                    # 供应商参考 / 竞品链接参考：非链接则置空
+                    for link_field in ('supplier_reference', 'competitor_link_reference'):
+                        val = mapped.get(link_field, '')
+                        if val and not str(val).lower().startswith(('http://', 'https://')):
+                            mapped[link_field] = ''
 
                     # 图片：已有 URL → 复用；没有 → 从 Excel 提取
                     if asin in existing_images:
@@ -746,7 +754,7 @@ def export_product_board():
                       '30天退款率', '60天退款率', '当月acos', '当月tacos',
                       '昨日广告费', '当月广告费', '近30天广告费',
                       '产品开发时间', '第一次到货时间', '最早到货时间', 'FBA到货时间',
-                      '导入时间']
+                      '供应商参考', '竞品链接参考', '导入时间']
         writer.writerow(col_labels)
 
         col_keys = list(HEADER_MAP.keys())
