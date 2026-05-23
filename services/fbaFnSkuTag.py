@@ -86,30 +86,56 @@ def generate_amazon_label_v4(
     # 绘制条码
     barcode.drawOn(c, bc_x, bc_y)
 
-    # --- 4. 绘制 FNSKU 文字 ---
-    fnsku_text_y = bc_y - 5 * mm
+    # --- 4. 动态布局：条码和底部固定，中间均分间距 ---
+    bottom_baseline = 2 * mm                       # 底部 SKU/MIC 基线（固定）
+    top_of_bottom_row = 6 * mm                     # 底部行占 6mm
+    barcode_bottom = bc_y                          # 条码底部（固定）
+
+    # 30mm 及以下缩小产品名字号
+    is_tight = height_mm <= 30
+    pn_font_size = 6 if is_tight else 8
+
+    # 中间文本行（从上到下：FNSKU → 产品名 → 附加信息 够空间才加）
+    mid_lines = [
+        ("Helvetica-Bold", 10, fnsku, True),          # FNSKU 居中
+        ("SimHei", pn_font_size, product_name, False), # 产品名 左对齐
+    ]
+    if extra_info and (barcode_bottom - top_of_bottom_row) > 14 * mm:
+        mid_lines.append(("SimHei", 6 if is_tight else 7, extra_info, False))
+
+    # FNSKU 基线：升部 2.5mm + 间距 1mm = 条码底向下 3.5mm
+    # 保证 FNSKU 文字和条码之间有可见间距
+    fnsku_baseline = barcode_bottom - 3.5 * mm
+
+    # FNSKU 以下可用空间
+    below_fnsku = fnsku_baseline - 1 * mm - top_of_bottom_row  # 减去 FNSKU 降部 1mm
+    other_lines = mid_lines[1:]                                 # FNSKU 之外的行
+    n_other = len(other_lines)
+    line_h = 2.5 * mm if is_tight else 3.2 * mm
+    other_block_h = n_other * line_h
+    other_gap = (below_fnsku - other_block_h) / (n_other + 1)
+    if other_gap < 0.5 * mm:
+        other_gap = 0.5 * mm
+
+    # 渲染 FNSKU（居中）
     c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(width / 2, fnsku_text_y, fnsku)
+    c.drawCentredString(width / 2, fnsku_baseline, fnsku)
 
-    # --- 5. 绘制产品信息 ---
-    text_start_y = fnsku_text_y - 6 * mm
-    line_height = 3.5 * mm
-    
-    c.setFont("SimHei", 8)
-    c.drawString(3 * mm, text_start_y, product_name)
-    
-    c.setFont("SimHei", 7)
-    c.drawString(3 * mm, text_start_y - line_height, extra_info)
+    # 渲染其余行（从左到右从上往下）
+    y = fnsku_baseline - 1 * mm - other_gap            # FNSKU 降部下方起始
+    for font_name, font_size, text, centered in other_lines:
+        y -= line_h
+        baseline = y + 0.8 * mm
+        c.setFont(font_name, font_size)
+        c.drawString(3 * mm, baseline, text)
+        y -= other_gap
 
-    # --- 6. 绘制底部信息 ---
-    bottom_y = 2 * mm
+    # --- 5. 绘制底部信息（SKU + Made In China，固定贴底）---
     c.setFont("SimHei", 8)
-    
-    c.drawString(3 * mm, bottom_y, f"SKU:{sku}")
-    
+    c.drawString(3 * mm, bottom_baseline, f"SKU:{sku}")
     mic_text = "Made In China"
     mic_width = c.stringWidth(mic_text, "SimHei", 8)
-    c.drawString(width - 3 * mm - mic_width, bottom_y, mic_text)
+    c.drawString(width - 3 * mm - mic_width, bottom_baseline, mic_text)
 
     c.save()
     print(f"✅ 标签生成成功: {output_path}")
