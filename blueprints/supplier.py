@@ -11,6 +11,9 @@ from services.mysql_service import get_db_connection
 
 supplier_bp = Blueprint('supplier', __name__, url_prefix='/api')
 
+# 进货单最终状态（已完成）
+PURCHASE_ORDER_STATUS_COMPLETED = 2
+
 
 def _generate_order_no():
     """生成进货单号：PO + 年月日 + 4位随机数"""
@@ -199,6 +202,40 @@ def update_supplier(supplier_id):
 
     except Exception as e:
         print(f"[Suppliers] 更新异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@supplier_bp.route('/suppliers/batch-status', methods=['PUT'])
+@login_required
+@permission_required('suppliers:edit')
+def batch_update_supplier_status():
+    """批量修改供应商状态"""
+    try:
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        status = data.get('status')
+
+        if not ids or not isinstance(ids, list):
+            return jsonify({"status": "error", "message": "请提供要修改的ID列表"}), 400
+        if status is None:
+            return jsonify({"status": "error", "message": "请提供目标状态"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                placeholders = ', '.join(['%s'] * len(ids))
+                sql = f"UPDATE suppliers SET status = %s WHERE id IN ({placeholders})"
+                cursor.execute(sql, tuple([int(status)] + [int(i) for i in ids]))
+                conn.commit()
+                return jsonify({
+                    "status": "success",
+                    "message": f"成功更新 {cursor.rowcount} 条记录",
+                    "data": {"affected": cursor.rowcount}
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Suppliers] 批量更新供应商状态异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -465,10 +502,12 @@ def update_purchase_order(order_id):
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                # 先确认进货单存在（避免 rowcount==0 误判）
-                cursor.execute("SELECT id FROM purchase_orders WHERE id = %s", (order_id,))
-                if not cursor.fetchone():
+                # 先确认进货单存在（避免 rowcount==0 误判），同时获取单号
+                cursor.execute("SELECT id, order_no FROM purchase_orders WHERE id = %s", (order_id,))
+                existing = cursor.fetchone()
+                if not existing:
                     return jsonify({"status": "error", "message": "进货单不存在"}), 404
+                order_no = existing['order_no']
 
                 # 更新主表
                 cursor.execute("""
@@ -504,12 +543,93 @@ def update_purchase_order(order_id):
                     ))
 
                 conn.commit()
+
+                # 状态变为已完成时，自动创建支出记录
+                if data.get('status') == PURCHASE_ORDER_STATUS_COMPLETED:
+                    try:
+                        from blueprints.expenses import create_expense_for_source
+                        cursor.execute(
+                            "SELECT id FROM expenses WHERE category = %s AND remark = %s LIMIT 1",
+                            ('采购/货值', f"进货单 {order_no}")
+                        )
+                        if not cursor.fetchone():
+                            create_expense_for_source(
+                                conn, '采购/货值',
+                                float(total_amount), datetime.now().strftime('%Y-%m-%d'),
+                                f"进货单 {order_no}", 'company'
+                            )
+                    except Exception as e:
+                        print(f"[PurchaseOrders] 自动创建支出记录异常: {e}")
+
                 return jsonify({"status": "success", "message": "更新成功"})
         finally:
             conn.close()
 
     except Exception as e:
         print(f"[PurchaseOrders] 更新异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@supplier_bp.route('/purchase-orders/batch-status', methods=['PUT'])
+@login_required
+@permission_required('purchase_orders:edit')
+def batch_update_purchase_order_status():
+    """批量修改进货单状态"""
+    try:
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        status = data.get('status')
+
+        if not ids or not isinstance(ids, list):
+            return jsonify({"status": "error", "message": "请提供要修改的ID列表"}), 400
+        if status is None:
+            return jsonify({"status": "error", "message": "请提供目标状态"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                placeholders = ', '.join(['%s'] * len(ids))
+                sql = f"UPDATE purchase_orders SET status = %s WHERE id IN ({placeholders})"
+                cursor.execute(sql, tuple([int(status)] + [int(i) for i in ids]))
+                conn.commit()
+
+                # 状态变为已完成时，自动创建支出记录
+                if int(status) == PURCHASE_ORDER_STATUS_COMPLETED:
+                    try:
+                        from blueprints.expenses import create_expense_for_source
+                        placeholders2 = ', '.join(['%s'] * len(ids))
+                        int_ids = [int(i) for i in ids]
+                        cursor.execute(f"""
+                            SELECT id, order_no, total_amount FROM purchase_orders
+                            WHERE id IN ({placeholders2})
+                            AND NOT EXISTS (
+                                SELECT 1 FROM expenses
+                                WHERE expenses.category = '采购/货值'
+                                AND expenses.remark = CONCAT('进货单 ', purchase_orders.order_no)
+                            )
+                        """, tuple(int_ids))
+                        pending = cursor.fetchall()
+                        for row in pending:
+                            try:
+                                create_expense_for_source(
+                                    conn, '采购/货值',
+                                    float(row['total_amount'] or 0), datetime.now().strftime('%Y-%m-%d'),
+                                    f"进货单 {row['order_no']}", 'company'
+                                )
+                            except Exception as e:
+                                print(f"[PurchaseOrders] 为进货单 {row['order_no']} 创建支出记录失败: {e}")
+                    except Exception as e:
+                        print(f"[PurchaseOrders] 批量创建支出记录异常: {e}")
+
+                return jsonify({
+                    "status": "success",
+                    "message": f"成功更新 {cursor.rowcount} 条记录",
+                    "data": {"affected": cursor.rowcount}
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[PurchaseOrders] 批量更新进货单状态异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

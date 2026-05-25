@@ -13,6 +13,9 @@ from blueprints.user_auth import login_required, permission_required
 
 logistics_bp = Blueprint('logistics', __name__, url_prefix='/api')
 
+# 运单最终状态（已完成）
+WAYBILL_STATUS_COMPLETED = 5
+
 
 def _get_conn():
     return get_db_connection()
@@ -211,6 +214,40 @@ def update_provider(provider_id):
             conn.close()
     except Exception as e:
         print(f"[Logistics] 更新货代异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@logistics_bp.route('/logistics-providers/batch-status', methods=['PUT'])
+@login_required
+@permission_required('logistics_providers:edit')
+def batch_update_provider_status():
+    """批量修改货代状态"""
+    try:
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        status = data.get('status')
+
+        if not ids or not isinstance(ids, list):
+            return jsonify({"status": "error", "message": "请提供要修改的ID列表"}), 400
+        if status is None:
+            return jsonify({"status": "error", "message": "请提供目标状态"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                placeholders = ', '.join(['%s'] * len(ids))
+                sql = f"UPDATE logistics_providers SET status = %s WHERE id IN ({placeholders})"
+                cursor.execute(sql, tuple([int(status)] + [int(i) for i in ids]))
+                conn.commit()
+                return jsonify({
+                    "status": "success",
+                    "message": f"成功更新 {cursor.rowcount} 条记录",
+                    "data": {"affected": cursor.rowcount}
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Logistics] 批量更新货代状态异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -488,11 +525,103 @@ def update_waybill(waybill_id):
                 conn.commit()
                 if cursor.rowcount == 0:
                     return jsonify({"status": "error", "message": "运单不存在"}), 404
+
+                # 状态变为已完成时，自动创建支出记录
+                if data.get('status') == WAYBILL_STATUS_COMPLETED:
+                    try:
+                        from blueprints.expenses import create_expense_for_source
+                        wb_no = waybill_no
+                        if not wb_no:
+                            cursor.execute("SELECT waybill_no, total_cost_cny FROM logistics_waybills WHERE id = %s", (waybill_id,))
+                            row = cursor.fetchone()
+                            if row:
+                                wb_no = row['waybill_no']
+                        if wb_no:
+                            cursor.execute(
+                                "SELECT id FROM expenses WHERE category = %s AND remark = %s LIMIT 1",
+                                ('物流/头程', f"运单 {wb_no}")
+                            )
+                            if not cursor.fetchone():
+                                cursor.execute("SELECT total_cost_cny FROM logistics_waybills WHERE id = %s", (waybill_id,))
+                                cost_row = cursor.fetchone()
+                                total_cost = float(cost_row['total_cost_cny'] or 0) if cost_row else 0
+                                create_expense_for_source(
+                                    conn, '物流/头程',
+                                    total_cost, datetime.now().strftime('%Y-%m-%d'),
+                                    f"运单 {wb_no}", 'company'
+                                )
+                    except Exception as e:
+                        print(f"[Logistics] 自动创建支出记录异常: {e}")
+
                 return jsonify({"status": "success", "message": "更新成功"})
         finally:
             conn.close()
     except Exception as e:
         print(f"[Logistics] 更新运单异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@logistics_bp.route('/logistics-waybills/batch-status', methods=['PUT'])
+@login_required
+@permission_required('logistics_waybills:edit')
+def batch_update_waybill_status():
+    """批量修改运单状态"""
+    try:
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        status = data.get('status')
+
+        if not ids or not isinstance(ids, list):
+            return jsonify({"status": "error", "message": "请提供要修改的ID列表"}), 400
+        if status is None:
+            return jsonify({"status": "error", "message": "请提供目标状态"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                placeholders = ', '.join(['%s'] * len(ids))
+                sql = f"UPDATE logistics_waybills SET status = %s WHERE id IN ({placeholders})"
+                cursor.execute(sql, tuple([int(status)] + [int(i) for i in ids]))
+                conn.commit()
+
+                # 状态变为已完成时，自动创建支出记录
+                if int(status) == WAYBILL_STATUS_COMPLETED:
+                    try:
+                        from blueprints.expenses import create_expense_for_source
+                        placeholders2 = ', '.join(['%s'] * len(ids))
+                        int_ids = [int(i) for i in ids]
+                        cursor.execute(f"""
+                            SELECT id, waybill_no, total_cost_cny FROM logistics_waybills
+                            WHERE id IN ({placeholders2})
+                            AND waybill_no IS NOT NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM expenses
+                                WHERE expenses.category = '物流/头程'
+                                AND expenses.remark = CONCAT('运单 ', logistics_waybills.waybill_no)
+                            )
+                        """, tuple(int_ids))
+                        pending = cursor.fetchall()
+                        for row in pending:
+                            try:
+                                create_expense_for_source(
+                                    conn, '物流/头程',
+                                    float(row['total_cost_cny'] or 0), datetime.now().strftime('%Y-%m-%d'),
+                                    f"运单 {row['waybill_no']}", 'company'
+                                )
+                            except Exception as e:
+                                print(f"[Logistics] 为运单 {row['waybill_no']} 创建支出记录失败: {e}")
+                    except Exception as e:
+                        print(f"[Logistics] 批量创建支出记录异常: {e}")
+
+                return jsonify({
+                    "status": "success",
+                    "message": f"成功更新 {cursor.rowcount} 条记录",
+                    "data": {"affected": cursor.rowcount}
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Logistics] 批量更新运单状态异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

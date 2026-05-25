@@ -87,6 +87,32 @@ def log_expense_action(conn, expense_id, action, user_id, old_data=None, new_dat
         # 日志记录失败不影响主流程
 
 
+def create_expense_for_source(conn, category, amount, date, remark, account_type='company'):
+    """
+    供其他模块调用的支出记录创建函数（在已有事务中调用）。
+    返回新创建的 expense id，失败返回 None。
+    user_id/created_by/updated_by 固定为 0（系统），日志也记录为系统操作。
+    """
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO expenses (user_id, date, category, amount, remark, has_invoice, account_type, reimbursed, created_by, updated_by)
+                VALUES (%s, %s, %s, %s, %s, 0, %s, 0, %s, %s)
+            """, (0, date, category, amount, remark, account_type, 0, 0))
+            new_id = cursor.lastrowid
+
+        log_expense_action(
+            conn, new_id, 'CREATE', 0,
+            old_data=None,
+            new_data={'date': str(date), 'category': category, 'amount': float(amount),
+                      'remark': remark, 'account_type': account_type}
+        )
+        return new_id
+    except Exception as e:
+        print(f"[Expenses] 自动创建支出记录异常: {e}")
+        return None
+
+
 def allowed_file(filename):
     """检查文件扩展名是否允许"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
@@ -204,8 +230,8 @@ def get_expense_list():
                         e.id, e.date, e.category, e.amount, e.remark,
                         e.has_invoice, e.invoice_image, e.account_type, e.reimbursed,
                         e.created_at, e.updated_at,
-                        e.created_by, cu.nickname as created_by_name,
-                        e.updated_by, uu.nickname as updated_by_name
+                        e.created_by, COALESCE(cu.nickname, '系统') as created_by_name,
+                        e.updated_by, COALESCE(uu.nickname, '系统') as updated_by_name
                     FROM expenses e
                     LEFT JOIN users cu ON e.created_by = cu.id
                     LEFT JOIN users uu ON e.updated_by = uu.id
@@ -536,7 +562,7 @@ def get_expense_logs(id):
                 cursor.execute("""
                     SELECT
                         l.id, l.expense_id, l.action, l.user_id,
-                        u.nickname as operator_name,
+                        COALESCE(u.nickname, '系统') as operator_name,
                         l.old_data, l.new_data, l.created_at
                     FROM expense_logs l
                     LEFT JOIN users u ON l.user_id = u.id
