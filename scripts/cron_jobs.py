@@ -8,7 +8,8 @@ Crontab 定时任务入口脚本
 
 可用任务：
     inventory        库存同步（每小时）
-    inbound          入库计划同步（每3小时）
+    inbound-30min    入库计划 + 货件列表同步（每30分钟）
+    inbound-6h       箱子 + 货件详情同步（每6小时）
     listing          Listing同步（每3小时）
     orders-recent    近期订单同步 24h（每15分钟）
     orders-week      本周订单同步 7d（每3小时）
@@ -63,15 +64,12 @@ def task_inventory():
             print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 库存同步异常: {e}")
 
 
-# ==================== 2. 入库计划同步 ====================
+# ==================== 2. 入库计划同步（30分钟粒度：计划+货件列表）====================
 
-def task_inbound():
+def task_inbound_30min():
     from blueprints.amazon.inbound_plans import (
         _sync_inbound_plans,
-        _sync_all_inbound_plan_boxes,
         _sync_all_inbound_plan_shipments,
-        _sync_inbound_plan_shipments_all,
-        _get_inbound_plan_ids,
     )
     shops = get_all_active_shops()
     if not shops:
@@ -91,11 +89,32 @@ def task_inbound():
             print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划同步异常: {e}")
             continue
 
-        if plans_result.get('synced_count', 0) <= 0:
-            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 没有入库计划，跳过后续同步")
-            continue
+        # 2. 同步货件列表
+        print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划货件同步...")
+        try:
+            result = _sync_all_inbound_plan_shipments(shop_id=shop_id, status='ACTIVE')
+            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划货件同步完成: {result}")
+        except Exception as e:
+            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划货件同步异常: {e}")
 
-        # 2. 同步箱子
+
+# ==================== 3. 入库计划同步（6小时粒度：箱子+货件详情）====================
+
+def task_inbound_6h():
+    from blueprints.amazon.inbound_plans import (
+        _sync_all_inbound_plan_boxes,
+        _sync_all_inbound_shipment_details,
+    )
+    shops = get_all_active_shops()
+    if not shops:
+        print(f"[{_now_str()}] [Cron] 没有启用的店铺，跳过入库计划深度同步")
+        return
+
+    for shop in shops:
+        shop_name = shop.get('shop_name', f"shop_{shop['id']}")
+        shop_id = shop['id']
+
+        # 1. 同步所有箱子
         print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划箱子同步...")
         try:
             result = _sync_all_inbound_plan_boxes(shop_id=shop_id, status='ACTIVE')
@@ -103,35 +122,13 @@ def task_inbound():
         except Exception as e:
             print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划箱子同步异常: {e}")
 
-        # 3. 同步货件列表
-        print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划货件同步...")
+        # 2. 同步所有货件详情
+        print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划货件详情同步...")
         try:
-            result = _sync_all_inbound_plan_shipments(shop_id=shop_id, status='ACTIVE')
-            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划货件同步完成: {result}")
+            result = _sync_all_inbound_shipment_details(shop_id=shop_id, status='ACTIVE')
+            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划货件详情同步完成: {result}")
         except Exception as e:
-            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划货件同步异常: {e}")
-            continue
-
-        # 4. 同步货件详情
-        plan_ids = _get_inbound_plan_ids(shop_id=shop_id, status='ACTIVE')
-        if not plan_ids:
-            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 没有 ACTIVE 入库计划，跳过货件详情同步")
-            continue
-
-        print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划货件详情同步，共 {len(plan_ids)} 个计划...")
-        total_detail_synced = 0
-        detail_errors = []
-        for plan_id in plan_ids:
-            try:
-                result = _sync_inbound_plan_shipments_all(shop_id=shop_id, plan_id=plan_id)
-                total_detail_synced += result.get('details_synced_count', 0)
-                if result.get('errors'):
-                    detail_errors.extend(result['errors'])
-            except Exception as e:
-                detail_errors.append({"plan_id": plan_id, "error": str(e)})
-
-        print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划货件详情同步完成: {total_detail_synced} 条"
-              f"{f', 错误: {detail_errors}' if detail_errors else ''}")
+            print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划货件详情同步异常: {e}")
 
 
 # ==================== 3. Listing 同步 ====================
@@ -350,7 +347,8 @@ def task_reports_monthly():
 
 TASK_MAP = {
     'inventory': task_inventory,
-    'inbound': task_inbound,
+    'inbound-30min': task_inbound_30min,
+    'inbound-6h': task_inbound_6h,
     'listing': task_listing,
     'orders-recent': task_orders_recent,
     'orders-week': task_orders_week,
