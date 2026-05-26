@@ -87,7 +87,7 @@ def log_expense_action(conn, expense_id, action, user_id, old_data=None, new_dat
         # 日志记录失败不影响主流程
 
 
-def create_expense_for_source(conn, category, amount, date, remark, account_type='company'):
+def create_expense_for_source(conn, category, amount, date, remark, source_type, source_no, account_type='company'):
     """
     供其他模块调用的支出记录创建函数（在已有事务中调用）。
     返回新创建的 expense id，失败返回 None。
@@ -96,16 +96,16 @@ def create_expense_for_source(conn, category, amount, date, remark, account_type
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO expenses (user_id, date, category, amount, remark, has_invoice, account_type, reimbursed, created_by, updated_by)
-                VALUES (%s, %s, %s, %s, %s, 0, %s, 0, %s, %s)
-            """, (0, date, category, amount, remark, account_type, 0, 0))
+                INSERT INTO expenses (user_id, date, category, source_type, source_no, amount, remark, has_invoice, account_type, reimbursed, created_by, updated_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, 0, %s, %s)
+            """, (0, date, category, source_type, source_no, amount, remark, account_type, 0, 0))
             new_id = cursor.lastrowid
 
         log_expense_action(
             conn, new_id, 'CREATE', 0,
             old_data=None,
-            new_data={'date': str(date), 'category': category, 'amount': float(amount),
-                      'remark': remark, 'account_type': account_type}
+            new_data={'date': str(date), 'category': category, 'source_type': source_type, 'source_no': source_no,
+                      'amount': float(amount), 'remark': remark, 'account_type': account_type}
         )
         return new_id
     except Exception as e:
@@ -227,7 +227,7 @@ def get_expense_list():
                 offset = (page - 1) * page_size
                 sql = f"""
                     SELECT
-                        e.id, e.date, e.category, e.amount, e.remark,
+                        e.id, e.date, e.category, e.source_type, e.source_no, e.amount, e.remark,
                         e.has_invoice, e.invoice_image, e.account_type, e.reimbursed,
                         e.created_at, e.updated_at,
                         e.created_by, COALESCE(cu.nickname, '系统') as created_by_name,

@@ -549,14 +549,14 @@ def update_purchase_order(order_id):
                     try:
                         from blueprints.expenses import create_expense_for_source
                         cursor.execute(
-                            "SELECT id FROM expenses WHERE category = %s AND remark = %s LIMIT 1",
-                            ('采购/货值', f"进货单 {order_no}")
+                            "SELECT id FROM expenses WHERE source_type = %s AND source_no = %s LIMIT 1",
+                            ('purchase_order', order_no)
                         )
                         if not cursor.fetchone():
                             create_expense_for_source(
                                 conn, '采购/货值',
                                 float(total_amount), datetime.now().strftime('%Y-%m-%d'),
-                                f"进货单 {order_no}", 'company'
+                                f"进货单 {order_no}", 'purchase_order', order_no, 'company'
                             )
                     except Exception as e:
                         print(f"[PurchaseOrders] 自动创建支出记录异常: {e}")
@@ -604,8 +604,8 @@ def batch_update_purchase_order_status():
                             WHERE id IN ({placeholders2})
                             AND NOT EXISTS (
                                 SELECT 1 FROM expenses
-                                WHERE expenses.category = '采购/货值'
-                                AND expenses.remark = CONCAT('进货单 ', purchase_orders.order_no)
+                                WHERE expenses.source_type = 'purchase_order'
+                                AND expenses.source_no = purchase_orders.order_no
                             )
                         """, tuple(int_ids))
                         pending = cursor.fetchall()
@@ -614,7 +614,7 @@ def batch_update_purchase_order_status():
                                 create_expense_for_source(
                                     conn, '采购/货值',
                                     float(row['total_amount'] or 0), datetime.now().strftime('%Y-%m-%d'),
-                                    f"进货单 {row['order_no']}", 'company'
+                                    f"进货单 {row['order_no']}", 'purchase_order', row['order_no'], 'company'
                                 )
                             except Exception as e:
                                 print(f"[PurchaseOrders] 为进货单 {row['order_no']} 创建支出记录失败: {e}")

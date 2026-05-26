@@ -285,6 +285,7 @@ def list_waybills():
     """运单列表（分页 + 筛选）"""
     try:
         keyword = request.args.get('keyword', '').strip() or None
+        waybill_no = request.args.get('waybill_no', '').strip() or None
         provider_id = request.args.get('provider_id', '').strip() or None
         status = request.args.get('status', '').strip() or None
         page = int(request.args.get('page', 1))
@@ -300,6 +301,10 @@ def list_waybills():
             with conn.cursor() as cursor:
                 conditions = ["1=1"]
                 params = []
+
+                if waybill_no:
+                    conditions.append("w.waybill_no LIKE %s")
+                    params.append(f"%{waybill_no}%")
 
                 if keyword:
                     conditions.append(
@@ -538,8 +543,8 @@ def update_waybill(waybill_id):
                                 wb_no = row['waybill_no']
                         if wb_no:
                             cursor.execute(
-                                "SELECT id FROM expenses WHERE category = %s AND remark = %s LIMIT 1",
-                                ('物流/头程', f"运单 {wb_no}")
+                                "SELECT id FROM expenses WHERE source_type = %s AND source_no = %s LIMIT 1",
+                                ('logistics_waybill', wb_no)
                             )
                             if not cursor.fetchone():
                                 cursor.execute("SELECT total_cost_cny FROM logistics_waybills WHERE id = %s", (waybill_id,))
@@ -548,7 +553,7 @@ def update_waybill(waybill_id):
                                 create_expense_for_source(
                                     conn, '物流/头程',
                                     total_cost, datetime.now().strftime('%Y-%m-%d'),
-                                    f"运单 {wb_no}", 'company'
+                                    f"运单 {wb_no}", 'logistics_waybill', wb_no, 'company'
                                 )
                     except Exception as e:
                         print(f"[Logistics] 自动创建支出记录异常: {e}")
@@ -596,8 +601,8 @@ def batch_update_waybill_status():
                             AND waybill_no IS NOT NULL
                             AND NOT EXISTS (
                                 SELECT 1 FROM expenses
-                                WHERE expenses.category = '物流/头程'
-                                AND expenses.remark = CONCAT('运单 ', logistics_waybills.waybill_no)
+                                WHERE expenses.source_type = 'logistics_waybill'
+                                AND expenses.source_no = logistics_waybills.waybill_no
                             )
                         """, tuple(int_ids))
                         pending = cursor.fetchall()
@@ -606,7 +611,7 @@ def batch_update_waybill_status():
                                 create_expense_for_source(
                                     conn, '物流/头程',
                                     float(row['total_cost_cny'] or 0), datetime.now().strftime('%Y-%m-%d'),
-                                    f"运单 {row['waybill_no']}", 'company'
+                                    f"运单 {row['waybill_no']}", 'logistics_waybill', row['waybill_no'], 'company'
                                 )
                             except Exception as e:
                                 print(f"[Logistics] 为运单 {row['waybill_no']} 创建支出记录失败: {e}")
