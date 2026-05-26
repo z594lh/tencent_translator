@@ -57,7 +57,7 @@ HEADER_MAP = {
     '竞品链接参考': 'competitor_link_reference',
 }
 
-ALL_COLUMNS = list(HEADER_MAP.values())
+ALL_COLUMNS = list(HEADER_MAP.values()) + ['is_listed']
 
 NUMERIC_FIELDS = {
     'rating', 'selling_price_usd', 'promo_price_usd', 'suggested_price_usd',
