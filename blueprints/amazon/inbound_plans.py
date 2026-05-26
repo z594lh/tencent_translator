@@ -402,7 +402,13 @@ def sync_amazon_inbound_shipments():
 
         return jsonify({
             "status": "success",
-            "message": f"同步完成，入库计划 {result['plans'].get('synced_count', 0)} 个，货件 {result['shipments_synced']} 条，详情 {result['details_synced']} 条",
+            "message": (
+                f"同步完成，入库计划 {result['plans'].get('synced_count', 0)} 个"
+                f"（新增 {result.get('new_plan_count', 0)} 个）"
+                f"，箱子 {result.get('boxes_synced', 0)} 条"
+                f"，货件 {result['shipments_synced']} 条"
+                f"，详情 {result['details_synced']} 条"
+            ),
             "data": result
         })
 
@@ -778,28 +784,49 @@ def _get_inbound_shipments(shop_id, inbound_plan_id=None, shipment_confirmation_
 
 def _sync_active_inbound_shipments_full(shop_id):
     """
-    一键同步 ACTIVE 状态的所有入库计划及其货件详情
+    一键同步 ACTIVE 状态的所有入库计划及其货件详情、箱子数据
     流程：
         1. 同步 ACTIVE 状态的入库计划列表
-        2. 同步这些入库计划的货件列表
-        3. 同步每个货件的详情
+        2. 【新增】识别本次新增的入库计划，同步其箱子数据
+        3. 同步这些入库计划的货件列表
+        4. 同步每个货件的详情
     """
+    # 0. 同步前记录已有 ACTIVE 入库计划ID（用于识别新增）
+    existing_plan_ids = set(_get_inbound_plan_ids(shop_id=shop_id, status='ACTIVE') or [])
+
     # 1. 同步 ACTIVE 入库计划
     plans_result = _sync_inbound_plans(shop_id=shop_id, status='ACTIVE')
 
-    # 2. 获取数据库中 ACTIVE 状态的入库计划ID
-    plan_ids = _get_inbound_plan_ids(shop_id=shop_id, status='ACTIVE')
+    # 2. 获取同步后所有 ACTIVE 入库计划ID，找出新增的
+    current_plan_ids = set(_get_inbound_plan_ids(shop_id=shop_id, status='ACTIVE') or [])
+    new_plan_ids = list(current_plan_ids - existing_plan_ids)
+
+    # 2.5 同步新增入库计划的箱子数据
+    total_boxes_synced = 0
+    box_sync_errors = []
+    for plan_id in new_plan_ids:
+        result = _sync_inbound_plan_boxes(shop_id=shop_id, plan_id=plan_id)
+        total_boxes_synced += result.get('synced_count', 0)
+        if result.get('error'):
+            box_sync_errors.append({"plan_id": plan_id, "error": result['error']})
+        time.sleep(0.3)
+
+    # 3. 同步这些计划的货件列表
+    plan_ids = list(current_plan_ids)
     if not plan_ids:
         return {
             "plans": plans_result,
+            "boxes_synced": total_boxes_synced,
             "shipments_synced": 0,
             "details_synced": 0,
             "total_shipments": 0,
+            "new_plan_count": len(new_plan_ids),
+            "new_plan_ids": new_plan_ids,
+            "box_errors": box_sync_errors,
             "shipment_errors": [],
             "detail_errors": []
         }
 
-    # 3. 同步这些计划的货件列表
     total_shipments_synced = 0
     shipment_sync_errors = []
     all_shipment_entries = []
@@ -830,9 +857,13 @@ def _sync_active_inbound_shipments_full(shop_id):
 
     return {
         "plans": plans_result,
+        "boxes_synced": total_boxes_synced,
         "shipments_synced": total_shipments_synced,
         "details_synced": total_details_synced,
         "total_shipments": len(all_shipment_entries),
+        "new_plan_count": len(new_plan_ids),
+        "new_plan_ids": new_plan_ids,
+        "box_errors": box_sync_errors,
         "shipment_errors": shipment_sync_errors,
         "detail_errors": detail_sync_errors
     }

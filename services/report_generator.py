@@ -7,10 +7,7 @@
 
 数据来源：
   - 销售额/订单数：amazon_orders + amazon_order_items
-  - 产品成本：products.purchase_cost (CNY) → exchange_rates 转 USD
-  - FBA 配送费：fba_tier_fees 按重量查表
-  - 平台佣金：category_commission_rates 按类目
-  - 头程费用：logistics_waybills 按重量分摊（复用 pricing.py 逻辑）
+  - 产品成本、FBA 费、佣金、头程：统一调用 services/profit_calculator
   - 广告费：amazon_ad_spend（有则计入，无则记0）
   - 退款：amazon_refund_records（有则计入，无则记0）
 
@@ -18,169 +15,24 @@
   - 幂等设计：INSERT ... ON DUPLICATE KEY UPDATE，重复跑不会重复数据
   - 事务安全：单店铺单周期一个事务
   - 日志追踪：report_generation_log 记录每次生成耗时和结果
+
+【重构说明 2026-05-26】
+所有 SKU 维度的成本拆分（采购、头程、FBA、佣金）已下沉到 services/profit_calculator.py，
+本模块不再维护重复逻辑，直接调用：
+  - profit_calculator.get_unit_costs(cursor, seller_sku, exchange_rate) -> UnitCostBreakdown
+  - profit_calculator.calculate_profit(sales, qty, unit_costs, ad_cost, refund) -> ProfitResult
+确保定价模块、经营日报、SKU 利润表、库存周转四处的成本计算完全一致。
 """
-import json
-import re
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from services.mysql_service import get_db_connection
+from services.profit_calculator import (
+    get_exchange_rate,
+    get_unit_costs,
+    calculate_profit,
+)
 
-# 头程分摊相关 helper（复用 pricing.py 核心逻辑）
-_LB_TO_KG = 0.45359237
-
-
-def _lb_to_kg(lb):
-    return lb * _LB_TO_KG
-
-
-def _parse_dimensions(dimensions_str):
-    if not dimensions_str:
-        return None
-    parts = re.split(r'[\*xX×\s]+', str(dimensions_str).strip())
-    nums = []
-    for p in parts:
-        try:
-            nums.append(float(p.strip()))
-        except (ValueError, TypeError):
-            continue
-    if len(nums) >= 3:
-        return nums[:3]
-    return None
-
-
-def _get_billable_weight(weight_kg, dimensions_cm_str):
-    actual_weight = float(weight_kg) if weight_kg is not None else 0.0
-    dims = _parse_dimensions(dimensions_cm_str)
-    if dims and len(dims) == 3:
-        volume = dims[0] * dims[1] * dims[2]
-        volumetric_weight = volume / 5000.0
-        return max(actual_weight, volumetric_weight)
-    return actual_weight
-
-
-def _get_exchange_rate(cursor, from_currency='CNY', to_currency='USD'):
-    cursor.execute("""
-        SELECT rate FROM exchange_rates
-        WHERE from_currency = %s AND to_currency = %s
-        ORDER BY updated_at DESC LIMIT 1
-    """, (from_currency, to_currency))
-    row = cursor.fetchone()
-    if row and row.get('rate') is not None:
-        return Decimal(str(row['rate']))
-    return Decimal('0.138')  # fallback
-
-
-def _get_commission_rate(cursor, seller_sku):
-    try:
-        cursor.execute("SELECT category_id FROM products WHERE seller_sku = %s LIMIT 1", (seller_sku,))
-        row = cursor.fetchone()
-        if row and row.get('category_id'):
-            cursor.execute("""
-                SELECT commission_rate FROM category_commission_rates
-                WHERE id = %s LIMIT 1
-            """, (int(row['category_id']),))
-            r = cursor.fetchone()
-            if r and r.get('commission_rate') is not None:
-                return Decimal(str(r['commission_rate']))
-    except Exception:
-        pass
-    return Decimal('0.15')  # default 15%
-
-
-def _get_fba_fee(cursor, billable_weight_kg):
-    w = float(billable_weight_kg)
-    cursor.execute("""
-        SELECT fee_usd FROM fba_tier_fees
-        WHERE weight_min_kg <= %s
-          AND (weight_max_kg IS NULL OR weight_max_kg > %s)
-        ORDER BY weight_min_kg DESC
-        LIMIT 1
-    """, (w, w))
-    row = cursor.fetchone()
-    if row and row.get('fee_usd') is not None:
-        return Decimal(str(row['fee_usd']))
-    return Decimal('3.22')  # default Small Standard
-
-
-def _get_unit_headway_cost(cursor, seller_sku, exchange_rate):
-    """
-    计算单个 SKU 的单件头程成本（USD）
-    复用 pricing.py 的分摊逻辑，但返回【单件】成本而非总成本
-    """
-    like_pattern = f'%"msku": "{seller_sku}"%'
-    cursor.execute("""
-        SELECT DISTINCT b.shipment_id, s.sync_time
-        FROM amazon_inbound_plan_boxes b
-        INNER JOIN amazon_inbound_shipments_detail s
-            ON b.shipment_id = s.shipment_confirmation_id AND s.shop_id = b.shop_id
-        WHERE b.items_json LIKE %s AND s.status != 'CANCELLED'
-        ORDER BY s.sync_time DESC
-        LIMIT 1
-    """, (like_pattern,))
-    row = cursor.fetchone()
-    if not row:
-        return Decimal('0'), {"note": "未找到有效货件", "shipment_id": None}
-    shipment_id = row['shipment_id']
-
-    # 货件下该 SKU 总数量
-    cursor.execute("""
-        SELECT items_json FROM amazon_inbound_plan_boxes WHERE shipment_id = %s
-    """, (shipment_id,))
-    boxes = cursor.fetchall()
-    total_qty = 0
-    for box in boxes:
-        items = json.loads(box.get("items_json") or "[]")
-        if isinstance(items, list):
-            for it in items:
-                if it.get("msku") == seller_sku:
-                    total_qty += int(it.get("quantity") or 0)
-    if total_qty <= 0:
-        return Decimal('0'), {"note": "货件中该SKU数量为0", "shipment_id": shipment_id}
-
-    # 运单总费用
-    cursor.execute("""
-        SELECT total_cost_cny FROM logistics_waybills
-        WHERE shipment_id = %s ORDER BY created_at DESC LIMIT 1
-    """, (shipment_id,))
-    waybill = cursor.fetchone()
-    if not waybill or waybill.get('total_cost_cny') is None:
-        return Decimal('0'), {"note": "货件未绑定运单", "shipment_id": shipment_id}
-    total_cost_cny = Decimal(str(waybill['total_cost_cny']))
-
-    # 货件总重量
-    cursor.execute("""
-        SELECT weight_value, weight_unit FROM amazon_inbound_plan_boxes WHERE shipment_id = %s
-    """, (shipment_id,))
-    boxes = cursor.fetchall()
-    total_weight_kg = Decimal('0')
-    for box in boxes:
-        w = Decimal(str(box.get('weight_value') or 0))
-        unit = (box.get('weight_unit') or '').upper()
-        if unit == 'LB':
-            w = w * Decimal(str(_LB_TO_KG))
-        total_weight_kg += w
-    if total_weight_kg <= 0:
-        return Decimal('0'), {"note": "货件总重量为0", "shipment_id": shipment_id}
-
-    # SKU 单件重量
-    cursor.execute("SELECT weight_kg FROM products WHERE seller_sku = %s LIMIT 1", (seller_sku,))
-    prod = cursor.fetchone()
-    if not prod or prod.get('weight_kg') is None:
-        return Decimal('0'), {"note": "产品表无重量", "shipment_id": shipment_id}
-    sku_weight_kg = Decimal(str(prod['weight_kg']))
-
-    # 单件头程 = 总费用 * 单件重量 / 货件总重量 * 汇率
-    unit_headway_cny = total_cost_cny * sku_weight_kg / total_weight_kg
-    unit_headway_usd = unit_headway_cny * exchange_rate
-
-    return unit_headway_usd, {
-        "shipment_id": shipment_id,
-        "total_qty_in_shipment": total_qty,
-        "waybill_total_cost_cny": float(total_cost_cny),
-        "shipment_total_weight_kg": float(total_weight_kg),
-        "sku_weight_kg": float(sku_weight_kg),
-    }
 
 
 def _log_generation_start(report_type, period, shop_id=0):
@@ -247,7 +99,7 @@ def generate_business_daily(report_date, shop_id=None):
                 with conn.cursor() as cursor:
                     # 1. 读取汇率（缓存，同一天内复用）
                     if exchange_rate is None:
-                        exchange_rate = _get_exchange_rate(cursor)
+                        exchange_rate = get_exchange_rate(cursor)
 
                     # 2. 订单维度汇总：销售额、订单数、SKU数、销量
                     cursor.execute("""
@@ -293,40 +145,17 @@ def generate_business_daily(report_date, shop_id=None):
 
                     for row in sku_rows:
                         seller_sku = row['seller_sku']
-                        qty = Decimal(str(row['qty'] or 0))
+                        qty = int(row['qty'] or 0)
                         revenue = Decimal(str(row['revenue'] or 0))
 
-                        # 产品采购成本
-                        cursor.execute("""
-                            SELECT purchase_cost, weight_kg, dimensions_cm, category_id
-                            FROM products WHERE seller_sku = %s LIMIT 1
-                        """, (seller_sku,))
-                        prod = cursor.fetchone()
+                        # 统一成本入口（2026-05-26 重构）
+                        unit_costs = get_unit_costs(cursor, seller_sku, exchange_rate)
+                        profit = calculate_profit(revenue, qty, unit_costs)
 
-                        unit_product_cost_usd = Decimal('0')
-                        unit_fba_fee = Decimal('0')
-                        commission_rate = Decimal('0.15')
-                        unit_headway = Decimal('0')
-
-                        if prod:
-                            if prod.get('purchase_cost') is not None:
-                                pc = Decimal(str(prod['purchase_cost']))
-                                unit_product_cost_usd = pc * exchange_rate
-
-                            if prod.get('weight_kg') is not None:
-                                bw = _get_billable_weight(prod['weight_kg'], prod.get('dimensions_cm'))
-                                unit_fba_fee = _get_fba_fee(cursor, bw)
-
-                            if prod.get('category_id') is not None:
-                                commission_rate = _get_commission_rate(cursor, seller_sku)
-
-                        # 头程（单件）
-                        unit_headway, _ = _get_unit_headway_cost(cursor, seller_sku, exchange_rate)
-
-                        total_product_cost += unit_product_cost_usd * qty
-                        total_fba_fees += unit_fba_fee * qty
-                        total_commission += revenue * commission_rate
-                        total_headway += unit_headway * qty
+                        total_product_cost += profit.product_cost
+                        total_fba_fees += profit.fba_fees
+                        total_commission += profit.commission
+                        total_headway += profit.headway_cost
 
                     # 4. 广告费（仅读取 amazon_ad_spend，无数据则记0）
                     cursor.execute("""
@@ -613,7 +442,7 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
             try:
                 with conn.cursor() as cursor:
                     if exchange_rate is None:
-                        exchange_rate = _get_exchange_rate(cursor)
+                        exchange_rate = get_exchange_rate(cursor)
 
                     # 1. 聚合销售数据
                     cursor.execute("""
@@ -640,34 +469,9 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         sales_amount = Decimal(str(row['sales_amount'] or 0))
                         avg_price = Decimal(str(row['avg_price'] or 0))
 
-                        # 产品信息
-                        cursor.execute("""
-                            SELECT product_name, purchase_cost, weight_kg, dimensions_cm, category_id
-                            FROM products WHERE seller_sku = %s LIMIT 1
-                        """, (sku,))
-                        prod = cursor.fetchone()
-
-                        product_name = prod.get('product_name') or '' if prod else ''
-                        unit_product_cost_usd = Decimal('0')
-                        unit_fba_fee = Decimal('0')
-                        commission_rate = Decimal('0.15')
-                        unit_headway = Decimal('0')
-
-                        if prod:
-                            if prod.get('purchase_cost') is not None:
-                                unit_product_cost_usd = Decimal(str(prod['purchase_cost'])) * exchange_rate
-                            if prod.get('weight_kg') is not None:
-                                bw = _get_billable_weight(prod['weight_kg'], prod.get('dimensions_cm'))
-                                unit_fba_fee = _get_fba_fee(cursor, bw)
-                            if prod.get('category_id') is not None:
-                                commission_rate = _get_commission_rate(cursor, sku)
-
-                        unit_headway, _ = _get_unit_headway_cost(cursor, sku, exchange_rate)
-
-                        product_cost = unit_product_cost_usd * sales_qty
-                        fba_fees = unit_fba_fee * sales_qty
-                        platform_fees = sales_amount * commission_rate
-                        headway_cost = unit_headway * sales_qty
+                        # 统一成本入口（2026-05-26 重构）
+                        unit_costs = get_unit_costs(cursor, sku, exchange_rate)
+                        product_name = unit_costs.product_name or ''
 
                         # 广告费（按 ASIN 汇总，无数据则记0）
                         cursor.execute("""
@@ -689,10 +493,16 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         refund_row = cursor.fetchone()
                         refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
 
-                        other_fees = Decimal('0')
-                        gross_profit = sales_amount - product_cost - fba_fees - platform_fees - refund_amount - headway_cost
-                        net_profit = gross_profit - ad_cost - other_fees
-                        profit_margin = (net_profit / sales_amount) if sales_amount > 0 else Decimal('0')
+                        # 统一利润公式
+                        profit = calculate_profit(sales_amount, sales_qty, unit_costs, ad_cost, refund_amount)
+                        product_cost = profit.product_cost
+                        fba_fees = profit.fba_fees
+                        platform_fees = profit.commission
+                        headway_cost = profit.headway_cost
+                        gross_profit = profit.gross_profit
+                        net_profit = profit.net_profit
+                        profit_margin = profit.profit_margin
+                        other_fees = profit.other_fees
 
                         cursor.execute("""
                             INSERT INTO sku_profit (
@@ -767,7 +577,7 @@ def generate_inventory_turnover(shop_id=None):
             try:
                 with conn.cursor() as cursor:
                     if exchange_rate is None:
-                        exchange_rate = _get_exchange_rate(cursor)
+                        exchange_rate = get_exchange_rate(cursor)
 
                     # 1. 获取当前库存
                     cursor.execute("""
@@ -858,17 +668,9 @@ def generate_inventory_turnover(shop_id=None):
                         # 建议补货 = max(0, 日均销量 * 60 - 总可用)
                         suggested = max(0, int((avg_daily_sales * Decimal('60') - Decimal(str(total_available))).to_integral_value(rounding=ROUND_HALF_UP)))
 
-                        # 单位成本
-                        cursor.execute("""
-                            SELECT purchase_cost, weight_kg FROM products WHERE seller_sku = %s LIMIT 1
-                        """, (sku,))
-                        prod = cursor.fetchone()
-                        unit_cost = Decimal('0')
-                        if prod and prod.get('purchase_cost') is not None:
-                            unit_cost = Decimal(str(prod['purchase_cost'])) * exchange_rate
-                            # 加上单件头程
-                            headway_usd, _ = _get_unit_headway_cost(cursor, sku, exchange_rate)
-                            unit_cost += headway_usd
+                        # 单位成本（统一入口，2026-05-26 重构）
+                        unit_costs = get_unit_costs(cursor, sku, exchange_rate)
+                        unit_cost = unit_costs.purchase_cost_usd + unit_costs.headway_cost_usd
 
                         inventory_value = unit_cost * Decimal(str(current_stock))
 
