@@ -35,6 +35,20 @@ BASE_URL = os.getenv("BASE_URL", "")
 FBA_LABEL_TASK_DIR = os.path.join('static', 'fba_labels', 'task')
 CARGO_AGENT_DIR = os.path.join('static', 'cargo_agent')
 
+# ==================== 货代箱唛配置 ====================
+# 新增货代时，在此追加配置项即可，无需修改业务逻辑
+# 前端统一上传 ZIP 格式，其他格式请前端手动转换
+# 每个配置只需定义：
+#   fba_pattern        - 从文件名提取 FBA 号的正则
+#   agent_code_pattern - 从文件名提取货代运单号的正则（没有则不填）
+# 1=>云驼物流（文件名示例：999260527000156-4件-FBA19DYP1G04-SWF2-美东整柜直送统配-华东按KG包税-无单证-92153.pdf）
+CARGO_AGENT_CONFIGS = {
+    1: {
+        'fba_pattern': r'FBA[A-Z0-9]+',
+        'agent_code_pattern': r'^(\d+)',
+    },
+}
+
 
 @fba_tools_bp.route('/fba/label', methods=['POST'])
 @login_required
@@ -271,7 +285,7 @@ def split_pdf_route():
 
 # ==================== 箱唛自动化整理 ====================
 
-def _create_task(task_id, shop_id, inbound_plan_id, crop_config=None, cargo_agent_path=None):
+def _create_task(task_id, shop_id, inbound_plan_id, crop_config=None, cargo_agent_path=None, logistics_provider_id=1):
     """创建任务记录"""
     conn = get_db_connection()
     try:
@@ -279,10 +293,10 @@ def _create_task(task_id, shop_id, inbound_plan_id, crop_config=None, cargo_agen
             expired_at = datetime.now() + timedelta(hours=24)
             crop_config_json = json.dumps(crop_config) if crop_config else None
             sql = """
-                INSERT INTO fba_label_tasks (id, shop_id, inbound_plan_id, crop_config, cargo_agent_path, status, progress, expired_at)
-                VALUES (%s, %s, %s, %s, %s, 'pending', 0, %s)
+                INSERT INTO fba_label_tasks (id, shop_id, inbound_plan_id, crop_config, cargo_agent_path, logistics_provider_id, status, progress, expired_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending', 0, %s)
             """
-            cursor.execute(sql, (task_id, shop_id, inbound_plan_id, crop_config_json, cargo_agent_path, expired_at))
+            cursor.execute(sql, (task_id, shop_id, inbound_plan_id, crop_config_json, cargo_agent_path, logistics_provider_id, expired_at))
             conn.commit()
     finally:
         conn.close()
@@ -325,7 +339,8 @@ def _get_task(task_id):
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, shop_id, inbound_plan_id, crop_config, cargo_agent_path, status, progress, message, result_path,
+                SELECT id, shop_id, inbound_plan_id, crop_config, cargo_agent_path, logistics_provider_id,
+                       status, progress, message, result_path,
                        created_at, completed_at, expired_at
                 FROM fba_label_tasks WHERE id = %s
             """, (task_id,))
@@ -406,7 +421,7 @@ def _get_box_ids_by_shipment_id(shop_id, shipment_id):
         conn.close()
 
 
-def _execute_task(task_id, shop_id, inbound_plan_id, crop_config):
+def _execute_task(task_id, shop_id, inbound_plan_id, crop_config, logistics_provider_id=0):
     """由工作线程执行单个箱唛整理任务"""
     try:
         _update_task(task_id, status='running', progress=0)
@@ -539,7 +554,7 @@ def _execute_task(task_id, shop_id, inbound_plan_id, crop_config):
         if cargo_agent_path and os.path.exists(cargo_agent_path):
             try:
                 shipment_ids = [s['shipment_confirmation_id'] for s in shipments]
-                _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids)
+                _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids, logistics_provider_id)
             except Exception as e:
                 print(f"[Organize Task] 货代箱唛处理失败: {e}")
                 import traceback
@@ -572,8 +587,12 @@ def _execute_task(task_id, shop_id, inbound_plan_id, crop_config):
         _update_task(task_id, status='failed', message=str(e))
 
 
-def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids):
-    """解压货代箱唛ZIP，按FBA货件号归类并拆分PDF到对应文件夹"""
+def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids, logistics_provider_id=1):
+    """解压货代箱唛ZIP，按配置规则归类并拆分PDF到对应文件夹"""
+    config = CARGO_AGENT_CONFIGS.get(logistics_provider_id)
+    if not config:
+        raise ValueError(f"未找到货代ID {logistics_provider_id} 的配置")
+
     temp_dir = os.path.join(task_dir, '_cargo_agent_temp')
     os.makedirs(temp_dir, exist_ok=True)
 
@@ -587,16 +606,21 @@ def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids):
             if not filename.lower().endswith('.pdf'):
                 continue
 
-            # 提取货代编号（99开头的数字）
-            agent_code_match = re.match(r'^(\d+)', filename)
-            agent_code = agent_code_match.group(1) if agent_code_match else ''
+            # 按配置提取货代运单号（没有就算了）
+            agent_code = ''
+            if config.get('agent_code_pattern'):
+                agent_code_match = re.match(config['agent_code_pattern'], filename)
+                agent_code = agent_code_match.group(1) if agent_code_match else ''
 
-            # 提取FBA号
-            fba_match = re.search(r'FBA[A-Z0-9]+', filename, re.IGNORECASE)
-            if not fba_match:
+            # 按配置提取FBA号
+            fba_id = None
+            if config.get('fba_pattern'):
+                fba_match = re.search(config['fba_pattern'], filename, re.IGNORECASE)
+                if fba_match:
+                    fba_id = fba_match.group(0).upper()
+            if not fba_id:
                 unmatched.append(filename)
                 continue
-            fba_id = fba_match.group(0).upper()
 
             # 找到对应货件文件夹
             matched_shipment = None
@@ -609,7 +633,13 @@ def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids):
                 unmatched.append(f'{filename} (FBA: {fba_id})')
                 continue
 
-            # 打开PDF按页拆分（货代PDF无需裁剪）
+            # 构建文件名前缀
+            if agent_code:
+                name_prefix = f"货代-{fba_id}-{agent_code}"
+            else:
+                name_prefix = f"货代-{fba_id}"
+
+            # 打开PDF处理（货代PDF无需裁剪）
             pdf_path = os.path.join(root, filename)
             try:
                 doc = fitz.open(pdf_path)
@@ -617,13 +647,13 @@ def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids):
                 os.makedirs(dest_dir, exist_ok=True)
 
                 if len(doc) == 1:
-                    new_filename = f"货代-{fba_id}-{agent_code}.pdf"
+                    new_filename = f"{name_prefix}.pdf"
                     doc.save(os.path.join(dest_dir, new_filename))
                 else:
                     for page_num in range(len(doc)):
                         new_doc = fitz.open()
                         new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                        new_filename = f"货代-{fba_id}-{agent_code}_page_{page_num + 1}.pdf"
+                        new_filename = f"{name_prefix}_page_{page_num + 1}.pdf"
                         new_doc.save(os.path.join(dest_dir, new_filename))
                         new_doc.close()
 
@@ -696,11 +726,27 @@ def organize_plan_labels():
         else:
             task_id = str(uuid.uuid4())
 
+        # 货代ID（决定用哪套解析规则）
+        if cargo_agent_file and cargo_agent_file.filename:
+            # 上传了货代ZIP，必须指定货代ID
+            logistics_provider_id = request.form.get('logistics_provider_id', '').strip()
+            if not logistics_provider_id:
+                return jsonify({"status": "error", "message": "上传货代箱唛时必须指定 logistics_provider_id"}), 400
+            try:
+                logistics_provider_id = int(logistics_provider_id)
+            except ValueError:
+                return jsonify({"status": "error", "message": "logistics_provider_id 必须是整数"}), 400
+            if logistics_provider_id not in CARGO_AGENT_CONFIGS:
+                return jsonify({"status": "error", "message": f"不支持的货代ID: {logistics_provider_id}"}), 400
+        else:
+            # 没上传货代ZIP，默认为0
+            logistics_provider_id = 0
+
         # 清理过期任务
         _cleanup_old_tasks()
 
         # 创建任务（只写数据库，工作线程会自动轮询执行）
-        _create_task(task_id, shop_id, inbound_plan_id, crop_config, cargo_agent_path)
+        _create_task(task_id, shop_id, inbound_plan_id, crop_config, cargo_agent_path, logistics_provider_id)
 
         return jsonify({
             "status": "success",
@@ -781,7 +827,7 @@ def _pick_pending_task():
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT id, shop_id, inbound_plan_id, crop_config, status, progress, message, result_path,
+                SELECT id, shop_id, inbound_plan_id, crop_config, logistics_provider_id, status, progress, message, result_path,
                        created_at, completed_at, expired_at
                 FROM fba_label_tasks
                 WHERE status = 'pending'
@@ -830,7 +876,8 @@ def _label_worker_loop():
                         task_id=task_id,
                         shop_id=task['shop_id'],
                         inbound_plan_id=task['inbound_plan_id'],
-                        crop_config=task.get('crop_config') or {"x_ratio": [0, 1], "y_ratio": [0, 0.667]}
+                        crop_config=task.get('crop_config') or {"x_ratio": [0, 1], "y_ratio": [0, 0.667]},
+                        logistics_provider_id=task.get('logistics_provider_id', 0)
                     )
                 except Exception as e:
                     print(f"[Label Worker] 任务 {task_id} 执行异常: {e}")
@@ -855,30 +902,34 @@ def _start_label_workers():
 
 
 def _list_tasks(shop_id, status=None, page=1, page_size=10):
-    """分页查询任务列表"""
+    """分页查询任务列表（连表货代信息）"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = ["shop_id = %s"]
+            conditions = ["t.shop_id = %s"]
             params = [shop_id]
             if status:
-                conditions.append("status = %s")
+                conditions.append("t.status = %s")
                 params.append(status)
             where_clause = " AND ".join(conditions)
 
             cursor.execute(
-                f"SELECT COUNT(*) as total FROM fba_label_tasks WHERE {where_clause}",
+                f"SELECT COUNT(*) as total FROM fba_label_tasks t WHERE {where_clause}",
                 tuple(params)
             )
             total = cursor.fetchone()['total']
 
             offset = (page - 1) * page_size
             cursor.execute(f"""
-                SELECT id, shop_id, inbound_plan_id, status, progress, message, result_path,
-                       created_at, completed_at, expired_at
-                FROM fba_label_tasks
+                SELECT
+                    t.id, t.shop_id, t.inbound_plan_id, t.status, t.progress, t.message, t.result_path,
+                    t.logistics_provider_id,
+                    t.created_at, t.completed_at, t.expired_at,
+                    p.name as logistics_name
+                FROM fba_label_tasks t
+                LEFT JOIN logistics_providers p ON t.logistics_provider_id = p.id
                 WHERE {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY t.created_at DESC
                 LIMIT %s OFFSET %s
             """, tuple(params + [page_size, offset]))
             rows = cursor.fetchall()
@@ -936,12 +987,12 @@ def _cancel_task_db(task_id):
 
 
 def _retry_task_db(task_id):
-    """复制失败任务为新任务"""
+    """复制失败任务为新任务（含货代信息）"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT shop_id, inbound_plan_id, crop_config
+                SELECT shop_id, inbound_plan_id, crop_config, cargo_agent_path, logistics_provider_id
                 FROM fba_label_tasks WHERE id = %s
             """, (task_id,))
             row = cursor.fetchone()
@@ -951,9 +1002,10 @@ def _retry_task_db(task_id):
             new_task_id = str(uuid.uuid4())
             expired_at = datetime.now() + timedelta(hours=24)
             cursor.execute("""
-                INSERT INTO fba_label_tasks (id, shop_id, inbound_plan_id, crop_config, status, progress, expired_at)
-                VALUES (%s, %s, %s, %s, 'pending', 0, %s)
-            """, (new_task_id, row['shop_id'], row['inbound_plan_id'], row.get('crop_config'), expired_at))
+                INSERT INTO fba_label_tasks (id, shop_id, inbound_plan_id, crop_config, cargo_agent_path, logistics_provider_id, status, progress, expired_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending', 0, %s)
+            """, (new_task_id, row['shop_id'], row['inbound_plan_id'], row.get('crop_config'),
+                  row.get('cargo_agent_path'), row.get('logistics_provider_id', 0), expired_at))
             conn.commit()
             return new_task_id, None
     finally:

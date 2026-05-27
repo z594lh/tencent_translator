@@ -24,6 +24,10 @@ static/fbatag/*
 static/products/*
 static/product_board/*
 static/avatars/*
+static/cargo_agent/*
+static/fba_labels/*
+
+
 
 .claude/
 doc/
