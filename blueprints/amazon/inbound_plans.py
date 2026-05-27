@@ -1015,7 +1015,8 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
                     d.tracking_details_json,
                     d.dates_json,
                     d.sync_time AS detail_sync_time,
-                    p.created_at AS plan_created_at
+                    p.created_at AS plan_created_at,
+                    (SELECT COUNT(*) FROM amazon_inbound_plan_boxes b WHERE b.shipment_id = d.shipment_confirmation_id AND b.shop_id = s.shop_id) AS box_count
                 FROM amazon_inbound_shipments s
                 LEFT JOIN amazon_inbound_shipments_detail d ON s.shipment_id = d.shipment_id AND d.shop_id = s.shop_id
                 LEFT JOIN amazon_inbound_plans p ON s.inbound_plan_id = p.inbound_plan_id AND s.shop_id = p.shop_id
