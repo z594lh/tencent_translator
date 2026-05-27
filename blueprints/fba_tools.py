@@ -154,12 +154,11 @@ def edit_pdf():
 
 def _extract_fba_info_from_text(text):
     """从页面文本中提取 FBA 号和 SKU"""
-    # FBA 号：匹配 FBA 开头字符串，去掉末尾 U+数字 箱号
+    # FBA 号：匹配 FBA 开头字符串，保留完整的 FBA 箱号（含末尾 U+数字）
     fba_id = None
     fba_match = re.search(r'FBA[A-Z0-9]+', text, re.IGNORECASE)
     if fba_match:
         fba_id = fba_match.group(0).upper()
-        fba_id = re.sub(r'U\d+$', '', fba_id)
 
     # SKU：匹配 Single SKU 后的值
     sku = None
@@ -241,7 +240,7 @@ def split_pdf_route():
                         name = name_map.get(sku) or ''
                         safe_name = re.sub(r'[\\/:*?"<>|]', '', name)
                         safe_sku = re.sub(r'[\\/:*?"<>|]', '', sku)
-                        filenames[page_num] = f"{fba_id}{safe_name}{safe_sku}.pdf"
+                        filenames[page_num] = f"{fba_id}_{safe_sku}_{safe_name}.pdf"
         except Exception as e:
             print(f"[PDF Split] 提取FBA信息失败: {e}")
             # 提取失败不影响正常拆分，回退到默认文件名
