@@ -1026,7 +1026,7 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
                 LEFT JOIN amazon_inbound_shipments_detail d ON s.shipment_id = d.shipment_id AND d.shop_id = s.shop_id
                 LEFT JOIN amazon_inbound_plans p ON s.inbound_plan_id = p.inbound_plan_id AND s.shop_id = p.shop_id
                 WHERE {where_clause}
-                ORDER BY s.sync_time DESC
+                ORDER BY p.created_at DESC
                 LIMIT %s OFFSET %s
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
