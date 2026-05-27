@@ -84,6 +84,96 @@ def _extract_shipment_id_from_box(box):
 # 1. 前端页面接口（路由）
 # =============================================================================
 
+@amazon_inbound_plans_bp.route('/amazon/inbound-plans', methods=['GET'])
+@login_required
+@permission_required('amazon_inbound_plans:page')
+def amazon_inbound_plans():
+    """
+    查询入库计划列表（用于前端下拉框选择）
+    查询参数（必填）:
+        shop_id         - 店铺ID
+    查询参数（可选）:
+        status          - 状态筛选，默认 ACTIVE
+        created_after   - 创建时间起始，ISO格式，默认一个月前
+        created_before  - 创建时间截止，ISO格式，默认当前时间
+        page            - 页码，默认 1
+        page_size       - 每页条数，默认 20，最大 100
+    """
+    try:
+        shop_id = _require_shop_id()
+        status = request.args.get('status', 'ACTIVE').strip() or 'ACTIVE'
+
+        # 时间范围，默认一个月前到现在
+        from datetime import datetime, timedelta
+        default_after = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%S')
+        default_before = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        created_after = request.args.get('created_after', default_after).strip() or default_after
+        created_before = request.args.get('created_before', default_before).strip() or default_before
+
+        page = request.args.get('page', 1)
+        page_size = request.args.get('page_size', 20)
+        try:
+            page = max(1, int(page))
+            page_size = max(1, min(100, int(page_size)))
+        except ValueError:
+            page = 1
+            page_size = 20
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                conditions = ["shop_id = %s", "status = %s", "created_at >= %s", "created_at <= %s"]
+                params = [shop_id, status, created_after, created_before]
+
+                where_clause = " AND ".join(conditions)
+
+                cursor.execute(
+                    f"SELECT COUNT(*) as total FROM amazon_inbound_plans WHERE {where_clause}",
+                    tuple(params)
+                )
+                total = cursor.fetchone()["total"]
+
+                offset = (page - 1) * page_size
+                cursor.execute(f"""
+                    SELECT
+                        inbound_plan_id,
+                        marketplace_id,
+                        name,
+                        status,
+                        created_at,
+                        last_updated_at,
+                        source_address_line1,
+                        source_city,
+                        source_company_name,
+                        source_country_code
+                    FROM amazon_inbound_plans
+                    WHERE {where_clause}
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, tuple(params + [page_size, offset]))
+                rows = cursor.fetchall()
+
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        "list": rows,
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size
+                    }
+                })
+        finally:
+            conn.close()
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Inbound Plans] 查询异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @amazon_inbound_plans_bp.route('/amazon/inbound-shipments', methods=['GET'])
 @login_required
 @permission_required('amazon_inbound_plans:page')

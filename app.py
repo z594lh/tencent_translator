@@ -165,5 +165,9 @@ app.register_blueprint(cron_bp)
 # 注册权限管理路由
 app.register_blueprint(permissions_bp)
 
+# 启动箱唛整理后台工作线程
+from blueprints.fba_tools import _start_label_workers
+_start_label_workers()
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
