@@ -91,7 +91,7 @@ def amazon_inbound_shipments():
     """
     查询入库计划货件列表（连表详情）
     查询参数：shop_id, inbound_plan_id, shipment_confirmation_id,
-             amazon_reference_id, destination_warehouse_id, status, page, page_size
+             amazon_reference_id, destination_warehouse_id, status, shipment_name, page, page_size
     """
     try:
         shop_id = _require_shop_id()
@@ -100,6 +100,7 @@ def amazon_inbound_shipments():
         amazon_reference_id = request.args.get('amazon_reference_id', '').strip() or None
         destination_warehouse_id = request.args.get('destination_warehouse_id', '').strip() or None
         status = request.args.get('status', '').strip() or None
+        shipment_name = request.args.get('shipment_name', '').strip() or None
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
 
@@ -115,6 +116,7 @@ def amazon_inbound_shipments():
             amazon_reference_id=amazon_reference_id,
             destination_warehouse_id=destination_warehouse_id,
             status=status,
+            shipment_name=shipment_name,
             page=page,
             page_size=page_size
         )
@@ -955,7 +957,7 @@ def sync_inbound_shipment_detail_to_db(shop_id, plan_id, shipment_id, detail):
 
 def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_confirmation_id=None,
                                        amazon_reference_id=None, destination_warehouse_id=None,
-                                       status=None, page=1, page_size=20):
+                                       status=None, shipment_name=None, page=1, page_size=20):
     """
     从数据库分页查询入库计划货件列表（amazon_inbound_shipments 连表 amazon_inbound_shipments_detail）
     """
@@ -980,6 +982,9 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
             if status:
                 conditions.append("s.status = %s")
                 params.append(status)
+            if shipment_name:
+                conditions.append("d.name LIKE %s")
+                params.append(f"%{shipment_name}%")
 
             where_clause = " AND ".join(conditions)
 
