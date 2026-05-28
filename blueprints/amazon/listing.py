@@ -72,6 +72,7 @@ def get_listings():
         status = request.args.get('status', '').strip() or None
         parent_sku = request.args.get('parent_sku', '').strip() or None
         keyword = request.args.get('keyword', '').strip() or None
+        has_issues = request.args.get('has_issues', '').strip() or None
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
 
@@ -84,6 +85,7 @@ def get_listings():
             shop_id=shop_id,
             sku=sku, asin=asin, product_type=product_type,
             status=status, parent_sku=parent_sku, keyword=keyword,
+            has_issues=has_issues,
             page=page, page_size=page_size
         )
 
@@ -1386,7 +1388,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
 
 
 def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, status=None,
-                          parent_sku=None, keyword=None, page=1, page_size=20):
+                          parent_sku=None, keyword=None, has_issues=None, page=1, page_size=20):
     """从数据库分页查询 Listing 列表"""
     conn = get_db_connection()
     try:
@@ -1413,6 +1415,10 @@ def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, statu
                 conditions.append("(item_name LIKE %s OR brand LIKE %s OR sku LIKE %s)")
                 like = f"%{keyword}%"
                 params.extend([like, like, like])
+            if has_issues and has_issues.lower() in ('1', 'true', 'yes', 'on'):
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM amazon_listing_issues WHERE shop_id = amazon_listings.shop_id AND sku = amazon_listings.sku)"
+                )
 
             where_clause = " AND ".join(conditions)
 
@@ -1437,6 +1443,29 @@ def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, statu
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
             rows = cursor.fetchall()
+
+            # 批量查询关联的 issues
+            if rows:
+                skus = [r['sku'] for r in rows]
+                placeholders = ','.join(['%s'] * len(skus))
+                cursor.execute(f"""
+                    SELECT sku, issue_code, message, severity
+                    FROM amazon_listing_issues
+                    WHERE shop_id = %s AND sku IN ({placeholders})
+                    ORDER BY id ASC
+                """, (shop_id, *skus))
+                issues = cursor.fetchall()
+
+                issues_map = {}
+                for iss in issues:
+                    issues_map.setdefault(iss['sku'], []).append({
+                        'issue_code': iss['issue_code'],
+                        'message': iss['message'],
+                        'severity': iss['severity']
+                    })
+
+                for r in rows:
+                    r['issues'] = issues_map.get(r['sku'], [])
 
             return {
                 "list": rows,
