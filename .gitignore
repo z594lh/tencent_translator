@@ -30,6 +30,7 @@ static/fba_labels/*
 
 
 .claude/
+.codegraph/
 doc/
 docs/
 sql/
