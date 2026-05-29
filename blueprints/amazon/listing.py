@@ -166,6 +166,62 @@ def sync_listings():
 
 
 # ========================
+# 路由：同步单条 Listing
+# ========================
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/sync', methods=['POST'])
+@login_required
+@permission_required('amazon_listings:sync')
+def sync_single_listing(sku):
+    """
+    从 SP-API 实时拉取单条 Listing 并写入本地数据库
+    适用于修改（标题/价格/描述/五点）后刷新验证
+    请求体（必填）:
+        shop_id  - 店铺ID
+    """
+    try:
+        data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
+        included_data = data.get('included_data', ["summaries", "attributes", "issues"])
+
+        client = get_sp_api_client(shop_id=shop_id)
+        seller_id = client.seller_id or ''
+        marketplace_id = client.marketplace_id
+
+        result = client.get_listings_item(sku=sku, included_data=included_data)
+
+        if not result or not isinstance(result, dict) or not result.get('sku'):
+            return jsonify({
+                "status": "error",
+                "message": f"SP-API 未返回 Listing {sku} 数据，可能该 SKU 尚未同步到亚马逊或参数错误"
+            }), 404
+
+        synced_count, error = sync_listings_to_db(
+            shop_id, marketplace_id, seller_id, [result]
+        )
+
+        if error:
+            return jsonify({
+                "status": "error",
+                "message": f"同步到数据库失败: {error}"
+            }), 500
+
+        detail = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
+
+        return jsonify({
+            "status": "success",
+            "message": f"Listing {sku} 同步成功",
+            "data": detail
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Amazon Listing Sync Single] 同步单条异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ========================
 # 路由：同步 Listing 到产品表
 # ========================
 
