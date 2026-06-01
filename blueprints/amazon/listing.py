@@ -9,6 +9,7 @@ Amazon Listing 模块（多店铺支持版）
 """
 import json
 import time
+import threading
 
 from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
@@ -196,7 +197,7 @@ def sync_single_listing(sku):
                 "message": f"SP-API 未返回 Listing {sku} 数据，可能该 SKU 尚未同步到亚马逊或参数错误"
             }), 404
 
-        synced_count, error = sync_listings_to_db(
+        synced_count, error, _ = sync_listings_to_db(
             shop_id, marketplace_id, seller_id, [result]
         )
 
@@ -225,6 +226,204 @@ def sync_single_listing(sku):
 # 路由：同步 Listing 到产品表
 # ========================
 
+def _extract_model_from_attrs(attrs):
+    model_list = attrs.get('model', [])
+    if not model_list:
+        model_list = attrs.get('model_number', [])
+    if not model_list:
+        model_list = attrs.get('model_name', [])
+    if not model_list:
+        return ''
+    for item in model_list:
+        if isinstance(item, dict) and item.get('value'):
+            return item['value']
+    if isinstance(model_list, list) and len(model_list) > 0 and isinstance(model_list[0], str):
+        return model_list[0]
+    return ''
+
+
+def _generate_model(declare_name_en, dimensions_cm, listing_model=''):
+    if listing_model:
+        return listing_model
+    if not declare_name_en:
+        return ''
+    words = declare_name_en.split()
+    initials = ''.join(w[0].upper() for w in words if w)
+    if not initials:
+        return ''
+    if dimensions_cm:
+        return f"{initials}-{dimensions_cm}"
+    return initials
+
+
+def _sync_product_from_listing(shop_id, sku, decl_info=None):
+    listing = _get_listing_detail_from_db(shop_id, sku)
+    if not listing:
+        return {"status": "error", "message": f"Listing {sku} 不存在"}
+
+    attrs = {}
+    raw = listing.get('attributes_json', '{}')
+    if raw and raw != '{}':
+        try:
+            attrs = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    weight_kg = _parse_weight_kg(attrs)
+    dimensions_cm = _parse_dimensions_cm(attrs)
+
+    material_cn = _extract_material_cn(attrs)
+
+    if decl_info:
+        product_name = decl_info.get('name_cn') or ''
+        declare_name_cn = decl_info.get('name_cn') or ''
+        declare_name_en = decl_info.get('name_en') or ''
+        material_cn = decl_info.get('material_cn') or material_cn
+        material_en = decl_info.get('material_en') or ''
+        hs_code = decl_info.get('hs_code') or ''
+        purpose = decl_info.get('purpose') or ''
+    else:
+        product_description = listing.get('product_description', '') or ''
+        decl = generate_declaration_info(product_description, material_cn)
+
+        product_name = decl.get('name_cn') or ''
+        declare_name_cn = decl.get('name_cn') or ''
+        declare_name_en = decl.get('name_en') or ''
+        material_cn = decl.get('material_cn') or material_cn
+        material_en = decl.get('material_en') or ''
+        hs_code = decl.get('hs_code') or ''
+        purpose = decl.get('purpose') or ''
+
+    listing_model = _extract_model_from_attrs(attrs)
+    model = _generate_model(declare_name_en, dimensions_cm, listing_model)
+
+    shared_decl = {
+        "name_cn": declare_name_cn,
+        "name_en": declare_name_en,
+        "material_cn": material_cn,
+        "material_en": material_en,
+        "hs_code": hs_code,
+        "purpose": purpose,
+    }
+
+    brand = listing.get('brand') or ''
+    if brand.strip().lower() == 'generic':
+        brand = '无'
+
+    images = listing.get('images', []) or []
+    image_urls_list = [img['media_location'] for img in images
+                       if img.get('media_location') and img.get('image_type') != 'main']
+    image_urls = json.dumps(image_urls_list, ensure_ascii=False) if image_urls_list else None
+
+    asin = (listing.get('asin') or '').strip()
+    sales_url = f"https://www.amazon.com/dp/{asin}" if asin else ''
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM products WHERE seller_sku = %s", (sku,))
+            existing = cursor.fetchone()
+
+            if existing:
+                cursor.execute("""
+                    UPDATE products SET
+                        product_name = %s,
+                        brand = %s,
+                        declare_name_cn = %s,
+                        declare_name_en = %s,
+                        material_cn = %s,
+                        material_en = %s,
+                        purpose = %s,
+                        model = %s,
+                        hs_code = %s,
+                        declare_value = %s,
+                        currency = %s,
+                        asin = %s,
+                        fnsku = %s,
+                        image_url = %s,
+                        image_urls = %s,
+                        weight_kg = %s,
+                        dimensions_cm = %s,
+                        sales_url = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                """, (
+                    product_name,
+                    brand,
+                    declare_name_cn,
+                    declare_name_en,
+                    material_cn,
+                    material_en,
+                    purpose,
+                    model,
+                    hs_code,
+                    listing.get('list_price'),
+                    listing.get('list_price_currency', 'USD'),
+                    asin,
+                    listing.get('fn_sku') or '',
+                    listing.get('main_image_url') or '',
+                    image_urls,
+                    weight_kg,
+                    dimensions_cm,
+                    sales_url,
+                    existing['id']
+                ))
+                conn.commit()
+                return {
+                    "status": "success",
+                    "message": f"产品 {sku} 已更新",
+                    "data": {"id": existing['id'], "action": "updated"},
+                    "decl_info": shared_decl
+                }
+            else:
+                cursor.execute("""
+                    INSERT INTO products
+                        (seller_sku, product_name, brand,
+                         declare_name_cn, declare_name_en, material_cn, material_en,
+                         purpose, model, hs_code,
+                         declare_value, currency, asin, fnsku,
+                         image_url, image_urls, weight_kg, dimensions_cm, sales_url,
+                         status)
+                    VALUES
+                        (%s, %s, %s,
+                         %s, %s, %s, %s,
+                         %s, %s, %s,
+                         %s, %s, %s, %s,
+                         %s, %s, %s, %s, %s,
+                         1)
+                """, (
+                    sku,
+                    product_name,
+                    brand,
+                    declare_name_cn,
+                    declare_name_en,
+                    material_cn,
+                    material_en,
+                    purpose,
+                    model,
+                    hs_code,
+                    listing.get('list_price'),
+                    listing.get('list_price_currency', 'USD'),
+                    asin,
+                    listing.get('fn_sku') or '',
+                    listing.get('main_image_url') or '',
+                    image_urls,
+                    weight_kg,
+                    dimensions_cm,
+                    sales_url,
+                ))
+                conn.commit()
+                new_id = cursor.lastrowid
+                return {
+                    "status": "success",
+                    "message": f"产品 {sku} 已创建",
+                    "data": {"id": new_id, "action": "created"},
+                    "decl_info": shared_decl
+                }
+    finally:
+        conn.close()
+
+
 @amazon_listing_bp.route('/amazon/listings/<sku>/sync-to-product', methods=['POST'])
 @login_required
 @permission_required('amazon_listings:sync')
@@ -238,143 +437,13 @@ def sync_listing_to_product(sku):
         data = request.get_json() or {}
         shop_id = _require_shop_id_from_body(data)
 
-        # 1. 获取 Listing 详情（含子表）
-        listing = _get_listing_detail_from_db(shop_id, sku)
-        if not listing:
-            return jsonify({"status": "error", "message": f"Listing {sku} 不存在"}), 404
+        result = _sync_product_from_listing(shop_id, sku)
 
-        # 2. 解析 attributes_json 获取重量和尺寸
-        attrs = {}
-        raw = listing.get('attributes_json', '{}')
-        if raw and raw != '{}':
-            try:
-                attrs = json.loads(raw) if isinstance(raw, str) else raw
-            except (json.JSONDecodeError, TypeError):
-                pass
+        if result.get('status') == 'error':
+            code = 404 if '不存在' in result.get('message', '') else 500
+            return jsonify(result), code
 
-        weight_kg = _parse_weight_kg(attrs)
-        dimensions_cm = _parse_dimensions_cm(attrs)
-
-        # 2.5 提取材质 → 调用 DeepSeek 生成申报信息
-        material_cn = _extract_material_cn(attrs)
-        product_description = listing.get('product_description', '') or ''
-        decl = generate_declaration_info(product_description, material_cn)
-
-        product_name = decl.get('name_cn') or ''
-        declare_name_cn = decl.get('name_cn') or ''
-        declare_name_en = decl.get('name_en') or ''
-        material_cn = decl.get('material_cn') or material_cn
-        material_en = decl.get('material_en') or ''
-
-        # 品牌处理：Generic → 无
-        brand = listing.get('brand') or ''
-        if brand.strip().lower() == 'generic':
-            brand = '无'
-
-        # 3. 拼接多图 URL
-        images = listing.get('images', []) or []
-        image_urls_list = [img['media_location'] for img in images
-                           if img.get('media_location') and img.get('image_type') != 'main']
-        image_urls = json.dumps(image_urls_list, ensure_ascii=False) if image_urls_list else None
-
-        # 4. 构造 ASIN 链接
-        asin = (listing.get('asin') or '').strip()
-        sales_url = f"https://www.amazon.com/dp/{asin}" if asin else ''
-
-        # 5. 检查 products 表是否已有此 SKU
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT id FROM products WHERE seller_sku = %s", (sku,))
-                existing = cursor.fetchone()
-
-                if existing:
-                    # —— 更新 ——
-                    cursor.execute("""
-                        UPDATE products SET
-                            product_name = %s,
-                            brand = %s,
-                            declare_name_cn = %s,
-                            declare_name_en = %s,
-                            material_cn = %s,
-                            material_en = %s,
-                            declare_value = %s,
-                            currency = %s,
-                            asin = %s,
-                            fnsku = %s,
-                            image_url = %s,
-                            image_urls = %s,
-                            weight_kg = %s,
-                            dimensions_cm = %s,
-                            sales_url = %s,
-                            updated_at = NOW()
-                        WHERE id = %s
-                    """, (
-                        product_name,
-                        brand,
-                        declare_name_cn,
-                        declare_name_en,
-                        material_cn,
-                        material_en,
-                        listing.get('list_price'),
-                        listing.get('list_price_currency', 'USD'),
-                        asin,
-                        listing.get('fn_sku') or '',
-                        listing.get('main_image_url') or '',
-                        image_urls,
-                        weight_kg,
-                        dimensions_cm,
-                        sales_url,
-                        existing['id']
-                    ))
-                    conn.commit()
-                    return jsonify({
-                        "status": "success",
-                        "message": f"产品 {sku} 已更新",
-                        "data": {"id": existing['id'], "action": "updated"}
-                    })
-                else:
-                    # —— 新增 ——
-                    cursor.execute("""
-                        INSERT INTO products
-                            (seller_sku, product_name, brand,
-                             declare_name_cn, declare_name_en, material_cn, material_en,
-                             declare_value, currency, asin, fnsku,
-                             image_url, image_urls, weight_kg, dimensions_cm, sales_url,
-                             status)
-                        VALUES
-                            (%s, %s, %s,
-                             %s, %s, %s, %s,
-                             %s, %s, %s, %s,
-                             %s, %s, %s, %s, %s,
-                             1)
-                    """, (
-                        sku,
-                        product_name,
-                        brand,
-                        declare_name_cn,
-                        declare_name_en,
-                        material_cn,
-                        material_en,
-                        listing.get('list_price'),
-                        listing.get('list_price_currency', 'USD'),
-                        asin,
-                        listing.get('fn_sku') or '',
-                        listing.get('main_image_url') or '',
-                        image_urls,
-                        weight_kg,
-                        dimensions_cm,
-                        sales_url,
-                    ))
-                    conn.commit()
-                    new_id = cursor.lastrowid
-                    return jsonify({
-                        "status": "success",
-                        "message": f"产品 {sku} 已创建",
-                        "data": {"id": new_id, "action": "created"}
-                    })
-        finally:
-            conn.close()
+        return jsonify(result)
 
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
@@ -1248,6 +1317,64 @@ def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
     return main_row, bullets, images, issue_rows, offers
 
 
+def _auto_sync_products(shop_id, skus):
+    if not skus:
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ','.join(['%s'] * len(skus))
+            cursor.execute(
+                f"SELECT sku, parentage_level, parent_sku FROM amazon_listings WHERE shop_id = %s AND sku IN ({placeholders})",
+                [shop_id] + list(skus)
+            )
+            rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    child_by_parent = {}
+    for row in rows:
+        level = (row.get('parentage_level') or '').strip().lower()
+        parent_sku = (row.get('parent_sku') or '').strip()
+        sku = row['sku']
+
+        if level == 'parent' or level == 'variation_parent':
+            print(f"[AutoSync] 跳过父体 [{sku}]")
+            continue
+
+        if not parent_sku:
+            child_by_parent.setdefault('__no_parent__', []).append(sku)
+        else:
+            child_by_parent.setdefault(parent_sku, []).append(sku)
+
+    print(f"[AutoSync][shop_id={shop_id}] 开始异步同步产品，共 {len(child_by_parent)} 个分组...")
+
+    for parent_sku, child_skus in child_by_parent.items():
+        if not child_skus:
+            continue
+        first_sku = child_skus[0]
+
+        try:
+            result = _sync_product_from_listing(shop_id, first_sku)
+            action = result.get('data', {}).get('action', '?') if result.get('status') == 'success' else 'error'
+            print(f"[AutoSync][shop_id={shop_id}] 产品同步 [{first_sku}]: {action}")
+            decl_info = result.get('decl_info') if result.get('status') == 'success' else None
+        except Exception as e:
+            print(f"[AutoSync][shop_id={shop_id}] 产品同步异常 [{first_sku}]: {e}")
+            decl_info = None
+
+        for sku in child_skus[1:]:
+            try:
+                result = _sync_product_from_listing(shop_id, sku, decl_info=decl_info)
+                action = result.get('data', {}).get('action', '?') if result.get('status') == 'success' else 'error'
+                print(f"[AutoSync][shop_id={shop_id}] 产品同步 [{sku}]: {action}")
+            except Exception as e:
+                print(f"[AutoSync][shop_id={shop_id}] 产品同步异常 [{sku}]: {e}")
+
+    print(f"[AutoSync][shop_id={shop_id}] 异步产品同步完成")
+
+
 def _sync_listings(shop_id, included_data=None, page_size=20):
     """
     同步 Listing 数据到数据库（自动处理分页）
@@ -1286,11 +1413,20 @@ def _sync_listings(shop_id, included_data=None, page_size=20):
 
             time.sleep(0.5)
 
-        synced_count, error = sync_listings_to_db(shop_id, marketplace_id, seller_id, all_items)
+        synced_count, error, new_skus = sync_listings_to_db(shop_id, marketplace_id, seller_id, all_items)
+
+        if new_skus:
+            print(f"[Listing Sync][shop_id={shop_id}] 检测到 {len(new_skus)} 个新增 Listing，后台异步同步到产品表...")
+            threading.Thread(
+                target=_auto_sync_products,
+                args=(shop_id, new_skus),
+                daemon=True
+            ).start()
 
         return {
             "synced_count": synced_count,
             "total_fetched": total_fetched,
+            "new_listings": len(new_skus),
             "error": error,
             "next_token": None
         }
@@ -1299,6 +1435,7 @@ def _sync_listings(shop_id, included_data=None, page_size=20):
         return {
             "synced_count": 0,
             "total_fetched": total_fetched,
+            "new_listings": 0,
             "error": str(e),
             "next_token": next_token
         }
@@ -1307,20 +1444,41 @@ def _sync_listings(shop_id, included_data=None, page_size=20):
 def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
     """
     批量同步 Listing 数据到数据库（含子表）
+    返回: (synced_count, error, new_skus)
     """
     if not items:
-        return 0, None
+        return 0, None, []
 
     conn = get_db_connection()
     count = 0
+    new_skus = []
     try:
         with conn.cursor() as cursor:
+            all_skus = []
+            for item in items:
+                main_row, _, _, _, _ = _parse_listing_item(
+                    item, shop_id, marketplace_id, seller_id
+                )
+                all_skus.append(main_row['sku'])
+
+            existing_skus = set()
+            if all_skus:
+                placeholders = ','.join(['%s'] * len(all_skus))
+                cursor.execute(
+                    f"SELECT sku FROM amazon_listings WHERE shop_id = %s AND sku IN ({placeholders})",
+                    [shop_id] + all_skus
+                )
+                existing_skus = {row['sku'] for row in cursor.fetchall()}
+
             for item in items:
                 main_row, bullets, images, issues, offers = _parse_listing_item(
                     item, shop_id, marketplace_id, seller_id
                 )
 
                 sku = main_row['sku']
+
+                if sku not in existing_skus:
+                    new_skus.append(sku)
 
                 # 1. 写入/更新主表
                 sql_main = """
@@ -1436,11 +1594,11 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
             conn.commit()
     except Exception as e:
         conn.rollback()
-        return count, str(e)
+        return count, str(e), new_skus
     finally:
         conn.close()
 
-    return count, None
+    return count, None, new_skus
 
 
 def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, status=None,
