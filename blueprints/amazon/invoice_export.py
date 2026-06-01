@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, request, jsonify, send_file
 from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
-from openpyxl import Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, Border, Side
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
@@ -21,6 +21,13 @@ from openpyxl.utils.units import pixels_to_EMU
 from PIL import Image as PILImage
 
 amazon_invoice_export_bp = Blueprint('amazon_invoice_export', __name__, url_prefix='/api')
+
+TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    'static', 'shipping_invoice_templates', 'yuntuo.xlsx'
+)
+TEMPLATE_HEADER_ROW = 5
+TEMPLATE_DATA_START_ROW = 6
 
 
 def _convert_length(value, unit):
@@ -251,81 +258,47 @@ def _fetch_shipment_invoice_data(shop_id, shipment_id):
 
 
 def _build_excel(data):
-    """在内存中构建 xlsx，返回 BytesIO"""
-    wb = Workbook()
+    """基于模板构建 xlsx，返回 BytesIO"""
+    wb = load_workbook(TEMPLATE_PATH)
     ws = wb.active
-    ws.title = "装箱明细"
 
-    headers = list(data[0].keys())
-    ws.append(headers)
+    header_row = TEMPLATE_HEADER_ROW
+    data_start_row = TEMPLATE_DATA_START_ROW
 
-    header_font = Font(bold=True)
+    headers = []
+    for col in range(1, ws.max_column + 1):
+        cell_value = ws.cell(row=header_row, column=col).value
+        if cell_value:
+            headers.append(str(cell_value))
+        else:
+            break
+    if not headers:
+        headers = list(data[0].keys())
+
+    img_col_idx = None
+    for idx, h in enumerate(headers, 1):
+        if h == "图片(不能超出单元格)":
+            img_col_idx = idx
+            break
+
     thin_border = Border(
         left=Side(style="thin"),
         right=Side(style="thin"),
         top=Side(style="thin"),
         bottom=Side(style="thin"),
     )
-    for col in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col)
-        cell.font = header_font
-        cell.border = thin_border
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    for row_data in data:
-        ws.append([row_data[h] for h in headers])
-
-    col_widths = {
-        "图片(不能超出单元格)": 12,
-        "是否报关": 10,
-        "件数CTN": 10,
-        "英文品名": 25,
-        "中文品名": 25,
-        "英文材质": 15,
-        "中文材质": 15,
-        "用途": 30,
-        "品牌": 12,
-        "型号": 12,
-        "单箱申报数量(PCS)": 14,
-        "申报总数量PCS": 14,
-        "单个产品申报货值": 14,
-        "总申报货值": 14,
-        "币种": 8,
-        "单箱重量(kg)": 12,
-        "海关编码": 12,
-        "是否带电": 10,
-        "是否带磁": 10,
-        "FBA货箱编号": 25,
-        "亚马逊内部编码ID": 20,
-        "货箱长度(cm)": 12,
-        "货箱宽度(cm)": 12,
-        "货箱高度(cm)": 12,
-        "仓库代码": 12,
-        "派送地址": 15,
-        "国家": 8,
-        "VAT号码": 15,
-        "EORI号码": 15,
-        "销售链接": 30,
-        "产品重量(kg)": 12,
-        "产品尺寸(长*宽*高cm)": 18,
-        "ASIN": 15,
-        "FNSKU": 15,
-    }
-    img_col_idx = None
-    for idx, h in enumerate(headers, 1):
-        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = (
-            col_widths.get(h, 15)
-        )
-        if h == "图片(不能超出单元格)":
-            img_col_idx = idx
-
-    # 设置数据行高度，给图片预留空间（60点 ≈ 80像素）
-    for row_idx in range(2, ws.max_row + 1):
+    for row_offset, row_data in enumerate(data):
+        row_idx = data_start_row + row_offset
         ws.row_dimensions[row_idx].height = 60
+        for col_idx, h in enumerate(headers, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=row_data.get(h))
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # 插入产品图片
     if img_col_idx:
-        for row_idx, row_data in enumerate(data, 2):
+        for row_offset, row_data in enumerate(data):
+            row_idx = data_start_row + row_offset
             img_url = row_data.get("图片(不能超出单元格)")
             if not img_url:
                 continue
@@ -333,12 +306,10 @@ def _build_excel(data):
                 pil_img = None
                 parsed = urlparse(img_url)
                 path = parsed.path
-                # 判断是否是本地 static 目录下的图片，直接用本地文件
                 if path.startswith("/static/") or path.startswith("static/"):
                     local_path = path.lstrip("/")
                     pil_img = PILImage.open(local_path)
                 else:
-                    # 外部图片，走下载
                     req = urllib.request.Request(
                         img_url, headers={"User-Agent": "Mozilla/5.0"}
                     )
@@ -346,7 +317,6 @@ def _build_excel(data):
                         image_bytes = response.read()
                     pil_img = PILImage.open(io.BytesIO(image_bytes))
 
-                # 统一转 RGB，避免透明通道导致保存异常
                 if pil_img.mode in ("RGBA", "LA", "P"):
                     background = PILImage.new("RGB", pil_img.size, (255, 255, 255))
                     if pil_img.mode == "P":
@@ -360,20 +330,17 @@ def _build_excel(data):
                     else:
                         pil_img = pil_img.convert("RGB")
 
-                # 限制图片尺寸，确保不超出单元格（列宽12字符≈84像素，行高60点≈80像素）
                 max_width = 60
                 max_height = 50
                 pil_img.thumbnail((max_width, max_height), PILImage.LANCZOS)
 
-                # 先保存到 BytesIO，再让 XLImage 重新打开，避免 fp=None 导致 openpyxl 保存失败
                 img_buf = io.BytesIO()
                 pil_img.save(img_buf, format="PNG")
                 img_buf.seek(0)
                 xl_img = XLImage(img_buf)
 
-                # 计算居中偏移，让图片在单元格内居中
-                cell_width_px = 84   # 列宽12字符 ≈ 84像素
-                cell_height_px = 80  # 行高60点 ≈ 80像素
+                cell_width_px = 84
+                cell_height_px = 80
                 offset_x = max(0, (cell_width_px - xl_img.width) // 2)
                 offset_y = max(0, (cell_height_px - xl_img.height) // 2)
 
@@ -391,20 +358,10 @@ def _build_excel(data):
                 ws._images.append(xl_img)
 
                 cell = ws.cell(row=row_idx, column=img_col_idx)
-                cell.value = None  # 清空单元格中的 URL 文本
+                cell.value = None
             except Exception as e:
-                # 图片下载或处理失败，保留 URL 文本便于排查
                 print(f"[Invoice Export] 图片插入失败 [{img_url}]: {e}")
                 pass
-
-    for row in ws.iter_rows(
-        min_row=2, max_row=ws.max_row, min_col=1, max_col=len(headers)
-    ):
-        for cell in row:
-            cell.border = thin_border
-            cell.alignment = Alignment(
-                horizontal="center", vertical="center", wrap_text=True
-            )
 
     output = io.BytesIO()
     wb.save(output)
