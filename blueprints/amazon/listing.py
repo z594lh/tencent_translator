@@ -430,6 +430,7 @@ def _sync_product_from_listing(shop_id, sku, decl_info=None):
 def sync_listing_to_product(sku):
     """
     将指定 Listing 同步到 products 表：sku 存在则更新，不存在则新增。
+    如果 sku 是父体，则同步该父体下所有子体（共用同一份申报信息）。
     请求体（必填）:
         shop_id  - 店铺ID
     """
@@ -437,13 +438,65 @@ def sync_listing_to_product(sku):
         data = request.get_json() or {}
         shop_id = _require_shop_id_from_body(data)
 
-        result = _sync_product_from_listing(shop_id, sku)
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT parentage_level, parent_sku FROM amazon_listings WHERE shop_id = %s AND sku = %s",
+                    (shop_id, sku)
+                )
+                row = cursor.fetchone()
+        finally:
+            conn.close()
 
-        if result.get('status') == 'error':
-            code = 404 if '不存在' in result.get('message', '') else 500
-            return jsonify(result), code
+        if not row:
+            return jsonify({"status": "error", "message": f"Listing {sku} 不存在"}), 404
 
-        return jsonify(result)
+        level = (row.get('parentage_level') or '').strip().lower()
+
+        if level == 'parent' or level == 'variation_parent':
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT sku FROM amazon_listings WHERE shop_id = %s AND parent_sku = %s",
+                        (shop_id, sku)
+                    )
+                    children = [r['sku'] for r in cursor.fetchall()]
+            finally:
+                conn.close()
+
+            if not children:
+                return jsonify({"status": "error", "message": f"父体 {sku} 下没有子体"}), 400
+
+            first_result = _sync_product_from_listing(shop_id, children[0])
+            if first_result.get('status') == 'error':
+                return jsonify(first_result), 500
+            decl_info = first_result.get('decl_info')
+
+            results = [first_result]
+            for child_sku in children[1:]:
+                try:
+                    r = _sync_product_from_listing(shop_id, child_sku, decl_info=decl_info)
+                    results.append(r)
+                except Exception as e:
+                    results.append({"status": "error", "sku": child_sku, "message": str(e)})
+
+            return jsonify({
+                "status": "success",
+                "message": f"父体 {sku} 下 {len(children)} 个子体已同步",
+                "data": {
+                    "parent_sku": sku,
+                    "child_count": len(children),
+                    "results": results
+                }
+            })
+        else:
+            result = _sync_product_from_listing(shop_id, sku)
+            if result.get('status') == 'error':
+                code = 404 if '不存在' in result.get('message', '') else 500
+                return jsonify(result), code
+            return jsonify(result)
 
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
