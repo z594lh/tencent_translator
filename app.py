@@ -169,5 +169,9 @@ app.register_blueprint(permissions_bp)
 from blueprints.fba_tools import _start_label_workers
 _start_label_workers()
 
+# 启动发票整理后台工作线程
+from blueprints.amazon.invoice_export import _start_invoice_workers
+_start_invoice_workers()
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

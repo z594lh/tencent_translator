@@ -26,6 +26,7 @@ static/product_board/*
 static/avatars/*
 static/cargo_agent/*
 static/fba_labels/*
+static/shipping_invoice_templates/task/*
 
 
 
