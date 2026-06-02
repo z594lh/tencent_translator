@@ -1,27 +1,29 @@
 """
 报表数据生成器
-从现有 ERP 业务表自动聚合生成三类核心报表：
-  1. 经营日报/周报/月报
-  2. SKU 利润表
-  3. 库存周转分析
 
-数据来源：
-  - 销售额/订单数：amazon_orders + amazon_order_items
-  - 产品成本、FBA 费、佣金、头程：统一调用 services/profit_calculator
-  - 广告费：amazon_ad_spend（有则计入，无则记0）
-  - 退款：amazon_refund_records（有则计入，无则记0）
+简介: 从业务表自动聚合生成四类核心报表 + 一键调度入口。
 
-生成策略：
-  - 幂等设计：INSERT ... ON DUPLICATE KEY UPDATE，重复跑不会重复数据
-  - 事务安全：单店铺单周期一个事务
-  - 日志追踪：report_generation_log 记录每次生成耗时和结果
+数据来源:
+  - 已结算日報 (settled):  amazon_order_finances（Amazon 实际打款净额）+ profit_calculator（内部成本）
+  - 预估日報 (estimated):  amazon_orders + amazon_order_items（仅销售额/订单数）
+  - 广告费:                amazon_ad_spend
+  - 退款:                  amazon_refund_records / amazon_order_finances Refund 交易
 
-【重构说明 2026-05-26】
-所有 SKU 维度的成本拆分（采购、头程、FBA、佣金）已下沉到 services/profit_calculator.py，
-本模块不再维护重复逻辑，直接调用：
-  - profit_calculator.get_unit_costs(cursor, seller_sku, exchange_rate) -> UnitCostBreakdown
-  - profit_calculator.calculate_profit(sales, qty, unit_costs, ad_cost, refund) -> ProfitResult
-确保定价模块、经营日报、SKU 利润表、库存周转四处的成本计算完全一致。
+生成策略:
+  - 幂等: INSERT ... ON DUPLICATE KEY UPDATE
+  - 事务: 单店铺单周期一个事务
+  - 日志: report_generation_log 记录每次耗时和结果
+
+模块入口:
+  - generate_yesterday_reports() — Cron 每天凌晨 2 点调用
+  - generate_business_daily/w.eekly/monthly — 手动生成经营报表
+  - generate_sku_profit — 手动生成 SKU 利润表
+  - generate_inventory_turnover — 生成库存周转
+
+成本计算 (2026-05-26 重构):
+  所有 SKU 成本计算统一通过 profit_calculator:
+    - get_unit_costs(cursor, seller_sku, exchange_rate) -> UnitCostBreakdown
+    - calculate_profit(sales, qty, unit_costs, ad_cost, refund) -> ProfitResult
 """
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -35,8 +37,12 @@ from services.profit_calculator import (
 )
 
 
-
 def _log_generation_start(report_type, period, shop_id=0):
+    """
+    记录生成开始
+
+    简介: 向 report_generation_log 插入一条 running 状态记录，返回 log_id。
+    """
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -55,6 +61,11 @@ def _log_generation_start(report_type, period, shop_id=0):
 
 
 def _log_generation_end(log_id, status, affected_rows=0, error_message=None):
+    """
+    记录生成结束
+
+    简介: 更新 report_generation_log 的状态、完成时间和影响行数。
+    """
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -260,7 +271,12 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
 
 
 def _upsert_daily_report(cursor, sid, report_date, d):
-    """根据预处理数据写入/更新 report_business 日報行"""
+    """
+    写入/更新日报行
+
+    简介: 将预处理好的日报数据 INSERT 到 report_business，已存在则 UPDATE。
+    参数 d 由 _generate_estimated_daily 或 _generate_settled_daily 返回。
+    """
     cursor.execute("""
         INSERT INTO report_business (
             shop_id, report_type, report_date, report_week, report_month, data_status,
@@ -497,8 +513,7 @@ def generate_business_monthly(month_str, shop_id=None):
         end_date = f'{year + 1}-01-01'
     else:
         end_date = f'{year}-{month + 1:02d}-01'
-    from datetime import datetime as dt
-    end_date = (dt.strptime(end_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+    end_date = (datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
 
     conn = get_db_connection()
     try:
@@ -598,7 +613,18 @@ def generate_business_monthly(month_str, shop_id=None):
 def generate_sku_profit(period_start, period_end, shop_id=None):
     """
     按 ASIN/SKU 汇总指定周期内的利润数据
-    period_start/end: 'YYYY-MM-DD'
+
+    简介: 从 amazon_orders + profit_calculator 计算每个 SKU 的营收/成本/利润。
+
+    详细:
+      - 逐 SKU 计算：销售额、销量、采购成本、FBA费、佣金、头程、广告费、退款
+      - 统一成本入口: profit_calculator.get_unit_costs + calculate_profit
+      - 幂等: ON DUPLICATE KEY UPDATE
+
+    参数:
+        period_start: 'YYYY-MM-DD'
+        period_end:   'YYYY-MM-DD'
+        shop_id:      None=所有店铺
     """
     report_type = 'sku_profit'
     period = f"{period_start}~{period_end}"
@@ -733,7 +759,14 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
 
 def generate_inventory_turnover(shop_id=None):
     """
-    基于当前库存和近30天销售速度生成库存周转数据
+    生成库存周转数据
+
+    简介: 基于当前 FBA 库存 + 近 30 天销售速度，计算每个 SKU 的周转天数、状态和建议补货量。
+
+    详细:
+      - 数据源: amazon_inventory（库存）+ amazon_orders（销售速度）
+      - 状态: normal / slow 滞销 / out_of_stock 缺货 / warning 预警
+      - 幂等: ON DUPLICATE KEY UPDATE
     """
     report_type = 'inventory_turnover'
     period = datetime.now().strftime('%Y-%m-%d')
@@ -904,8 +937,9 @@ def generate_inventory_turnover(shop_id=None):
 
 def _calc_ad_metrics(impressions, clicks, ad_spend, sales_7d, sales_30d):
     """
-    计算广告比率指标，返回字典。
-    分母为0时返回 NULL（数据库层面用 None 表示）。
+    计算广告比率指标
+
+    简介: 返回 CT/CPC/ACOS/ROAS（分母为 0 时返回 None）。
     """
     ctr = (Decimal(str(clicks)) / Decimal(str(impressions))) if impressions > 0 else None
     cpc = (Decimal(str(ad_spend)) / Decimal(str(clicks))) if clicks > 0 else None
@@ -928,7 +962,11 @@ def _insert_advertising_report(cursor, report_type, report_date, report_week, re
                                 ad_group_id, ad_group_name, asin, sku,
                                 impressions, clicks, ad_spend,
                                 orders_7d, orders_30d, sales_7d, sales_30d):
-    """插入/更新单条广告效果报表记录"""
+    """
+    插入/更新单条广告效果报表
+
+    简介: 自动计算 CT/CPC/ACOS/ROAS 后写入 report_advertising，幂等。
+    """
     metrics = _calc_ad_metrics(impressions, clicks, ad_spend, sales_7d, sales_30d)
     cursor.execute("""
         INSERT INTO report_advertising (
@@ -969,8 +1007,9 @@ def _insert_advertising_report(cursor, report_type, report_date, report_week, re
 def _generate_advertising_from_ads(cursor, shop_id, report_type, report_date,
                                    report_week, report_month, date_start, date_end):
     """
-    从 amazon_ad_spend 聚合生成广告效果报表。
-    同时生成 overall / campaign / ad_group / asin 四个维度。
+    从 amazon_ad_spend 聚合生成广告效果报表
+
+    简介: 同步生成 overall / campaign / ad_group / asin 四个维度的广告数据。
     """
     total_affected = 0
 
@@ -1085,8 +1124,9 @@ def _generate_advertising_from_ads(cursor, shop_id, report_type, report_date,
 
 def generate_advertising_daily(report_date, shop_id=None):
     """
-    生成单日广告效果报表（4个维度）
-    report_date: 'YYYY-MM-DD'
+    生成单日广告效果报表
+
+    简介: 从 amazon_ad_spend 拉取单日数据，生成 4 个维度的广告报表。
     """
     report_type = 'advertising_daily'
     period = report_date
@@ -1125,8 +1165,9 @@ def generate_advertising_daily(report_date, shop_id=None):
 
 def generate_advertising_weekly(start_date, end_date, shop_id=None):
     """
-    生成周报广告效果报表
-    start_date/end_date: 'YYYY-MM-DD'
+    生成周度广告效果报表
+
+    简介: 对指定周内的 amazon_ad_spend 数据聚合，生成 4 维度广告周报。
     """
     report_type = 'advertising_weekly'
     period = f"{start_date}~{end_date}"
@@ -1166,8 +1207,9 @@ def generate_advertising_weekly(start_date, end_date, shop_id=None):
 
 def generate_advertising_monthly(month_str, shop_id=None):
     """
-    生成月报广告效果报表
-    month_str: 'YYYY-MM' 如 '2026-05'
+    生成月度广告效果报表
+
+    简介: 对指定月的 amazon_ad_spend 数据聚合，生成 4 维度广告月报。
     """
     report_type = 'advertising_monthly'
     period = month_str
@@ -1177,8 +1219,7 @@ def generate_advertising_monthly(month_str, shop_id=None):
         end_date = f'{year + 1}-01-01'
     else:
         end_date = f'{year}-{month + 1:02d}-01'
-    from datetime import datetime as _dt
-    end_date = (_dt.strptime(end_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+    end_date = (datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
 
     conn = get_db_connection()
     try:

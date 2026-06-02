@@ -1,12 +1,38 @@
 """
-报表模块 - 数据报表管理
-├── 经营日/周/月报（销售额/成本/毛利/头程占比）
-├── SKU利润表（每个ASIN的盈亏）
-└── 库存周转（滞销/缺货/预警分析）
+报表模块 — 数据报表管理
 
-数据生成：services/report_generator.py（定时任务自动跑 + 本模块支持手动触发）
-数据查询：本模块提供完整 REST API
-数据导入：广告费、退款明细可通过 API 导入（也可后续对接 SP-API/Ads API）
+简介: 提供经营报表、SKU 利润、库存周转、广告效果等模块的查询与生成接口。
+
+前端接口:
+  经营报表:
+    GET    /api/reports/business                   分页查询经营报表（日/周/月）
+    GET    /api/reports/business/summary            经营报表汇总统计
+    GET    /api/reports/business/trend              经营趋势（销售额/毛利走势）
+    POST   /api/reports/business/generate           手动触发生成
+  SKU 利润表:
+    GET    /api/reports/sku-profit                  分页查询 SKU 利润列表
+    GET    /api/reports/sku-profit/summary          SKU 利润汇总统计
+    GET    /api/reports/sku-profit/top              SKU 利润排行
+    POST   /api/reports/sku-profit/generate         手动触发生成
+  库存周转:
+    GET    /api/reports/inventory-turnover           分页查询库存周转列表
+    GET    /api/reports/inventory-turnover/stats     库存周转统计
+    POST   /api/reports/inventory-turnover/generate  手动触发生成
+    POST   /api/reports/inventory-turnover/batch-update-status  批量更新库存状态
+  数据导入:
+    POST   /api/reports/ad-spend/import              导入广告费明细
+    POST   /api/reports/refund/import                导入退款明细
+  生成日志:
+    GET    /api/reports/generation-logs              查询报表生成日志
+  广告效果报表:
+    GET    /api/reports/advertising                  分页查询广告效果报表
+    GET    /api/reports/advertising/summary          广告效果汇总统计
+    GET    /api/reports/advertising/trend            广告效果趋势
+    POST   /api/reports/advertising/generate         手动触发生成
+  一键生成:
+    POST   /api/reports/generate-yesterday           一键生成昨日全部报表
+
+数据生成: services/report_generator.py（定时任务自动跑 + 本模块支持手动触发）
 """
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta
@@ -29,12 +55,21 @@ from services.report_generator import (
 reports_bp = Blueprint('reports', __name__, url_prefix='/api')
 
 
+# ============================================================
+# 工具函数
+# ============================================================
+
 def _get_conn():
+    """获取数据库连接"""
     return get_db_connection()
 
 
 def _to_json_serializable(obj):
-    """将数据库返回的 Decimal、datetime 等类型转为可 JSON 序列化的值"""
+    """
+    将数据库返回值转为 JSON 可序列化格式
+
+    简介: 递归处理 dict/list/Decimal/datetime 类型。
+    """
     if isinstance(obj, dict):
         return {k: _to_json_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -42,12 +77,17 @@ def _to_json_serializable(obj):
     if isinstance(obj, Decimal):
         return float(obj)
     if hasattr(obj, 'strftime'):
-        # 与 app.py CustomJSONProvider 保持一致：%Y-%m-%d %H:%M:%S
         return obj.strftime('%Y-%m-%d %H:%M:%S')
     return obj
 
 
 def _parse_pagination():
+    """
+    解析分页参数
+
+    简介: 从 request.args 读取 page/page_size，带边界校验。
+    返回: (page, page_size)
+    """
     try:
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
@@ -63,6 +103,11 @@ def _parse_pagination():
 
 
 def _get_shop_id_optional():
+    """
+    从请求参数中读取可选的 shop_id
+
+    简介: 不存在或格式错误时返回 None，表示不过滤。
+    """
     shop_id = request.args.get('shop_id', '').strip() or None
     if shop_id is None:
         return None
@@ -72,13 +117,31 @@ def _get_shop_id_optional():
         return None
 
 
-# ==================== 1. 经营报表 ====================
+# ============================================================
+# 1. 经营报表
+# ============================================================
 
 @reports_bp.route('/reports/business', methods=['GET'])
 @login_required
 @permission_required('reports:page')
 def list_business_reports():
-    """查询经营报表列表（日/周/月报）"""
+    """
+    分页查询经营报表列表
+
+    简介: 支持按类型（daily/weekly/monthly）、日期范围、店铺过滤。
+
+    查询参数:
+        type       (可选) 报表类型: daily / weekly / monthly
+        start_date (可选) report_date >=
+        end_date   (可选) report_date <=
+        shop_id    (可选) 店铺ID
+        page       (可选) 页码，默认 1
+        page_size  (可选) 每页条数，默认 20
+
+    返回:
+        { status, data: { list, total, page, page_size } }
+        每行含 data_status 字段: estimated=预估 / settled=已结算
+    """
     try:
         report_type = request.args.get('type', '').strip() or None
         start_date = request.args.get('start_date', '').strip() or None
@@ -112,7 +175,6 @@ def list_business_reports():
 
             offset = (page - 1) * page_size
             with conn.cursor() as cursor:
-                # 统一按 report_date 排序（日报=当天，周报=周一，月报=1号）
                 sql = f"""
                     SELECT * FROM report_business
                     {where_sql}
@@ -128,7 +190,7 @@ def list_business_reports():
                     "list": _to_json_serializable(rows),
                     "total": total,
                     "page": page,
-                    "page_size": page_size
+                    "page_size": page_size,
                 }
             })
         finally:
@@ -142,7 +204,11 @@ def list_business_reports():
 @login_required
 @permission_required('reports:page')
 def business_summary():
-    """经营报表汇总统计"""
+    """
+    经营报表汇总统计
+
+    简介: 对筛选范围内的日报/周报/月报做 SUM 聚合，返回总量指标。
+    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
         start_date = request.args.get('start_date', '').strip() or None
@@ -153,7 +219,6 @@ def business_summary():
         try:
             where_clauses = ["report_type = %s"]
             params = [report_type]
-
             if shop_id is not None:
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
@@ -163,7 +228,6 @@ def business_summary():
             if end_date:
                 where_clauses.append("report_date <= %s")
                 params.append(end_date)
-
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             with conn.cursor() as cursor:
@@ -187,7 +251,7 @@ def business_summary():
 
             return jsonify({
                 "status": "success",
-                "data": _to_json_serializable(summary)
+                "data": _to_json_serializable(summary),
             })
         finally:
             conn.close()
@@ -200,7 +264,11 @@ def business_summary():
 @login_required
 @permission_required('reports:page')
 def business_trend():
-    """经营趋势（按时间维度返回销售额、毛利、头程占比走势）"""
+    """
+    经营趋势
+
+    简介: 按时间维度返回销售额、毛利、头程占比走势，用于折线图。
+    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
         start_date = request.args.get('start_date', '').strip() or None
@@ -211,7 +279,6 @@ def business_trend():
         try:
             where_clauses = ["report_type = %s"]
             params = [report_type]
-
             if shop_id is not None:
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
@@ -221,20 +288,17 @@ def business_trend():
             if end_date:
                 where_clauses.append("report_date <= %s")
                 params.append(end_date)
-
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             if report_type == 'daily':
                 time_col = 'report_date'
                 order_sql = f"ORDER BY {time_col}"
             elif report_type == 'weekly':
-                # 范围格式 2026.05.11~2026.05.17，按开始日期排序
                 time_col = "report_week"
                 order_sql = "ORDER BY STR_TO_DATE(SUBSTRING_INDEX(report_week, '~', 1), '%%Y.%%m.%%d')"
             else:
                 time_col = 'report_month'
                 order_sql = f"ORDER BY {time_col}"
-
 
             with conn.cursor() as cursor:
                 cursor.execute(f"""
@@ -254,7 +318,7 @@ def business_trend():
 
             return jsonify({
                 "status": "success",
-                "data": _to_json_serializable(rows)
+                "data": _to_json_serializable(rows),
             })
         finally:
             conn.close()
@@ -267,11 +331,21 @@ def business_trend():
 @login_required
 @permission_required('reports:generate')
 def trigger_business_report():
-    """手动触发经营报表生成"""
+    """
+    手动触发经营报表生成
+
+    简介: 支持按日/周/月维度手动生成，生成结果直接写入 report_business 表。
+
+    请求体 (JSON):
+        report_type  (必填) daily / weekly / monthly
+        period       (daily/monthly 必填) 日期，如 2026-05-18 或 2026-05
+        period_start (weekly 必填) 周开始日期，如 2026-05-11
+        period_end   (weekly 必填) 周结束日期，如 2026-05-17
+        shop_id      (可选) 指定店铺，不传则所有店铺
+    """
     try:
         data = request.get_json() or {}
         report_type = data.get('report_type', '').strip()
-        period = data.get('period', '').strip()
         shop_id = data.get('shop_id')
 
         if report_type not in ('daily', 'weekly', 'monthly'):
@@ -286,7 +360,7 @@ def trigger_business_report():
             period_start = data.get('period_start', '').strip()
             period_end = data.get('period_end', '').strip()
             if not period_start or not period_end:
-                return jsonify({"status": "error", "message": "weekly 类型需要 period_start 和 period_end 参数（如 2026-05-11 / 2026-05-17）"}), 400
+                return jsonify({"status": "error", "message": "weekly 类型需要 period_start 和 period_end"}), 400
             result = generate_business_weekly(period_start, period_end, shop_id)
         else:
             period = data.get('period', '').strip()
@@ -294,19 +368,25 @@ def trigger_business_report():
                 return jsonify({"status": "error", "message": "monthly 类型需要 period 参数（如 2026-05）"}), 400
             result = generate_business_monthly(period, shop_id)
 
-        return jsonify({"status": "success", "message": "生成任务已提交", "data": result})
+        return jsonify({"status": "success", "message": "生成完成", "data": result})
     except Exception as e:
         print(f"[trigger_business_report] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 2. SKU 利润表 ====================
+# ============================================================
+# 2. SKU 利润表
+# ============================================================
 
 @reports_bp.route('/reports/sku-profit', methods=['GET'])
 @login_required
 @permission_required('reports:page')
 def list_sku_profit():
-    """查询 SKU 利润表列表"""
+    """
+    分页查询 SKU 利润表
+
+    简介: 按 ASIN/SKU 查询指定周期内的利润数据，支持关键词搜索。
+    """
     try:
         keyword = request.args.get('keyword', '').strip() or None
         asin = request.args.get('asin', '').strip() or None
@@ -363,7 +443,7 @@ def list_sku_profit():
                     "list": _to_json_serializable(rows),
                     "total": total,
                     "page": page,
-                    "page_size": page_size
+                    "page_size": page_size,
                 }
             })
         finally:
@@ -377,7 +457,11 @@ def list_sku_profit():
 @login_required
 @permission_required('reports:page')
 def sku_profit_summary():
-    """SKU 利润汇总统计"""
+    """
+    SKU 利润汇总统计
+
+    简介: 对筛选范围内的 SKU 利润做 SUM 聚合。
+    """
     try:
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
@@ -387,7 +471,6 @@ def sku_profit_summary():
         try:
             where_clauses = []
             params = []
-
             if shop_id is not None:
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
@@ -416,7 +499,7 @@ def sku_profit_summary():
 
             return jsonify({
                 "status": "success",
-                "data": _to_json_serializable(summary)
+                "data": _to_json_serializable(summary),
             })
         finally:
             conn.close()
@@ -429,7 +512,11 @@ def sku_profit_summary():
 @login_required
 @permission_required('reports:page')
 def sku_profit_top():
-    """SKU 利润 Top / Bottom 排行"""
+    """
+    SKU 利润排行
+
+    简介: 按净利润/利润率/销售额等维度排序，返回 Top N。
+    """
     try:
         sort_by = request.args.get('sort_by', 'net_profit').strip()
         sort_dir = request.args.get('sort_dir', 'desc').strip().lower()
@@ -450,7 +537,6 @@ def sku_profit_top():
         try:
             where_clauses = []
             params = []
-
             if shop_id is not None:
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
@@ -483,7 +569,7 @@ def sku_profit_top():
 
             return jsonify({
                 "status": "success",
-                "data": _to_json_serializable(rows)
+                "data": _to_json_serializable(rows),
             })
         finally:
             conn.close()
@@ -496,7 +582,14 @@ def sku_profit_top():
 @login_required
 @permission_required('reports:generate')
 def trigger_sku_profit():
-    """手动触发 SKU 利润表生成"""
+    """
+    手动触发 SKU 利润表生成
+
+    请求体 (JSON):
+        period_start (必填) 开始日期，如 2026-05-01
+        period_end   (必填) 结束日期，如 2026-05-31
+        shop_id      (可选) 指定店铺
+    """
     try:
         data = request.get_json() or {}
         period_start = data.get('period_start', '').strip()
@@ -507,19 +600,25 @@ def trigger_sku_profit():
             return jsonify({"status": "error", "message": "period_start 和 period_end 必填"}), 400
 
         result = generate_sku_profit(period_start, period_end, shop_id)
-        return jsonify({"status": "success", "message": "生成任务已提交", "data": result})
+        return jsonify({"status": "success", "message": "生成完成", "data": result})
     except Exception as e:
         print(f"[trigger_sku_profit] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 3. 库存周转 ====================
+# ============================================================
+# 3. 库存周转
+# ============================================================
 
 @reports_bp.route('/reports/inventory-turnover', methods=['GET'])
 @login_required
 @permission_required('reports:page')
 def list_inventory_turnover():
-    """查询库存周转列表"""
+    """
+    分页查询库存周转列表
+
+    简介: 按 SKU 查询库存现状、销售速度和周转天数，支持按滞销/缺货状态过滤。
+    """
     try:
         keyword = request.args.get('keyword', '').strip() or None
         sku = request.args.get('sku', '').strip() or None
@@ -531,7 +630,6 @@ def list_inventory_turnover():
         try:
             where_clauses = []
             params = []
-
             if shop_id is not None:
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
@@ -570,7 +668,7 @@ def list_inventory_turnover():
                     "list": _to_json_serializable(rows),
                     "total": total,
                     "page": page,
-                    "page_size": page_size
+                    "page_size": page_size,
                 }
             })
         finally:
@@ -584,7 +682,11 @@ def list_inventory_turnover():
 @login_required
 @permission_required('reports:page')
 def inventory_turnover_stats():
-    """库存周转统计"""
+    """
+    库存周转统计
+
+    简介: 按库存状态（正常/滞销/缺货/预警）汇总 SKU 数量、库存量、货值。
+    """
     try:
         shop_id = _get_shop_id_optional()
 
@@ -592,7 +694,6 @@ def inventory_turnover_stats():
         try:
             where_clauses = []
             params = []
-
             if shop_id is not None:
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
@@ -630,7 +731,7 @@ def inventory_turnover_stats():
                 "status": "success",
                 "data": {
                     "overall": _to_json_serializable(overall),
-                    "by_status": _to_json_serializable(status_stats)
+                    "by_status": _to_json_serializable(status_stats),
                 }
             })
         finally:
@@ -644,12 +745,17 @@ def inventory_turnover_stats():
 @login_required
 @permission_required('reports:generate')
 def trigger_inventory_turnover():
-    """手动触发库存周转生成"""
+    """
+    手动触发库存周转生成
+
+    请求体 (JSON):
+        shop_id (可选) 指定店铺
+    """
     try:
         data = request.get_json() or {}
         shop_id = data.get('shop_id')
         result = generate_inventory_turnover(shop_id)
-        return jsonify({"status": "success", "message": "生成任务已提交", "data": result})
+        return jsonify({"status": "success", "message": "生成完成", "data": result})
     except Exception as e:
         print(f"[trigger_inventory_turnover] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -659,7 +765,14 @@ def trigger_inventory_turnover():
 @login_required
 @permission_required('reports:edit')
 def batch_update_inventory_status():
-    """批量更新库存状态（根据当前库存和日均销量自动计算）"""
+    """
+    批量更新库存状态
+
+    简介: 根据当前库存和日均销量重新计算 stock_status 和建议补货量。
+
+    请求体 (JSON):
+        shop_id (必填) 店铺ID
+    """
     try:
         data = request.get_json() or {}
         shop_id = data.get('shop_id')
@@ -685,7 +798,7 @@ def batch_update_inventory_status():
             return jsonify({
                 "status": "success",
                 "message": "状态更新完成",
-                "data": {"affected_rows": affected}
+                "data": {"affected_rows": affected},
             })
         except Exception as e:
             conn.rollback()
@@ -697,19 +810,27 @@ def batch_update_inventory_status():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 4. 数据导入接口（广告费 / 退款） ====================
+# ============================================================
+# 4. 数据导入接口
+# ============================================================
 
 @reports_bp.route('/reports/ad-spend/import', methods=['POST'])
 @login_required
 @permission_required('reports:edit')
 def import_ad_spend():
-    """导入广告费明细（JSON数组或单条），兼容 Amazon Advertising API 字段格式"""
+    """
+    导入广告费明细
+
+    简介: 批量上传广告花费数据到 amazon_ad_spend 表，支持单条或数组。
+
+    请求体 (JSON):
+        records: [ { shop_id, date, ad_spend, campaign_id?, asin?, clicks?, ... }, ... ]
+    """
     try:
         data = request.get_json() or {}
         records = data.get('records', [])
         if not records:
             return jsonify({"status": "error", "message": "records 不能为空"}), 400
-
         if isinstance(records, dict):
             records = [records]
 
@@ -726,17 +847,13 @@ def import_ad_spend():
                         errors.append({"record": rec, "error": f"缺少 {', '.join(missing)}"})
                         continue
 
-                    # 兼容旧字段名：orders/sales → 映射到 7d 归因
                     orders_7d = rec.get('orders_7d')
                     if orders_7d is None:
                         orders_7d = rec.get('orders', 0)
-
                     orders_30d = rec.get('orders_30d', 0)
-
                     sales_7d = rec.get('sales_7d')
                     if sales_7d is None:
                         sales_7d = rec.get('sales', 0)
-
                     sales_30d = rec.get('sales_30d', 0)
 
                     cursor.execute("""
@@ -766,7 +883,7 @@ def import_ad_spend():
                         rec.get('asin', ''), rec.get('sku', ''),
                         rec.get('currency', 'USD'),
                         rec['ad_spend'], rec.get('clicks', 0), rec.get('impressions', 0),
-                        orders_7d, orders_30d, sales_7d, sales_30d
+                        orders_7d, orders_30d, sales_7d, sales_30d,
                     ))
                     if cursor.rowcount == 1:
                         inserted += 1
@@ -775,7 +892,7 @@ def import_ad_spend():
             conn.commit()
             return jsonify({
                 "status": "success",
-                "data": {"inserted": inserted, "updated": updated, "errors": errors}
+                "data": {"inserted": inserted, "updated": updated, "errors": errors},
             })
         except Exception as e:
             conn.rollback()
@@ -791,13 +908,19 @@ def import_ad_spend():
 @login_required
 @permission_required('reports:edit')
 def import_refund_records():
-    """导入退款明细（JSON数组或单条）"""
+    """
+    导入退款明细
+
+    简介: 批量上传退款记录到 amazon_refund_records 表，支持单条或数组。
+
+    请求体 (JSON):
+        records: [ { shop_id, amazon_order_id, refund_date, refund_amount, ... }, ... ]
+    """
     try:
         data = request.get_json() or {}
         records = data.get('records', [])
         if not records:
             return jsonify({"status": "error", "message": "records 不能为空"}), 400
-
         if isinstance(records, dict):
             records = [records]
 
@@ -809,10 +932,10 @@ def import_refund_records():
             with conn.cursor() as cursor:
                 for rec in records:
                     required = ['shop_id', 'amazon_order_id', 'refund_date', 'refund_amount']
-                    for r in required:
-                        if r not in rec:
-                            errors.append({"record": rec, "error": f"缺少 {r}"})
-                            continue
+                    missing = [r for r in required if r not in rec]
+                    if missing:
+                        errors.append({"record": rec, "error": f"缺少 {', '.join(missing)}"})
+                        continue
 
                     cursor.execute("""
                         INSERT INTO amazon_refund_records (
@@ -830,7 +953,7 @@ def import_refund_records():
                         rec['shop_id'], rec['amazon_order_id'],
                         rec.get('order_item_id', ''), rec.get('asin', ''), rec.get('sku', ''),
                         rec['refund_date'], rec['refund_amount'],
-                        rec.get('refund_quantity', 0), rec.get('refund_reason', '')
+                        rec.get('refund_quantity', 0), rec.get('refund_reason', ''),
                     ))
                     if cursor.rowcount == 1:
                         inserted += 1
@@ -839,7 +962,7 @@ def import_refund_records():
             conn.commit()
             return jsonify({
                 "status": "success",
-                "data": {"inserted": inserted, "updated": updated, "errors": errors}
+                "data": {"inserted": inserted, "updated": updated, "errors": errors},
             })
         except Exception as e:
             conn.rollback()
@@ -851,13 +974,19 @@ def import_refund_records():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 5. 报表生成日志查询 ====================
+# ============================================================
+# 5. 报表生成日志
+# ============================================================
 
 @reports_bp.route('/reports/generation-logs', methods=['GET'])
 @login_required
 @permission_required('reports:page')
 def list_generation_logs():
-    """查询报表生成日志"""
+    """
+    查询报表生成日志
+
+    简介: 查看历史报表生成记录，按类型/状态过滤，用于排查生成失败原因。
+    """
     try:
         report_type = request.args.get('report_type', '').strip() or None
         status = request.args.get('status', '').strip() or None
@@ -896,7 +1025,7 @@ def list_generation_logs():
                     "list": _to_json_serializable(rows),
                     "total": total,
                     "page": page,
-                    "page_size": page_size
+                    "page_size": page_size,
                 }
             })
         finally:
@@ -906,13 +1035,19 @@ def list_generation_logs():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 6. 广告效果报表 ====================
+# ============================================================
+# 6. 广告效果报表
+# ============================================================
 
 @reports_bp.route('/reports/advertising', methods=['GET'])
 @login_required
 @permission_required('reports_advertising:page')
 def list_advertising_reports():
-    """查询广告效果报表列表"""
+    """
+    分页查询广告效果报表
+
+    简介: 按类型/维度/日期范围查询广告表现数据（曝光/点击/花费/ACOS/ROAS）。
+    """
     try:
         report_type = request.args.get('type', '').strip() or None
         dimension_type = request.args.get('dimension', '').strip() or None
@@ -928,7 +1063,6 @@ def list_advertising_reports():
         try:
             where_clauses = []
             params = []
-
             if report_type:
                 where_clauses.append("report_type = %s")
                 params.append(report_type)
@@ -977,7 +1111,7 @@ def list_advertising_reports():
                     "list": _to_json_serializable(rows),
                     "total": total,
                     "page": page,
-                    "page_size": page_size
+                    "page_size": page_size,
                 }
             })
         finally:
@@ -991,7 +1125,11 @@ def list_advertising_reports():
 @login_required
 @permission_required('reports_advertising:page')
 def advertising_summary():
-    """广告效果汇总统计"""
+    """
+    广告效果汇总统计
+
+    简介: 对筛选范围内的广告数据做 SUM 聚合，返回总量和平均指标。
+    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
         dimension_type = request.args.get('dimension', '').strip() or None
@@ -1003,7 +1141,6 @@ def advertising_summary():
         try:
             where_clauses = ["report_type = %s"]
             params = [report_type]
-
             if dimension_type:
                 where_clauses.append("dimension_type = %s")
                 params.append(dimension_type)
@@ -1016,7 +1153,6 @@ def advertising_summary():
             if end_date:
                 where_clauses.append("report_date <= %s")
                 params.append(end_date)
-
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             with conn.cursor() as cursor:
@@ -1043,7 +1179,7 @@ def advertising_summary():
 
             return jsonify({
                 "status": "success",
-                "data": _to_json_serializable(summary)
+                "data": _to_json_serializable(summary),
             })
         finally:
             conn.close()
@@ -1056,7 +1192,11 @@ def advertising_summary():
 @login_required
 @permission_required('reports_advertising:page')
 def advertising_trend():
-    """广告效果趋势（按时间维度返回核心指标走势）"""
+    """
+    广告效果趋势
+
+    简介: 按时间维度返回核心广告指标走势（曝光/点击/花费/ACOS/ROAS）。
+    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
         dimension_type = request.args.get('dimension', '').strip() or 'overall'
@@ -1068,7 +1208,6 @@ def advertising_trend():
         try:
             where_clauses = ["report_type = %s", "dimension_type = %s"]
             params = [report_type, dimension_type]
-
             if shop_id is not None:
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
@@ -1078,7 +1217,6 @@ def advertising_trend():
             if end_date:
                 where_clauses.append("report_date <= %s")
                 params.append(end_date)
-
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             if report_type == 'daily':
@@ -1113,7 +1251,7 @@ def advertising_trend():
 
             return jsonify({
                 "status": "success",
-                "data": _to_json_serializable(rows)
+                "data": _to_json_serializable(rows),
             })
         finally:
             conn.close()
@@ -1126,7 +1264,16 @@ def advertising_trend():
 @login_required
 @permission_required('reports_advertising:generate')
 def trigger_advertising_report():
-    """手动触发广告效果报表生成"""
+    """
+    手动触发广告效果报表生成
+
+    请求体 (JSON):
+        report_type   (必填) daily / weekly / monthly
+        period        (daily/monthly 必填) 日期
+        period_start  (weekly 必填) 周开始日期
+        period_end    (weekly 必填) 周结束日期
+        shop_id       (可选) 指定店铺
+    """
     try:
         data = request.get_json() or {}
         report_type = data.get('report_type', '').strip()
@@ -1138,7 +1285,7 @@ def trigger_advertising_report():
         if report_type == 'daily':
             period = data.get('period', '').strip()
             if not period:
-                return jsonify({"status": "error", "message": "daily 类型需要 period 参数（如 2026-05-18）"}), 400
+                return jsonify({"status": "error", "message": "daily 类型需要 period 参数"}), 400
             result = generate_advertising_daily(period, shop_id)
         elif report_type == 'weekly':
             period_start = data.get('period_start', '').strip()
@@ -1149,25 +1296,32 @@ def trigger_advertising_report():
         else:
             period = data.get('period', '').strip()
             if not period:
-                return jsonify({"status": "error", "message": "monthly 类型需要 period 参数（如 2026-05）"}), 400
+                return jsonify({"status": "error", "message": "monthly 类型需要 period 参数"}), 400
             result = generate_advertising_monthly(period, shop_id)
 
-        return jsonify({"status": "success", "message": "广告报表生成任务已提交", "data": result})
+        return jsonify({"status": "success", "message": "生成完成", "data": result})
     except Exception as e:
         print(f"[trigger_advertising_report] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 7. 一键生成昨日全部报表 ====================
+# ============================================================
+# 7. 一键生成昨日全部报表
+# ============================================================
 
 @reports_bp.route('/reports/generate-yesterday', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
 def trigger_yesterday_reports():
-    """手动触发昨日全部报表生成"""
+    """
+    一键生成昨日全部报表
+
+    简介: 同时执行 T-1/T-2 预估日报 + T-3 已结算日报 + SKU利润 + 库存周转 + 广告日报，
+          并检查是否需要生周报（周三）或月报（3号）。
+    """
     try:
         results = generate_yesterday_reports()
-        return jsonify({"status": "success", "message": "昨日报表生成完成", "data": results})
+        return jsonify({"status": "success", "message": "报表生成完成", "data": results})
     except Exception as e:
         print(f"[trigger_yesterday_reports] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
