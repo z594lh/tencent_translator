@@ -19,6 +19,7 @@ from blueprints.amazon.inbound_plans import amazon_inbound_plans_bp
 from blueprints.amazon.invoice_export import amazon_invoice_export_bp
 from blueprints.amazon.orders import amazon_orders_bp
 from blueprints.amazon.listing import amazon_listing_bp
+from blueprints.amazon.finances import amazon_finances_bp
 from blueprints.shops import shops_bp
 from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
@@ -137,6 +138,7 @@ app.register_blueprint(amazon_inbound_plans_bp)
 app.register_blueprint(amazon_invoice_export_bp)
 app.register_blueprint(amazon_orders_bp)
 app.register_blueprint(amazon_listing_bp)
+app.register_blueprint(amazon_finances_bp)
 
 # 注册店铺管理路由
 app.register_blueprint(shops_bp)

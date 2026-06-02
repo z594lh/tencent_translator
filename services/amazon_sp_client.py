@@ -652,6 +652,47 @@ class AmazonSpApiClient:
         }
         return self._request("GET", f"/definitions/2020-09-01/productTypes/{product_type}", params=params)
 
+    # -------------------- Finances API --------------------
+
+    def list_financial_transactions(
+        self,
+        posted_after: str = None,
+        posted_before: str = None,
+        marketplace_id: str = None,
+        transaction_type: str = None,
+        related_identifier: str = None,
+        next_token: str = None,
+    ) -> dict:
+        """
+        获取财务交易列表
+
+        简介: 对接 Amazon Finances API v2024-06-19，支持按时间、订单、交易类型等过滤。
+
+        详细:
+          - 端点: GET /finances/2024-06-19/transactions
+          - related_identifier 格式: "ORDER_ID=123-4567890-1234567"
+          - 返回分页数据，可用 next_token 翻页
+          - 单个 transaction 含 items + breakdowns + contexts
+
+        文档:
+          https://developer-docs.amazon.com/sp-api/docs/finances-api-v2024-06-19-reference#listtransactions
+        """
+        params = {}
+        if posted_after:
+            params["postedAfter"] = posted_after
+        if posted_before:
+            params["postedBefore"] = posted_before
+        if marketplace_id:
+            params["marketplaceId"] = marketplace_id
+        if transaction_type:
+            params["transactionType"] = transaction_type
+        if related_identifier:
+            params["relatedIdentifier"] = related_identifier
+        if next_token:
+            params["nextToken"] = next_token
+
+        return self._request("GET", "/finances/2024-06-19/transactions", params=params)
+
 
 # ==================== 快捷函数（单例风格）====================
 

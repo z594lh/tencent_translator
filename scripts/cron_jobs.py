@@ -14,10 +14,11 @@ Crontab 定时任务入口脚本
     orders-recent    近期订单同步 24h（每15分钟）
     orders-week      本周订单同步 7d（每3小时）
     orders-month     本月订单同步 30d（每6小时，仅列表）
+    finances-recent  近期订单财务明细同步 2d（每30分钟）
     exchange-rate    汇率同步（每天9点）
-    reports-daily    经营日报+SKU利润+库存周转+广告日报（每天凌晨2点）
-    reports-weekly   经营周报+广告周报（每周一凌晨3点）
-    reports-monthly  经营月报+广告月报（每月1号凌晨4点）
+     reports-daily    经营日报+SKU利润+库存周转+广告日报（每天凌晨2点，T-1/T-2 estimated + T-3 settled）
+     reports-weekly   经营周报+广告周报（每周三凌晨3点，汇总上周）
+     reports-monthly  经营月报+广告月报（每月3号凌晨4点，汇总上月）
 
 crontab 示例：
     0 * * * * cd /项目路径 && python scripts/cron_jobs.py inventory >> /var/log/cron_inventory.log 2>&1
@@ -321,7 +322,24 @@ def task_orders_month():
             print(f"[{now_str}] [Cron] 店铺[{shop_name}] 本月订单同步异常: {e}")
 
 
-# ==================== 4. 汇率同步 ====================
+# ==================== 4. 财务明细同步 ====================
+
+def task_finances_recent():
+    """每30分钟：同步3~7天前订单的财务明细（跳过T+2未结算窗口）"""
+    from blueprints.amazon.finances import sync_finances_recent
+    now_str = _now_str()
+    print(f"[{now_str}] [Cron] 开始财务明细同步(3~7d ago)...")
+    try:
+        results = sync_finances_recent(days_to=3, days_from=7)
+        total_orders = sum(r.get('total_orders', 0) for r in results.values())
+        total_success = sum(r.get('success', 0) for r in results.values())
+        total_failed = sum(r.get('failed', 0) for r in results.values())
+        print(f"[{now_str}] [Cron] 财务明细同步完成: 店铺={len(results)}, 订单={total_orders}, 成功={total_success}, 失败={total_failed}")
+    except Exception as e:
+        print(f"[{now_str}] [Cron] 财务明细同步异常: {e}")
+
+
+# ==================== 5. 汇率同步 ====================
 
 def task_exchange_rate():
     print(f"[{_now_str()}] [Cron] 开始汇率同步...")
@@ -335,46 +353,63 @@ def task_exchange_rate():
         print(f"[{_now_str()}] [Cron] 汇率同步异常: {e}")
 
 
-# ==================== 5. 报表生成 ====================
+# ==================== 6. 报表生成 ====================
 
 def task_reports_daily():
-    """每天凌晨生成昨日报表（经营日报+SKU利润+库存周转+广告日报）"""
+    """
+    每天凌晨生成日报（T-1/T-2 预估 + T-3 已结算）
+    顺带检查今天是否是周三（生周报）或 3 号（生月报）
+    """
     from services.report_generator import generate_yesterday_reports
-    print(f"[{_now_str()}] [Cron] 开始生成昨日报表...")
+    print(f"[{_now_str()}] [Cron] 开始生成报表（T-1/T-2 estimated + T-3 settled）...")
     try:
         results = generate_yesterday_reports()
-        print(f"[{_now_str()}] [Cron] 昨日报表生成完成: {results}")
+        print(f"[{_now_str()}] [Cron] 报表生成完成: {list(results.keys())}")
     except Exception as e:
-        print(f"[{_now_str()}] [Cron] 昨日报表生成异常: {e}")
+        import traceback
+        print(f"[{_now_str()}] [Cron] 报表生成异常: {e}")
+        traceback.print_exc()
 
 
 def task_reports_weekly():
-    """每周一生成周报（周一~周日）"""
-    from services.report_generator import generate_business_weekly
+    """
+    每周三凌晨生成周报（上周 Mon-Sun）
+
+    注: 主入口是 task_reports_daily（每天跑），周三自动出周报。
+    此函数是备用手动入口。
+    """
+    from services.report_generator import generate_business_weekly, generate_advertising_weekly
     now = datetime.now()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
-    yesterday = now - timedelta(days=1)
-    week_start = (yesterday - timedelta(days=6)).strftime('%Y-%m-%d')
-    week_end = yesterday.strftime('%Y-%m-%d')
+    yesterday_dt = now - timedelta(days=1)
+    week_start = (yesterday_dt - timedelta(days=6)).strftime('%Y-%m-%d')
+    week_end = yesterday_dt.strftime('%Y-%m-%d')
     week_label = f"{week_start}~{week_end}"
     print(f"[{now_str}] [Cron] 开始生成周报 {week_label}...")
     try:
-        result = generate_business_weekly(week_start, week_end)
-        print(f"[{now_str}] [Cron] 周报生成完成: {result}")
+        result_biz = generate_business_weekly(week_start, week_end)
+        result_ad = generate_advertising_weekly(week_start, week_end)
+        print(f"[{now_str}] [Cron] 周报生成完成: biz={result_biz}, ad={result_ad}")
     except Exception as e:
         print(f"[{now_str}] [Cron] 周报生成异常: {e}")
 
 
 def task_reports_monthly():
-    """每月1号生成本月月报"""
-    from services.report_generator import generate_business_monthly
+    """
+    每月3号生成本月月报
+
+    注: 主入口是 task_reports_daily（每天跑），3号自动出月报。
+    此函数是备用手动入口。
+    """
+    from services.report_generator import generate_business_monthly, generate_advertising_monthly
     now = datetime.now()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     month_str = (now - timedelta(days=1)).strftime('%Y-%m')
     print(f"[{now_str}] [Cron] 开始生成月报 {month_str}...")
     try:
-        result = generate_business_monthly(month_str)
-        print(f"[{now_str}] [Cron] 月报生成完成: {result}")
+        result_biz = generate_business_monthly(month_str)
+        result_ad = generate_advertising_monthly(month_str)
+        print(f"[{now_str}] [Cron] 月报生成完成: biz={result_biz}, ad={result_ad}")
     except Exception as e:
         print(f"[{now_str}] [Cron] 月报生成异常: {e}")
 
@@ -389,6 +424,7 @@ TASK_MAP = {
     'orders-recent': task_orders_recent,
     'orders-week': task_orders_week,
     'orders-month': task_orders_month,
+    'finances-recent': task_finances_recent,
     'exchange-rate': task_exchange_rate,
     'reports-daily': task_reports_daily,
     'reports-weekly': task_reports_weekly,

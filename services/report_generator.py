@@ -25,6 +25,7 @@
 """
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+import json
 
 from services.mysql_service import get_db_connection
 from services.profit_calculator import (
@@ -71,11 +72,245 @@ def _log_generation_end(log_id, status, affected_rows=0, error_message=None):
 
 # ==================== 1. 经营报表生成 ====================
 
+
+def _check_finances_available(cursor, shop_id, report_date):
+    """
+    检查指定日期的 Finance 数据是否已结算
+
+    简介: 查询 amazon_order_finances 是否存在该日期的 Shipment 交易记录。
+
+    详细:
+      - Amazon 财务结算通常延迟 2-3 天
+      - 有 Shipment 记录 → 可生成 settled 报告
+      - 无记录 → 仅能生成 estimated 报告
+    """
+    cursor.execute(
+        """SELECT 1 FROM amazon_order_finances
+           WHERE shop_id = %s AND DATE(posted_date) = %s
+             AND transaction_type = 'Shipment'
+           LIMIT 1""",
+        (shop_id, report_date),
+    )
+    return cursor.fetchone() is not None
+
+
+def _generate_estimated_daily(cursor, sid, report_date):
+    """
+    生成 estimated（仅销售额）日报数据
+
+    简介: 从 amazon_orders + amazon_order_items 仅拉取销售额/订单数/SKU数。
+
+    详细:
+      - 不计算成本/利润（finance 数据未到达）
+      - total_sales = 前台售价汇总（gross）
+      - 其他字段全部为 0
+    """
+    cursor.execute("""
+        SELECT
+            COUNT(DISTINCT o.amazon_order_id) AS order_count,
+            COUNT(DISTINCT oi.seller_sku) AS sku_count,
+            COALESCE(SUM(oi.item_price_amount), 0) AS total_sales
+        FROM amazon_orders o
+        LEFT JOIN amazon_order_items oi
+            ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
+        WHERE o.shop_id = %s
+          AND DATE(o.purchase_date) = %s
+          AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
+    """, (sid, report_date))
+    row = cursor.fetchone()
+
+    return {
+        'total_sales': Decimal(str(row['total_sales'] or 0)),
+        'order_count': int(row['order_count'] or 0),
+        'sku_count': int(row['sku_count'] or 0),
+        'total_product_cost': Decimal('0'),
+        'total_headway': Decimal('0'),
+        'total_fba_fees': Decimal('0'),
+        'total_commission': Decimal('0'),
+        'ad_cost': Decimal('0'),
+        'refund_amount': Decimal('0'),
+        'refund_rate': Decimal('0'),
+        'total_cost': Decimal('0'),
+        'gross_profit': Decimal('0'),
+        'gross_profit_rate': Decimal('0'),
+        'headway_ratio': Decimal('0'),
+        'data_status': 'estimated',
+    }
+
+
+def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
+    """
+    生成 settled（完整已结算）日报数据
+
+    简介: 从 amazon_order_finances 拉取 Amazon 已结算的真实流水，结合内部成本计算利润。
+
+    详细:
+      - total_sales: ship 交易的 totalAmount 汇总（Amazon 实际打款净额）
+      - 内部成本: 从 profit_calculator 按 SKU 逐项计算（采购成本+头程）
+      - 退款: 从 finances 的 Refund 交易汇总
+      - 广告费: 从 amazon_ad_spend 读取
+      - platform_fees / fba_fees: 设为 0（已从 total_sales 中扣除）
+      - 无 finance 数据时返回 None 让调用方回退到 estimated
+    """
+    cursor.execute(
+        """SELECT 1 FROM amazon_order_finances
+           WHERE shop_id = %s AND DATE(posted_date) = %s
+             AND transaction_type = 'Shipment' LIMIT 1""",
+        (sid, report_date),
+    )
+    if not cursor.fetchone():
+        return None
+
+    # 1. Shipment 交易汇总（收入）
+    cursor.execute("""
+        SELECT
+            COUNT(DISTINCT amazon_order_id) AS order_count,
+            COALESCE(SUM(total_amount), 0) AS total_sales
+        FROM amazon_order_finances
+        WHERE shop_id = %s
+          AND DATE(posted_date) = %s
+          AND transaction_type = 'Shipment'
+    """, (sid, report_date))
+    ship_row = cursor.fetchone()
+    total_sales = Decimal(str(ship_row['total_sales'] or 0))
+    order_count = int(ship_row['order_count'] or 0)
+
+    # 2. 获取所有 Shipment 交易的 items，解析 SKU 级别数据
+    cursor.execute("""
+        SELECT items_json FROM amazon_order_finances
+        WHERE shop_id = %s AND DATE(posted_date) = %s
+          AND transaction_type = 'Shipment'
+    """, (sid, report_date))
+    txn_rows = cursor.fetchall()
+
+    sku_qty = {}
+    for txn_row in txn_rows:
+        items = txn_row['items_json']
+        if isinstance(items, str):
+            try:
+                items = json.loads(items)
+            except (json.JSONDecodeError, TypeError):
+                items = []
+        for item in (items or []):
+            for ctx in item.get('contexts', []):
+                if ctx.get('contextType') == 'ProductContext':
+                    sku = ctx.get('sku', '') or ''
+                    qty = int(ctx.get('quantityShipped', 0) or 0)
+                    if sku and qty > 0:
+                        sku_qty[sku] = sku_qty.get(sku, 0) + qty
+
+    sku_count = len(sku_qty)
+
+    # 3. 按 SKU 计算内部成本
+    total_product_cost = Decimal('0')
+    total_headway = Decimal('0')
+    for sku, qty in sku_qty.items():
+        try:
+            unit_costs = get_unit_costs(cursor, sku, exchange_rate)
+            total_product_cost += Decimal(str(unit_costs.purchase_cost)) * qty
+            total_headway += Decimal(str(unit_costs.headway_cost)) * qty
+        except Exception as e:
+            print(f"[Report] SKU {sku} 成本计算异常: {e}")
+            continue
+
+    # 4. 退款（从 finances Refund 交易）
+    cursor.execute("""
+        SELECT COALESCE(SUM(ABS(total_amount)), 0) AS refund_sum
+        FROM amazon_order_finances
+        WHERE shop_id = %s
+          AND DATE(posted_date) = %s
+          AND transaction_type = 'Refund'
+    """, (sid, report_date))
+    refund_row = cursor.fetchone()
+    refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
+
+    # 5. 广告费（仍从 amazon_ad_spend 读取）
+    cursor.execute("""
+        SELECT COALESCE(SUM(ad_spend), 0) AS ad_sum
+        FROM amazon_ad_spend
+        WHERE shop_id = %s AND date = %s
+    """, (sid, report_date))
+    ad_row = cursor.fetchone()
+    ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
+
+    # 6. 汇总计算
+    total_cost = total_product_cost + total_headway + refund_amount + ad_cost
+    gross_profit = total_sales - total_cost
+    gross_profit_rate = (gross_profit / total_sales) if total_sales > 0 else Decimal('0')
+    headway_ratio = (total_headway / total_sales) if total_sales > 0 else Decimal('0')
+    refund_rate = (refund_amount / total_sales) if total_sales > 0 else Decimal('0')
+
+    return {
+        'total_sales': total_sales,
+        'order_count': order_count,
+        'sku_count': sku_count,
+        'total_product_cost': total_product_cost,
+        'total_headway': total_headway,
+        'total_fba_fees': Decimal('0'),
+        'total_commission': Decimal('0'),
+        'ad_cost': ad_cost,
+        'refund_amount': refund_amount,
+        'refund_rate': refund_rate,
+        'total_cost': total_cost,
+        'gross_profit': gross_profit,
+        'gross_profit_rate': gross_profit_rate,
+        'headway_ratio': headway_ratio,
+        'data_status': 'settled',
+    }
+
+
+def _upsert_daily_report(cursor, sid, report_date, d):
+    """根据预处理数据写入/更新 report_business 日報行"""
+    cursor.execute("""
+        INSERT INTO report_business (
+            shop_id, report_type, report_date, report_week, report_month, data_status,
+            total_sales, total_cost, product_cost, gross_profit, gross_profit_rate,
+            headway_cost, headway_ratio, order_count, sku_count,
+            ad_cost, refund_amount, refund_rate, platform_fees, fba_fees
+        ) VALUES (%s, 'daily', %s, '', '', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            data_status = VALUES(data_status),
+            total_sales = VALUES(total_sales),
+            total_cost = VALUES(total_cost),
+            product_cost = VALUES(product_cost),
+            gross_profit = VALUES(gross_profit),
+            gross_profit_rate = VALUES(gross_profit_rate),
+            headway_cost = VALUES(headway_cost),
+            headway_ratio = VALUES(headway_ratio),
+            order_count = VALUES(order_count),
+            sku_count = VALUES(sku_count),
+            ad_cost = VALUES(ad_cost),
+            refund_amount = VALUES(refund_amount),
+            refund_rate = VALUES(refund_rate),
+            platform_fees = VALUES(platform_fees),
+            fba_fees = VALUES(fba_fees),
+            updated_at = NOW()
+    """, (
+        sid, report_date, d['data_status'],
+        float(d['total_sales']), float(d['total_cost']), float(d['total_product_cost']),
+        float(d['gross_profit']), float(d['gross_profit_rate']),
+        float(d['total_headway']), float(d['headway_ratio']),
+        d['order_count'], d['sku_count'],
+        float(d['ad_cost']), float(d['refund_amount']), float(d['refund_rate']),
+        float(d['total_commission']), float(d['total_fba_fees']),
+    ))
+
+
 def generate_business_daily(report_date, shop_id=None):
     """
-    生成单日的经营日报
-    report_date: 'YYYY-MM-DD'
-    shop_id: None 则遍历所有店铺
+    生成单日经营日报
+
+    简介: 根据 finance 数据可用性自动选择 estimated 或 settled 模式。
+
+    详细:
+      - 有 finance 数据: settled 模式，拉取真实流水 + 内部成本计算完整利润
+      - 无 finance 数据: estimated 模式，仅统计销售额/订单数/SKU数，费用字段为 0
+      - 幂等: ON DUPLICATE KEY UPDATE，重复调用安全
+      - settled 模式会覆盖同日的 estimated 数据
+
+    参数:
+        report_date: 'YYYY-MM-DD'
+        shop_id: None=所有店铺, int=指定店铺
     """
     report_type = 'business_daily'
     period = report_date
@@ -83,7 +318,6 @@ def generate_business_daily(report_date, shop_id=None):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # 获取目标店铺列表
             if shop_id is not None:
                 cursor.execute("SELECT id FROM amazon_shops WHERE id = %s AND status = 1", (shop_id,))
             else:
@@ -97,123 +331,24 @@ def generate_business_daily(report_date, shop_id=None):
             log_id = _log_generation_start(report_type, period, sid)
             try:
                 with conn.cursor() as cursor:
-                    # 1. 读取汇率（缓存，同一天内复用）
                     if exchange_rate is None:
                         exchange_rate = get_exchange_rate(cursor)
 
-                    # 2. 订单维度汇总：销售额、订单数、SKU数、销量
-                    cursor.execute("""
-                        SELECT
-                            COUNT(DISTINCT o.amazon_order_id) AS order_count,
-                            COUNT(DISTINCT oi.seller_sku) AS sku_count,
-                            COALESCE(SUM(oi.item_price_amount), 0) AS total_sales,
-                            COALESCE(SUM(oi.quantity_shipped), 0) AS total_qty
-                        FROM amazon_orders o
-                        LEFT JOIN amazon_order_items oi
-                            ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
-                        WHERE o.shop_id = %s
-                          AND DATE(o.purchase_date) = %s
-                          AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
-                    """, (sid, report_date))
-                    sales_row = cursor.fetchone()
-                    total_sales = Decimal(str(sales_row['total_sales'] or 0))
-                    order_count = int(sales_row['order_count'] or 0)
-                    sku_count = int(sales_row['sku_count'] or 0)
+                    settled_data = _generate_settled_daily(cursor, sid, report_date, exchange_rate)
 
-                    # 3. 逐 SKU 计算成本项
-                    cursor.execute("""
-                        SELECT
-                            oi.asin,
-                            oi.seller_sku,
-                            SUM(oi.quantity_shipped) AS qty,
-                            SUM(oi.item_price_amount) AS revenue
-                        FROM amazon_orders o
-                        JOIN amazon_order_items oi
-                            ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
-                        WHERE o.shop_id = %s
-                          AND DATE(o.purchase_date) = %s
-                          AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
-                        GROUP BY oi.asin, oi.seller_sku
-                    """, (sid, report_date))
-                    sku_rows = cursor.fetchall()
+                    if settled_data is not None:
+                        d = settled_data
+                        print(f"[Report] {report_date} shop={sid} settled: sales={d['total_sales']}, "
+                              f"orders={d['order_count']}, profit={d['gross_profit']}")
+                    else:
+                        d = _generate_estimated_daily(cursor, sid, report_date)
+                        if d['total_sales'] == 0:
+                            print(f"[Report] {report_date} shop={sid}: 无销售数据，跳过")
+                            continue
+                        print(f"[Report] {report_date} shop={sid} estimated: sales={d['total_sales']}, "
+                              f"orders={d['order_count']} (finance 未到达)")
 
-                    total_cost = Decimal('0')
-                    total_product_cost = Decimal('0')
-                    total_fba_fees = Decimal('0')
-                    total_commission = Decimal('0')
-                    total_headway = Decimal('0')
-
-                    for row in sku_rows:
-                        seller_sku = row['seller_sku']
-                        qty = int(row['qty'] or 0)
-                        revenue = Decimal(str(row['revenue'] or 0))
-
-                        # 统一成本入口（2026-05-26 重构）
-                        unit_costs = get_unit_costs(cursor, seller_sku, exchange_rate)
-                        profit = calculate_profit(revenue, qty, unit_costs)
-
-                        total_product_cost += profit.product_cost
-                        total_fba_fees += profit.fba_fees
-                        total_commission += profit.commission
-                        total_headway += profit.headway_cost
-
-                    # 4. 广告费（仅读取 amazon_ad_spend，无数据则记0）
-                    cursor.execute("""
-                        SELECT COALESCE(SUM(ad_spend), 0) AS ad_sum
-                        FROM amazon_ad_spend
-                        WHERE shop_id = %s AND date = %s
-                    """, (sid, report_date))
-                    ad_row = cursor.fetchone()
-                    ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
-
-                    # 5. 退款（仅读取 amazon_refund_records，无数据则记0）
-                    cursor.execute("""
-                        SELECT COALESCE(SUM(refund_amount), 0) AS refund_sum
-                        FROM amazon_refund_records
-                        WHERE shop_id = %s AND refund_date = %s
-                    """, (sid, report_date))
-                    refund_row = cursor.fetchone()
-                    refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
-                    refund_rate = (refund_amount / total_sales) if total_sales > 0 else Decimal('0')
-
-                    # 6. 总成本 = 产品成本 + FBA + 佣金 + 头程 + 退款 + 广告费
-                    total_cost = total_product_cost + total_fba_fees + total_commission + total_headway + refund_amount + ad_cost
-                    gross_profit = total_sales - total_cost
-                    gross_profit_rate = (gross_profit / total_sales) if total_sales > 0 else Decimal('0')
-                    headway_ratio = (total_headway / total_sales) if total_sales > 0 else Decimal('0')
-
-                    # 7. 写入/更新报表
-                    # 日报：report_date 有值，report_week=''，report_month=''
-                    cursor.execute("""
-                        INSERT INTO report_business (
-                            shop_id, report_type, report_date, report_week, report_month,
-                            total_sales, total_cost, product_cost, gross_profit, gross_profit_rate,
-                            headway_cost, headway_ratio, order_count, sku_count,
-                            ad_cost, refund_amount, refund_rate, platform_fees, fba_fees
-                        ) VALUES (%s, 'daily', %s, '', '', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            total_sales = VALUES(total_sales),
-                            total_cost = VALUES(total_cost),
-                            product_cost = VALUES(product_cost),
-                            gross_profit = VALUES(gross_profit),
-                            gross_profit_rate = VALUES(gross_profit_rate),
-                            headway_cost = VALUES(headway_cost),
-                            headway_ratio = VALUES(headway_ratio),
-                            order_count = VALUES(order_count),
-                            sku_count = VALUES(sku_count),
-                            ad_cost = VALUES(ad_cost),
-                            refund_amount = VALUES(refund_amount),
-                            refund_rate = VALUES(refund_rate),
-                            platform_fees = VALUES(platform_fees),
-                            fba_fees = VALUES(fba_fees),
-                            updated_at = NOW()
-                    """, (
-                        sid, report_date,
-                        float(total_sales), float(total_cost), float(total_product_cost), float(gross_profit), float(gross_profit_rate),
-                        float(total_headway), float(headway_ratio), order_count, sku_count,
-                        float(ad_cost), float(refund_amount), float(refund_rate),
-                        float(total_commission), float(total_fba_fees)
-                    ))
+                    _upsert_daily_report(cursor, sid, report_date, d)
                     total_affected += cursor.rowcount
 
                 conn.commit()
@@ -233,11 +368,19 @@ def generate_business_daily(report_date, shop_id=None):
 def generate_business_weekly(start_date, end_date, shop_id=None):
     """
     基于已生成的日报汇总周报
-    start_date/end_date: 'YYYY-MM-DD'，如 '2026-05-11' / '2026-05-17'
+
+    简介: 对指定周的日报进行 SUM 聚合，写入一条 weekly 记录。
+
+    详细:
+      - 周三生成时，上周日报应全部为 settled（>= T-3）
+      - 若仍有 estimated 日报，输出警告日志但不阻塞写入
+      - 周报 data_status = 'settled'
+
+    参数:
+        start_date/end_date: 'YYYY-MM-DD'，如 '2026-05-25' / '2026-05-31'
     """
     report_type = 'business_weekly'
     period = f"{start_date}~{end_date}"
-    # 对外展示用范围格式 2026.05.11~2026.05.17
     report_week_label = start_date.replace('-', '.') + '~' + end_date.replace('-', '.')
 
     conn = get_db_connection()
@@ -254,20 +397,33 @@ def generate_business_weekly(start_date, end_date, shop_id=None):
             log_id = _log_generation_start(report_type, period, sid)
             try:
                 with conn.cursor() as cursor:
-                    # 周报：report_date 用该周周一（方便按日期范围查询），report_week 有值，report_month=''
+                    cursor.execute(
+                        """SELECT report_date, data_status FROM report_business
+                           WHERE shop_id = %s AND report_type = 'daily'
+                             AND report_date BETWEEN %s AND %s
+                             AND data_status = 'estimated'""",
+                        (sid, start_date, end_date),
+                    )
+                    est_rows = cursor.fetchall()
+                    if est_rows:
+                        est_dates = [r['report_date'] for r in est_rows]
+                        print(f"[Report] 周报 {report_week_label} shop={sid}: "
+                              f"{len(est_dates)} 天仍为 estimated: {est_dates}")
+
                     cursor.execute("""
                         INSERT INTO report_business (
-                            shop_id, report_type, report_date, report_week, report_month,
+                            shop_id, report_type, report_date, report_week, report_month, data_status,
                             total_sales, total_cost, product_cost, gross_profit, gross_profit_rate,
                             headway_cost, headway_ratio, order_count, sku_count,
                             ad_cost, refund_amount, refund_rate, platform_fees, fba_fees
                         )
                         SELECT
                             shop_id,
-                            'weekly' AS report_type,
-                            %s AS report_date,
-                            %s AS report_week,
-                            '' AS report_month,
+                            'weekly',
+                            %s,
+                            %s,
+                            '',
+                            'settled',
                             SUM(total_sales),
                             SUM(total_cost),
                             SUM(product_cost),
@@ -287,6 +443,7 @@ def generate_business_weekly(start_date, end_date, shop_id=None):
                           AND report_date BETWEEN %s AND %s
                         GROUP BY shop_id
                         ON DUPLICATE KEY UPDATE
+                            data_status = 'settled',
                             total_sales = VALUES(total_sales),
                             total_cost = VALUES(total_cost),
                             product_cost = VALUES(product_cost),
@@ -321,18 +478,25 @@ def generate_business_weekly(start_date, end_date, shop_id=None):
 def generate_business_monthly(month_str, shop_id=None):
     """
     基于已生成的日报汇总月报
-    month_str: 'YYYY-MM' 如 '2026-05'
+
+    简介: 对上月日报进行 SUM 聚合，写入一条 monthly 记录。
+
+    详细:
+      - 每月 3 号生成时，上月日报应全部为 settled（>= T-3）
+      - 若仍有 estimated 日报，输出警告日志但不阻塞写入
+      - 月报 data_status = 'settled'
+
+    参数:
+        month_str: 'YYYY-MM' 如 '2026-05'
     """
     report_type = 'business_monthly'
     period = month_str
     year, month = map(int, month_str.split('-'))
     start_date = f'{year}-{month:02d}-01'
-    # 月末
     if month == 12:
         end_date = f'{year + 1}-01-01'
     else:
         end_date = f'{year}-{month + 1:02d}-01'
-    # 减一天
     from datetime import datetime as dt
     end_date = (dt.strptime(end_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
 
@@ -350,21 +514,34 @@ def generate_business_monthly(month_str, shop_id=None):
             log_id = _log_generation_start(report_type, period, sid)
             try:
                 with conn.cursor() as cursor:
-                    # 月报：report_date 用该月1号（方便按日期范围查询），report_week=''，report_month 有值
+                    cursor.execute(
+                        """SELECT report_date, data_status FROM report_business
+                           WHERE shop_id = %s AND report_type = 'daily'
+                             AND report_date BETWEEN %s AND %s
+                             AND data_status = 'estimated'""",
+                        (sid, start_date, end_date),
+                    )
+                    est_rows = cursor.fetchall()
+                    if est_rows:
+                        est_dates = [r['report_date'] for r in est_rows]
+                        print(f"[Report] 月报 {month_str} shop={sid}: "
+                              f"{len(est_dates)} 天仍为 estimated: {est_dates}")
+
                     month_start = f'{year}-{month:02d}-01'
                     cursor.execute("""
                         INSERT INTO report_business (
-                            shop_id, report_type, report_date, report_week, report_month,
+                            shop_id, report_type, report_date, report_week, report_month, data_status,
                             total_sales, total_cost, product_cost, gross_profit, gross_profit_rate,
                             headway_cost, headway_ratio, order_count, sku_count,
                             ad_cost, refund_amount, refund_rate, platform_fees, fba_fees
                         )
                         SELECT
                             shop_id,
-                            'monthly' AS report_type,
-                            %s AS report_date,
-                            '' AS report_week,
-                            %s AS report_month,
+                            'monthly',
+                            %s,
+                            '',
+                            %s,
+                            'settled',
                             SUM(total_sales),
                             SUM(total_cost),
                             SUM(product_cost),
@@ -384,6 +561,7 @@ def generate_business_monthly(month_str, shop_id=None):
                           AND report_date BETWEEN %s AND %s
                         GROUP BY shop_id
                         ON DUPLICATE KEY UPDATE
+                            data_status = 'settled',
                             total_sales = VALUES(total_sales),
                             total_cost = VALUES(total_cost),
                             product_cost = VALUES(product_cost),
@@ -1037,35 +1215,58 @@ def generate_advertising_monthly(month_str, shop_id=None):
 
 def generate_yesterday_reports():
     """
-    一键生成昨日全部报表（供 scheduler 调用）
+    一键生成全部定时报表（Cron 入口）
+
+    简介: 分三个时间窗口生成日报数据，并检查周报/月报触发条件。
+
+    详细:
+      - T-1 (昨天): 生成 estimated 日报（仅销售额，finance 未到达）
+      - T-2 (前天): 确保 estimated 日报存在（补生成，防止遗漏）
+      - T-3 (3 天前): 升级为 settled 日报（完整 finance 数据已到达）
+      - 周报: 每周三生成上周 Mon-Sun
+      - 月报: 每月 3 号生成上月
     """
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    today = datetime.now().date()
+    yesterday = (today - timedelta(days=1)).strftime('%Y-%m-%d')       # T-1
+    two_days_ago = (today - timedelta(days=2)).strftime('%Y-%m-%d')    # T-2
+    three_days_ago = (today - timedelta(days=3)).strftime('%Y-%m-%d')  # T-3 (settled)
+
     results = {}
 
-    # 1. 经营日报
-    results['business_daily'] = generate_business_daily(yesterday)
+    # 1. T-1: estimated（销售额 only）
+    print(f"[Report] generate T-1 estimated: {yesterday}")
+    results['business_daily_t1'] = generate_business_daily(yesterday)
 
-    # 2. SKU 利润（昨日单天）
+    # 2. T-2: estimated（补生成，确保数据连续）
+    print(f"[Report] generate T-2 estimated: {two_days_ago}")
+    results['business_daily_t2'] = generate_business_daily(two_days_ago)
+
+    # 3. T-3: settled upgrade（完整 finance 数据）
+    print(f"[Report] upgrade T-3 settled: {three_days_ago}")
+    results['business_daily_t3'] = generate_business_daily(three_days_ago)
+
+    # 4. SKU 利润（T-1，基于 orders 数据，不依赖 finances）
     results['sku_profit'] = generate_sku_profit(yesterday, yesterday)
 
-    # 3. 库存周转
+    # 5. 库存周转
     results['inventory_turnover'] = generate_inventory_turnover()
 
-    # 4. 广告效果日报
+    # 6. 广告效果日报（T-1，基于 amazon_ad_spend 导入数据）
     results['advertising_daily'] = generate_advertising_daily(yesterday)
 
-    # 5. 周报（如果昨天是周日，则生成本周周报：周一~周日）
-    yesterday_dt = datetime.strptime(yesterday, '%Y-%m-%d')
-    if yesterday_dt.weekday() == 6:  # Sunday=6
+    # 7. 周报: 每周三生成上周 Mon-Sun
+    if today.weekday() == 2:  # Wednesday=2
+        yesterday_dt = datetime.strptime(yesterday, '%Y-%m-%d')
         week_start = (yesterday_dt - timedelta(days=6)).strftime('%Y-%m-%d')
         week_end = yesterday
+        print(f"[Report] 周三触发周报: {week_start}~{week_end}")
         results['business_weekly'] = generate_business_weekly(week_start, week_end)
         results['advertising_weekly'] = generate_advertising_weekly(week_start, week_end)
 
-    # 6. 月报（如果昨天是月末，则生成本月月报）
-    today = datetime.now().date()
-    if today.day == 1:  # 今天1号，说明昨天是月末
+    # 8. 月报: 每月 3 号生成上月
+    if today.day == 3:
         month_str = (today - timedelta(days=1)).strftime('%Y-%m')
+        print(f"[Report] 3号触发月报: {month_str}")
         results['business_monthly'] = generate_business_monthly(month_str)
         results['advertising_monthly'] = generate_advertising_monthly(month_str)
 
