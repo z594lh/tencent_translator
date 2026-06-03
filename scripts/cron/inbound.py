@@ -4,7 +4,13 @@
   用法: python scripts/cron/inbound.py --30min    每30分钟
         python scripts/cron/inbound.py --6h       每6小时
 """
+import os
 import sys
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+from dotenv import load_dotenv
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
+
 from scripts.cron import _now_str
 from services.shop_service import get_all_active_shops
 
@@ -23,7 +29,6 @@ def run_30min():
         shop_name = shop.get('shop_name', f"shop_{shop['id']}")
         shop_id = shop['id']
 
-        # 1. 同步入库计划列表
         print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划同步...")
         try:
             plans_result = _sync_inbound_plans(shop_id=shop_id, status='ACTIVE')
@@ -32,7 +37,6 @@ def run_30min():
             print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划同步异常: {e}")
             continue
 
-        # 2. 同步货件列表
         print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划货件同步...")
         try:
             result = _sync_all_inbound_plan_shipments(shop_id=shop_id, status='ACTIVE')
@@ -55,7 +59,6 @@ def run_6h():
         shop_name = shop.get('shop_name', f"shop_{shop['id']}")
         shop_id = shop['id']
 
-        # 1. 同步所有箱子
         print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划箱子同步...")
         try:
             result = _sync_all_inbound_plan_boxes(shop_id=shop_id, status='ACTIVE')
@@ -63,7 +66,6 @@ def run_6h():
         except Exception as e:
             print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 入库计划箱子同步异常: {e}")
 
-        # 2. 同步所有货件详情
         print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] 开始入库计划货件详情同步...")
         try:
             result = _sync_all_inbound_shipment_details(shop_id=shop_id, status='ACTIVE')

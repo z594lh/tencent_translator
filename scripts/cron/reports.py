@@ -5,7 +5,13 @@
         python scripts/cron/reports.py --weekly     周报（每周三凌晨3点）
         python scripts/cron/reports.py --monthly    月报（每月3号凌晨4点）
 """
+import os
 import sys
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+from dotenv import load_dotenv
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
+
 from datetime import datetime, timedelta
 from scripts.cron import _now_str
 

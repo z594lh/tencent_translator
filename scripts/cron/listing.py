@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """Listing 同步（每3小时）"""
+import os
+import sys
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+from dotenv import load_dotenv
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
+
 from scripts.cron import _now_str
 from services.shop_service import get_all_active_shops
 

@@ -5,8 +5,14 @@
         python scripts/cron/orders.py --week      本周7d（每3小时）
         python scripts/cron/orders.py --month     本月30d（每6小时，仅列表）
 """
+import os
 import sys
 import time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from dotenv import load_dotenv
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
+
 from datetime import datetime, timedelta
 from scripts.cron import _now_str
 from services.mysql_service import get_db_connection
@@ -14,7 +20,6 @@ from services.shop_service import get_all_active_shops
 
 
 def _get_recent_order_ids(shop_id, hours):
-    """查询最近 N 小时内有更新的订单ID"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -30,7 +35,6 @@ def _get_recent_order_ids(shop_id, hours):
 
 
 def _sync_order_items_batch(shop_id, order_ids, label=""):
-    """批量同步订单商品，返回统计信息"""
     from blueprints.amazon.orders import _sync_order_items
     items_total = 0
     items_errors = []
@@ -47,7 +51,6 @@ def _sync_order_items_batch(shop_id, order_ids, label=""):
 
 
 def run_recent():
-    """每15分钟：同步最近24小时内有更新的订单（列表+商品）"""
     from blueprints.amazon.orders import _sync_orders
     now = datetime.now()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
@@ -76,7 +79,6 @@ def run_recent():
 
 
 def run_week():
-    """每3小时：同步最近7天内有更新的订单（列表+商品，商品只同步24h~7d区间）"""
     from blueprints.amazon.orders import _sync_orders
     now = datetime.now()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
@@ -94,7 +96,6 @@ def run_week():
             result = _sync_orders(shop_id=shop_id, last_updated_after=last_updated_after)
             print(f"[{now_str}] [Cron] 店铺[{shop_name}] 本周订单列表同步完成: fetched={result.get('total_fetched', 0)}, synced={result.get('synced_count', 0)}")
 
-            # 只同步 24h ~ 7d 这个区间的订单商品
             since_24h = (now - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
             since_7d = (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
             conn = get_db_connection()
@@ -119,7 +120,6 @@ def run_week():
 
 
 def run_month():
-    """每6小时：同步最近30天内有更新的订单（仅列表，不抓商品）"""
     from blueprints.amazon.orders import _sync_orders
     now = datetime.now()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')

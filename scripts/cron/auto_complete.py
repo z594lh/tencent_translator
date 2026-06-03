@@ -3,6 +3,13 @@
 自动完结超期订单（每天凌晨1:30）
 进货单/货代运单创建10天后仍为初始状态，自动变更为已完成并入账
 """
+import os
+import sys
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+from dotenv import load_dotenv
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
+
 from datetime import datetime
 from scripts.cron import _now_str
 from services.mysql_service import get_db_connection
