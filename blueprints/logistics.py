@@ -58,7 +58,7 @@ def _val_or_none(val, cast_type=None):
 def _sync_waybill_expense(conn, waybill_no, total_cost_cny, new_status):
     """
     根据新状态同步运单的支出记录：
-      - 已完成 → 不存在则创建
+      - 已完成 → 不存在则创建，已存在则更新金额
       - 非已完成 → 存在则删除
     """
     if not waybill_no:
@@ -68,18 +68,26 @@ def _sync_waybill_expense(conn, waybill_no, total_cost_cny, new_status):
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT id FROM expenses WHERE source_type = 'logistics_waybill' AND source_no = %s LIMIT 1",
+                    "SELECT id, amount FROM expenses WHERE source_type = 'logistics_waybill' AND source_no = %s LIMIT 1",
                     (waybill_no,)
                 )
-                if cursor.fetchone():
+                existing = cursor.fetchone()
+                amount = float(total_cost_cny or 0)
+                if existing:
+                    if float(existing['amount']) != amount:
+                        cursor.execute(
+                            "UPDATE expenses SET amount = %s WHERE id = %s",
+                            (amount, existing['id'])
+                        )
+                        conn.commit()
                     return
             create_expense_for_source(
                 conn, '物流/头程',
-                float(total_cost_cny or 0), datetime.now().strftime('%Y-%m-%d'),
+                amount, datetime.now().strftime('%Y-%m-%d'),
                 f"运单 {waybill_no}", 'logistics_waybill', waybill_no, 'company'
             )
         except Exception as e:
-            print(f"[Logistics] 自动创建支出记录异常: {e}")
+            print(f"[Logistics] 同步支出记录异常: {e}")
     else:
         try:
             with conn.cursor() as cursor:
@@ -511,6 +519,16 @@ def create_waybill():
                 cursor.execute(sql, tuple(values))
                 conn.commit()
                 new_id = cursor.lastrowid
+
+                # 新建时已是最终状态，直接入账
+                new_status = data.get('status', 0)
+                if new_status == WAYBILL_STATUS_COMPLETED:
+                    _sync_waybill_expense(
+                        conn, waybill_no,
+                        float(data.get('total_cost_cny') or 0),
+                        WAYBILL_STATUS_COMPLETED
+                    )
+
                 return jsonify({"status": "success", "message": "创建成功", "data": {"id": new_id}})
         finally:
             conn.close()

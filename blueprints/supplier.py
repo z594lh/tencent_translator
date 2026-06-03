@@ -54,7 +54,7 @@ def _generate_order_no():
 def _sync_purchase_order_expense(conn, order_no, total_amount, new_status):
     """
     根据新状态同步进货单的支出记录：
-      - 已完成 → 不存在则创建
+      - 已完成 → 不存在则创建，已存在则更新金额
       - 非已完成 → 存在则删除
     """
     if new_status == PURCHASE_ORDER_STATUS_COMPLETED:
@@ -62,18 +62,26 @@ def _sync_purchase_order_expense(conn, order_no, total_amount, new_status):
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT id FROM expenses WHERE source_type = 'purchase_order' AND source_no = %s LIMIT 1",
+                    "SELECT id, amount FROM expenses WHERE source_type = 'purchase_order' AND source_no = %s LIMIT 1",
                     (order_no,)
                 )
-                if cursor.fetchone():
+                existing = cursor.fetchone()
+                amount = float(total_amount or 0)
+                if existing:
+                    if float(existing['amount']) != amount:
+                        cursor.execute(
+                            "UPDATE expenses SET amount = %s WHERE id = %s",
+                            (amount, existing['id'])
+                        )
+                        conn.commit()
                     return
             create_expense_for_source(
                 conn, '采购/货值',
-                float(total_amount or 0), datetime.now().strftime('%Y-%m-%d'),
+                amount, datetime.now().strftime('%Y-%m-%d'),
                 f"进货单 {order_no}", 'purchase_order', order_no, 'company'
             )
         except Exception as e:
-            print(f"[PurchaseOrders] 自动创建支出记录异常: {e}")
+            print(f"[PurchaseOrders] 同步支出记录异常: {e}")
     else:
         try:
             with conn.cursor() as cursor:
@@ -495,6 +503,11 @@ def create_purchase_order():
                     ))
 
                 conn.commit()
+
+                # 新建时已是最终状态，直接入账
+                if data.get('status') == PURCHASE_ORDER_STATUS_COMPLETED:
+                    _sync_purchase_order_expense(conn, order_no, total_amount, PURCHASE_ORDER_STATUS_COMPLETED)
+
                 return jsonify({"status": "success", "message": "创建成功", "data": {"id": order_id, "order_no": order_no}})
         finally:
             conn.close()
