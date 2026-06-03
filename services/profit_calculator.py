@@ -209,8 +209,8 @@ def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, d
         """
         SELECT DISTINCT b.shipment_id, s.sync_time
         FROM amazon_inbound_plan_boxes b
-        INNER JOIN amazon_inbound_shipments_detail s
-            ON b.shipment_id = s.shipment_confirmation_id AND s.shop_id = b.shop_id
+        INNER JOIN amazon_inbound_shipments s
+            ON b.inbound_plan_id = s.inbound_plan_id AND s.shop_id = b.shop_id
         WHERE b.items_json LIKE %s AND s.status != 'CANCELLED'
         ORDER BY s.sync_time DESC
         LIMIT 1
