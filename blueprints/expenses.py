@@ -575,31 +575,6 @@ def get_expense_logs(id):
 
 
 # ============================================================
-# 路由: 用户列表（筛选下拉）
-# ============================================================
-@expenses_bp.route('/expenses/users', methods=['GET'])
-@login_required
-@permission_required('expenses:page')
-def get_expense_users():
-    """获取所有活跃用户列表，供支出筛选下拉框使用"""
-    try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT id, username, nickname FROM users
-                    WHERE status = 1 ORDER BY nickname, username
-                """)
-                rows = cursor.fetchall()
-                return jsonify({"status": "success", "data": rows})
-        finally:
-            conn.close()
-    except Exception as e:
-        print(f"[Expenses] 查询用户列表异常: {e}")
-        return jsonify({"status": "error", "message": f"查询失败: {e}"}), 500
-
-
-# ============================================================
 # 路由: 上传发票图片
 # ============================================================
 @expenses_bp.route('/expenses/upload-invoice', methods=['POST'])

@@ -29,6 +29,7 @@ from blueprints.product_board import product_board_bp
 from blueprints.reports import reports_bp
 from blueprints.cron import cron_bp
 from blueprints.permissions import permissions_bp
+from blueprints.options import options_bp
 
 # 定时任务已迁移到 Ubuntu crontab，通过 scripts/cron/ 子模块执行
 # 不再使用 APScheduler，避免与系统计划任务重复运行
@@ -122,9 +123,6 @@ app.register_blueprint(translation_bp)
 # 注册AI生图路由
 app.register_blueprint(ai_image_bp)
 
-# 注册视频相关路由
-
-
 # 注册记账路由
 app.register_blueprint(expenses_bp)
 
@@ -166,6 +164,9 @@ app.register_blueprint(cron_bp)
 
 # 注册权限管理路由
 app.register_blueprint(permissions_bp)
+
+# 注册下拉选项路由
+app.register_blueprint(options_bp)
 
 # 启动箱唛整理后台工作线程
 from blueprints.fba_tools import _start_label_workers

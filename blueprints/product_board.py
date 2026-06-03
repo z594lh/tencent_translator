@@ -645,30 +645,6 @@ def toggle_listed():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 筛选选项 ====================
-
-@product_board_bp.route('/product-board/filters', methods=['GET'])
-@login_required
-@permission_required('product_board:page')
-def product_board_filters():
-    try:
-        conn = _get_conn()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT DISTINCT amazon_status FROM product_board WHERE amazon_status != '' ORDER BY amazon_status")
-                amazon_statuses = [r['amazon_status'] for r in cursor.fetchall()]
-
-                return jsonify({
-                    "status": "success",
-                    "data": {"amazon_statuses": amazon_statuses}
-                })
-        finally:
-            conn.close()
-    except Exception as e:
-        print(f"[Product Board] 筛选查询异常: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
 # ==================== 统计 ====================
 
 @product_board_bp.route('/product-board/stats', methods=['GET'])

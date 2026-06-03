@@ -25,31 +25,6 @@ def _require_shop_id() -> int:
 
 # ==================== 路由（前端调用）====================
 
-@amazon_shipments_bp.route('/amazon/warehouses', methods=['GET'])
-@login_required
-@permission_required('amazon_shipments:warehouses')
-def amazon_warehouses():
-    """
-    查询 FBA 目的仓库列表（用于前端下拉筛选）
-    查询参数（必填）:
-        shop_id - 店铺ID
-    """
-    try:
-        shop_id = _require_shop_id()
-        result = _get_fba_warehouses(shop_id=shop_id)
-
-        return jsonify({
-            "status": "success",
-            "data": result
-        })
-
-    except ValueError as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-    except Exception as e:
-        print(f"[Amazon Warehouses DB] 查询异常: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
 @amazon_shipments_bp.route('/amazon/shipments/<shipment_id>/labels', methods=['GET'])
 @login_required
 @permission_required('amazon_shipments:labels')
