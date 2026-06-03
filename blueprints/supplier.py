@@ -1,6 +1,25 @@
 """
-供应商管理模块 - 供应商 CRUD + 进货单 CRUD
+供应商管理模块 — 供应商 CRUD + 进货单 CRUD
+
+路由一览:
+  供应商:
+    GET     /api/suppliers                      供应商列表（分页+搜索）
+    POST    /api/suppliers                      创建供应商
+    GET     /api/suppliers/<id>                  供应商详情
+    PUT     /api/suppliers/<id>                  编辑供应商
+    PUT     /api/suppliers/batch-status          批量修改供应商状态
+    DELETE  /api/suppliers/<id>                  删除供应商
+  进货单:
+    GET     /api/purchase-orders                 进货单列表（分页+搜索）
+    POST    /api/purchase-orders                 创建进货单（含明细）
+    GET     /api/purchase-orders/<id>            进货单详情（含明细）
+    PUT     /api/purchase-orders/<id>            编辑进货单（含明细）
+    PUT     /api/purchase-orders/batch-status    批量修改进货单状态
+    DELETE  /api/purchase-orders/<id>            删除进货单
 """
+# ============================================================
+# 导入
+# ============================================================
 from flask import Blueprint, request, jsonify
 import uuid
 from datetime import datetime
@@ -11,8 +30,18 @@ from services.mysql_service import get_db_connection
 
 supplier_bp = Blueprint('supplier', __name__, url_prefix='/api')
 
-# 进货单最终状态（已完成）
-PURCHASE_ORDER_STATUS_COMPLETED = 2
+# ============================================================
+# 常量
+# ============================================================
+PURCHASE_ORDER_STATUS_INITIAL = 0    # 初始状态（草稿）
+PURCHASE_ORDER_STATUS_COMPLETED = 2  # 最终状态（已完成）
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+def _get_conn():
+    return get_db_connection()
 
 
 def _generate_order_no():
@@ -22,11 +51,44 @@ def _generate_order_no():
     return f"PO{date_str}{random_suffix}"
 
 
-def _get_conn():
-    return get_db_connection()
+def _sync_purchase_order_expense(conn, order_no, total_amount, new_status):
+    """
+    根据新状态同步进货单的支出记录：
+      - 已完成 → 不存在则创建
+      - 非已完成 → 存在则删除
+    """
+    if new_status == PURCHASE_ORDER_STATUS_COMPLETED:
+        from blueprints.expenses import create_expense_for_source
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM expenses WHERE source_type = 'purchase_order' AND source_no = %s LIMIT 1",
+                    (order_no,)
+                )
+                if cursor.fetchone():
+                    return
+            create_expense_for_source(
+                conn, '采购/货值',
+                float(total_amount or 0), datetime.now().strftime('%Y-%m-%d'),
+                f"进货单 {order_no}", 'purchase_order', order_no, 'company'
+            )
+        except Exception as e:
+            print(f"[PurchaseOrders] 自动创建支出记录异常: {e}")
+    else:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM expenses WHERE source_type = 'purchase_order' AND source_no = %s",
+                    (order_no,)
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"[PurchaseOrders] 删除支出记录异常: {e}")
 
 
-# ==================== 供应商 CRUD ====================
+# ============================================================
+# 路由: 供应商 列表 / 详情 / 新增 / 编辑 / 批量状态 / 删除
+# ============================================================
 
 @supplier_bp.route('/suppliers', methods=['GET'])
 @login_required
@@ -61,30 +123,21 @@ def list_suppliers():
 
                 where_clause = " AND ".join(conditions)
 
-                # 统计总数
                 cursor.execute(f"SELECT COUNT(*) as total FROM suppliers WHERE {where_clause}", tuple(params))
                 total = cursor.fetchone()['total']
 
-                # 分页查询
                 offset = (page - 1) * page_size
-                sql = f"""
+                cursor.execute(f"""
                     SELECT id, name, contact_person, phone, email, address, shop_address, remark, status, created_at, updated_at
-                    FROM suppliers
-                    WHERE {where_clause}
+                    FROM suppliers WHERE {where_clause}
                     ORDER BY id DESC
                     LIMIT %s OFFSET %s
-                """
-                cursor.execute(sql, tuple(params + [page_size, offset]))
+                """, tuple(params + [page_size, offset]))
                 rows = cursor.fetchall()
 
                 return jsonify({
                     "status": "success",
-                    "data": {
-                        "list": rows,
-                        "total": total,
-                        "page": page,
-                        "page_size": page_size
-                    }
+                    "data": {"list": rows, "total": total, "page": page, "page_size": page_size}
                 })
         finally:
             conn.close()
@@ -135,11 +188,10 @@ def create_supplier():
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                sql = """
+                cursor.execute("""
                     INSERT INTO suppliers (name, contact_person, phone, email, address, shop_address, remark, status)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """
-                cursor.execute(sql, (
+                """, (
                     name,
                     data.get('contact_person', '').strip() or None,
                     data.get('phone', '').strip() or None,
@@ -175,12 +227,11 @@ def update_supplier(supplier_id):
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                sql = """
+                cursor.execute("""
                     UPDATE suppliers
                     SET name=%s, contact_person=%s, phone=%s, email=%s, address=%s, shop_address=%s, remark=%s, status=%s
                     WHERE id = %s
-                """
-                cursor.execute(sql, (
+                """, (
                     name,
                     data.get('contact_person', '').strip() or None,
                     data.get('phone', '').strip() or None,
@@ -235,7 +286,7 @@ def batch_update_supplier_status():
         finally:
             conn.close()
     except Exception as e:
-        print(f"[Suppliers] 批量更新供应商状态异常: {e}")
+        print(f"[Suppliers] 批量更新状态异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -248,7 +299,6 @@ def delete_supplier(supplier_id):
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                # 检查是否有关联进货单
                 cursor.execute("SELECT COUNT(*) as cnt FROM purchase_orders WHERE supplier_id = %s", (supplier_id,))
                 cnt = cursor.fetchone()['cnt']
                 if cnt > 0:
@@ -269,7 +319,9 @@ def delete_supplier(supplier_id):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==================== 进货单 CRUD ====================
+# ============================================================
+# 路由: 进货单 列表 / 详情 / 新增 / 编辑 / 批量状态 / 删除
+# ============================================================
 
 @supplier_bp.route('/purchase-orders', methods=['GET'])
 @login_required
@@ -309,18 +361,15 @@ def list_purchase_orders():
 
                 where_clause = " AND ".join(conditions)
 
-                # 统计总数
-                count_sql = f"""
+                cursor.execute(f"""
                     SELECT COUNT(*) as total FROM purchase_orders po
                     LEFT JOIN suppliers s ON po.supplier_id = s.id
                     WHERE {where_clause}
-                """
-                cursor.execute(count_sql, tuple(params))
+                """, tuple(params))
                 total = cursor.fetchone()['total']
 
-                # 分页查询
                 offset = (page - 1) * page_size
-                sql = f"""
+                cursor.execute(f"""
                     SELECT po.id, po.order_no, po.supplier_id, s.name as supplier_name,
                            po.product_amount, po.shipping_amount, po.misc_amount, po.total_amount,
                            po.status, po.remark, po.created_at, po.updated_at
@@ -329,18 +378,12 @@ def list_purchase_orders():
                     WHERE {where_clause}
                     ORDER BY po.id DESC
                     LIMIT %s OFFSET %s
-                """
-                cursor.execute(sql, tuple(params + [page_size, offset]))
+                """, tuple(params + [page_size, offset]))
                 rows = cursor.fetchall()
 
                 return jsonify({
                     "status": "success",
-                    "data": {
-                        "list": rows,
-                        "total": total,
-                        "page": page,
-                        "page_size": page_size
-                    }
+                    "data": {"list": rows, "total": total, "page": page, "page_size": page_size}
                 })
         finally:
             conn.close()
@@ -359,7 +402,6 @@ def get_purchase_order(order_id):
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                # 主表
                 cursor.execute("""
                     SELECT po.id, po.order_no, po.supplier_id, s.name as supplier_name,
                            po.product_amount, po.shipping_amount, po.misc_amount, po.total_amount,
@@ -373,14 +415,12 @@ def get_purchase_order(order_id):
                 if not order:
                     return jsonify({"status": "error", "message": "进货单不存在"}), 404
 
-                # 明细
                 cursor.execute("""
                     SELECT id, seller_sku, quantity, unit_price, total_price, remark
                     FROM purchase_order_items
                     WHERE order_id = %s
                 """, (order_id,))
-                items = cursor.fetchall()
-                order['items'] = items
+                order['items'] = cursor.fetchall()
 
                 return jsonify({"status": "success", "data": order})
         finally:
@@ -407,7 +447,6 @@ def create_purchase_order():
         if not items or not isinstance(items, list):
             return jsonify({"status": "error", "message": "进货明细不能为空"}), 400
 
-        # 计算商品金额并校验明细
         product_amount = Decimal('0')
         for item in items:
             if not item.get('seller_sku', '').strip():
@@ -426,7 +465,6 @@ def create_purchase_order():
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                # 插入主表
                 order_no = _generate_order_no()
                 cursor.execute("""
                     INSERT INTO purchase_orders (order_no, supplier_id, product_amount, shipping_amount, misc_amount, total_amount, status, remark)
@@ -443,7 +481,6 @@ def create_purchase_order():
                 ))
                 order_id = cursor.lastrowid
 
-                # 插入明细
                 for item in items:
                     cursor.execute("""
                         INSERT INTO purchase_order_items (order_id, seller_sku, quantity, unit_price, total_price, remark)
@@ -483,7 +520,6 @@ def update_purchase_order(order_id):
         if not items or not isinstance(items, list):
             return jsonify({"status": "error", "message": "进货明细不能为空"}), 400
 
-        # 计算商品金额并校验明细
         product_amount = Decimal('0')
         for item in items:
             if not item.get('seller_sku', '').strip():
@@ -502,14 +538,12 @@ def update_purchase_order(order_id):
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                # 先确认进货单存在（避免 rowcount==0 误判），同时获取单号
-                cursor.execute("SELECT id, order_no FROM purchase_orders WHERE id = %s", (order_id,))
+                cursor.execute("SELECT id, order_no, status FROM purchase_orders WHERE id = %s", (order_id,))
                 existing = cursor.fetchone()
                 if not existing:
                     return jsonify({"status": "error", "message": "进货单不存在"}), 404
                 order_no = existing['order_no']
 
-                # 更新主表
                 cursor.execute("""
                     UPDATE purchase_orders
                     SET supplier_id=%s, product_amount=%s, shipping_amount=%s, misc_amount=%s, total_amount=%s, status=%s, remark=%s
@@ -525,10 +559,8 @@ def update_purchase_order(order_id):
                     order_id
                 ))
 
-                # 删除旧明细
                 cursor.execute("DELETE FROM purchase_order_items WHERE order_id = %s", (order_id,))
 
-                # 插入新明细
                 for item in items:
                     cursor.execute("""
                         INSERT INTO purchase_order_items (order_id, seller_sku, quantity, unit_price, total_price, remark)
@@ -544,22 +576,12 @@ def update_purchase_order(order_id):
 
                 conn.commit()
 
-                # 状态变为已完成时，自动创建支出记录
-                if data.get('status') == PURCHASE_ORDER_STATUS_COMPLETED:
-                    try:
-                        from blueprints.expenses import create_expense_for_source
-                        cursor.execute(
-                            "SELECT id FROM expenses WHERE source_type = %s AND source_no = %s LIMIT 1",
-                            ('purchase_order', order_no)
-                        )
-                        if not cursor.fetchone():
-                            create_expense_for_source(
-                                conn, '采购/货值',
-                                float(total_amount), datetime.now().strftime('%Y-%m-%d'),
-                                f"进货单 {order_no}", 'purchase_order', order_no, 'company'
-                            )
-                    except Exception as e:
-                        print(f"[PurchaseOrders] 自动创建支出记录异常: {e}")
+                old_status = existing['status']
+                new_status = data.get('status', 0)
+
+                # 状态变更时同步支出记录
+                if old_status != new_status:
+                    _sync_purchase_order_expense(conn, order_no, total_amount, new_status)
 
                 return jsonify({"status": "success", "message": "更新成功"})
         finally:
@@ -589,37 +611,19 @@ def batch_update_purchase_order_status():
         try:
             with conn.cursor() as cursor:
                 placeholders = ', '.join(['%s'] * len(ids))
+                int_ids = [int(i) for i in ids]
+                new_status = int(status)
+
                 sql = f"UPDATE purchase_orders SET status = %s WHERE id IN ({placeholders})"
-                cursor.execute(sql, tuple([int(status)] + [int(i) for i in ids]))
+                cursor.execute(sql, tuple([new_status] + int_ids))
                 conn.commit()
 
-                # 状态变为已完成时，自动创建支出记录
-                if int(status) == PURCHASE_ORDER_STATUS_COMPLETED:
-                    try:
-                        from blueprints.expenses import create_expense_for_source
-                        placeholders2 = ', '.join(['%s'] * len(ids))
-                        int_ids = [int(i) for i in ids]
-                        cursor.execute(f"""
-                            SELECT id, order_no, total_amount FROM purchase_orders
-                            WHERE id IN ({placeholders2})
-                            AND NOT EXISTS (
-                                SELECT 1 FROM expenses
-                                WHERE expenses.source_type = 'purchase_order'
-                                AND expenses.source_no = purchase_orders.order_no
-                            )
-                        """, tuple(int_ids))
-                        pending = cursor.fetchall()
-                        for row in pending:
-                            try:
-                                create_expense_for_source(
-                                    conn, '采购/货值',
-                                    float(row['total_amount'] or 0), datetime.now().strftime('%Y-%m-%d'),
-                                    f"进货单 {row['order_no']}", 'purchase_order', row['order_no'], 'company'
-                                )
-                            except Exception as e:
-                                print(f"[PurchaseOrders] 为进货单 {row['order_no']} 创建支出记录失败: {e}")
-                    except Exception as e:
-                        print(f"[PurchaseOrders] 批量创建支出记录异常: {e}")
+                # 状态变更时同步支出记录
+                cursor.execute(f"""
+                    SELECT order_no, total_amount FROM purchase_orders WHERE id IN ({placeholders})
+                """, tuple(int_ids))
+                for row in cursor.fetchall():
+                    _sync_purchase_order_expense(conn, row['order_no'], row['total_amount'], new_status)
 
                 return jsonify({
                     "status": "success",
@@ -629,7 +633,7 @@ def batch_update_purchase_order_status():
         finally:
             conn.close()
     except Exception as e:
-        print(f"[PurchaseOrders] 批量更新进货单状态异常: {e}")
+        print(f"[PurchaseOrders] 批量更新状态异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

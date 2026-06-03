@@ -19,6 +19,7 @@ Crontab 定时任务入口脚本
      reports-daily    经营日报+SKU利润+库存周转+广告日报（每天凌晨2点，T-1/T-2 estimated + T-3 settled）
      reports-weekly   经营周报+广告周报（每周三凌晨3点，汇总上周）
      reports-monthly  经营月报+广告月报（每月3号凌晨4点，汇总上月）
+     auto-complete    自动完结超期订单：进货单/货代运单创建10天后仍为初始状态，自动变更为已完成并入账（每天凌晨1点）
 
 crontab 示例：
     0 * * * * cd /项目路径 && python scripts/cron_jobs.py inventory >> /var/log/cron_inventory.log 2>&1
@@ -414,6 +415,98 @@ def task_reports_monthly():
         print(f"[{now_str}] [Cron] 月报生成异常: {e}")
 
 
+# ==================== 7. 自动完结超期订单 ====================
+
+def task_auto_complete():
+    """
+    每天凌晨执行：将创建超过 10 天仍为初始状态（status=0）的进货单和货代运单
+    自动变更为最终状态（已完成），并创建对应的支出记录。
+    """
+    from blueprints.supplier import PURCHASE_ORDER_STATUS_INITIAL, PURCHASE_ORDER_STATUS_COMPLETED
+    from blueprints.logistics import WAYBILL_STATUS_INITIAL, WAYBILL_STATUS_COMPLETED
+    from blueprints.expenses import create_expense_for_source
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            # ---------- 进货单 ----------
+            cursor.execute("""
+                SELECT id, order_no, total_amount
+                FROM purchase_orders
+                WHERE status = %s AND created_at <= DATE_SUB(NOW(), INTERVAL 10 DAY)
+            """, (PURCHASE_ORDER_STATUS_INITIAL,))
+            stale_orders = cursor.fetchall()
+
+            if stale_orders:
+                print(f"[{_now_str()}] [Cron] 发现 {len(stale_orders)} 条超期进货单，开始自动完结...")
+                for order in stale_orders:
+                    try:
+                        cursor.execute(
+                            "UPDATE purchase_orders SET status = %s WHERE id = %s",
+                            (PURCHASE_ORDER_STATUS_COMPLETED, order['id'])
+                        )
+                        # 避免重复创建支出记录
+                        cursor.execute(
+                            "SELECT id FROM expenses WHERE source_type = %s AND source_no = %s LIMIT 1",
+                            ('purchase_order', order['order_no'])
+                        )
+                        if not cursor.fetchone() and order['order_no']:
+                            create_expense_for_source(
+                                conn, '采购/货值',
+                                float(order['total_amount'] or 0),
+                                datetime.now().strftime('%Y-%m-%d'),
+                                f"进货单 {order['order_no']}（自动完结）",
+                                'purchase_order', order['order_no'], 'company'
+                            )
+                        print(f"[{_now_str()}] [Cron]   进货单 {order['order_no']} 已自动完结并入账")
+                    except Exception as e:
+                        print(f"[{_now_str()}] [Cron]   进货单 {order.get('order_no')} 自动完结异常: {e}")
+            else:
+                print(f"[{_now_str()}] [Cron] 无超期进货单")
+
+            # ---------- 货代运单 ----------
+            cursor.execute("""
+                SELECT id, waybill_no, total_cost_cny
+                FROM logistics_waybills
+                WHERE status = %s AND created_at <= DATE_SUB(NOW(), INTERVAL 10 DAY)
+            """, (WAYBILL_STATUS_INITIAL,))
+            stale_waybills = cursor.fetchall()
+
+            if stale_waybills:
+                print(f"[{_now_str()}] [Cron] 发现 {len(stale_waybills)} 条超期货代运单，开始自动完结...")
+                for wb in stale_waybills:
+                    try:
+                        cursor.execute(
+                            "UPDATE logistics_waybills SET status = %s WHERE id = %s",
+                            (WAYBILL_STATUS_COMPLETED, wb['id'])
+                        )
+                        if wb['waybill_no']:
+                            cursor.execute(
+                                "SELECT id FROM expenses WHERE source_type = %s AND source_no = %s LIMIT 1",
+                                ('logistics_waybill', wb['waybill_no'])
+                            )
+                            if not cursor.fetchone():
+                                create_expense_for_source(
+                                    conn, '物流/头程',
+                                    float(wb['total_cost_cny'] or 0),
+                                    datetime.now().strftime('%Y-%m-%d'),
+                                    f"运单 {wb['waybill_no']}（自动完结）",
+                                    'logistics_waybill', wb['waybill_no'], 'company'
+                                )
+                        print(f"[{_now_str()}] [Cron]   运单 {wb['waybill_no']} 已自动完结并入账")
+                    except Exception as e:
+                        print(f"[{_now_str()}] [Cron]   运单 {wb.get('waybill_no')} 自动完结异常: {e}")
+            else:
+                print(f"[{_now_str()}] [Cron] 无超期货代运单")
+
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[{_now_str()}] [Cron] 自动完结超期订单异常: {e}")
+    finally:
+        conn.close()
+
+
 # ==================== 入口 ====================
 
 TASK_MAP = {
@@ -429,6 +522,7 @@ TASK_MAP = {
     'reports-daily': task_reports_daily,
     'reports-weekly': task_reports_weekly,
     'reports-monthly': task_reports_monthly,
+    'auto-complete': task_auto_complete,
 }
 
 

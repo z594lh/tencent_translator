@@ -179,7 +179,7 @@ def create_expense_for_source(conn, category, amount, date, remark, source_type,
 # ============================================================
 # 辅助: 构建筛选条件（多个路由共用）
 # ============================================================
-def _build_filter_conditions(month, category, account_type, reimbursed, created_by):
+def _build_filter_conditions(month, category, account_type, reimbursed, created_by, source_no):
     """根据查询参数构建 WHERE 条件和参数列表"""
     conditions = []
     params = []
@@ -207,6 +207,9 @@ def _build_filter_conditions(month, category, account_type, reimbursed, created_
     if created_by:
         conditions.append("e.created_by = %s")
         params.append(int(created_by))
+    if source_no:
+        conditions.append("e.source_no LIKE %s")
+        params.append(f"%{source_no}%")
 
     where_clause = " AND ".join(conditions) if conditions else "1=1"
     return where_clause, tuple(params)
@@ -221,7 +224,7 @@ def _build_filter_conditions(month, category, account_type, reimbursed, created_
 def get_expense_list():
     """
     获取支出列表
-    查询参数: month, category, account_type, reimbursed, created_by, page, page_size
+    查询参数: month, category, account_type, reimbursed, created_by, source_no, page, page_size
     """
     try:
         month = request.args.get('month', '').strip()
@@ -229,6 +232,7 @@ def get_expense_list():
         account_type = request.args.get('account_type', '').strip()
         reimbursed = request.args.get('reimbursed', '').strip()
         created_by = request.args.get('created_by', '').strip()
+        source_no = request.args.get('source_no', '').strip()
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
 
@@ -240,7 +244,7 @@ def get_expense_list():
         conn = get_db_connection()
         try:
             where_clause, where_params = _build_filter_conditions(
-                month, category, account_type, reimbursed, created_by
+                month, category, account_type, reimbursed, created_by, source_no
             )
 
             with conn.cursor() as cursor:
@@ -644,7 +648,7 @@ def upload_invoice_image():
 def get_expense_summary():
     """
     支出统计汇总，支持与列表相同的筛选条件。
-    查询参数: month, category, account_type, reimbursed, created_by
+    查询参数: month, category, account_type, reimbursed, created_by, source_no
     返回:
       total_amount, total_count          — 总计
       by_month  [{month, amount, count}] — 按月汇总
@@ -658,11 +662,12 @@ def get_expense_summary():
         account_type = request.args.get('account_type', '').strip()
         reimbursed = request.args.get('reimbursed', '').strip()
         created_by = request.args.get('created_by', '').strip()
+        source_no = request.args.get('source_no', '').strip()
 
         conn = get_db_connection()
         try:
             where_clause, where_params = _build_filter_conditions(
-                month, category, account_type, reimbursed, created_by
+                month, category, account_type, reimbursed, created_by, source_no
             )
 
             with conn.cursor() as cursor:
