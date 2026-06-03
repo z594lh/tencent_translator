@@ -193,9 +193,17 @@ def _build_filter_conditions(month, category, account_type, reimbursed, created_
     if account_type:
         conditions.append("e.account_type = %s")
         params.append(account_type)
-    if reimbursed in ('0', '1'):
-        conditions.append("e.reimbursed = %s")
-        params.append(int(reimbursed))
+    if reimbursed:
+        val = reimbursed.lower()
+        if val == 'false':
+            conditions.append("e.reimbursed = %s")
+            params.append(0)
+        elif val == 'true':
+            conditions.append("e.reimbursed = %s")
+            params.append(1)
+        elif val in ('0', '1'):
+            conditions.append("e.reimbursed = %s")
+            params.append(int(val))
     if created_by:
         conditions.append("e.created_by = %s")
         params.append(int(created_by))
@@ -642,6 +650,7 @@ def get_expense_summary():
       by_month  [{month, amount, count}] — 按月汇总
       by_category [{category, amount, count}] — 按分类汇总
       by_account_type [{account_type, amount, count}] — 按账户汇总
+      by_reimbursed [{reimbursed, amount, count}] — 按报销状态汇总（0=未报销, 1=已报销）
     """
     try:
         month = request.args.get('month', '').strip()
@@ -700,6 +709,18 @@ def get_expense_summary():
                 """, where_params)
                 by_account_type = cursor.fetchall()
 
+                # 按报销状态汇总
+                cursor.execute(f"""
+                    SELECT e.reimbursed,
+                           COALESCE(SUM(e.amount), 0) as amount,
+                           COUNT(*) as count
+                    FROM expenses e
+                    WHERE {where_clause}
+                    GROUP BY e.reimbursed
+                    ORDER BY e.reimbursed
+                """, where_params)
+                by_reimbursed = cursor.fetchall()
+
                 return jsonify({
                     "status": "success",
                     "data": {
@@ -708,6 +729,7 @@ def get_expense_summary():
                         "by_month": by_month,
                         "by_category": by_category,
                         "by_account_type": by_account_type,
+                        "by_reimbursed": by_reimbursed,
                     }
                 })
         finally:
