@@ -407,6 +407,14 @@ def list_waybills():
                 """, tuple(params + [page_size, offset]))
                 rows = cursor.fetchall()
 
+                # 日期字段统一转 YYYY-MM-DD 字符串
+                date_fields = ['ship_date', 'eta_date', 'arrival_date', 'delivery_date']
+                for row in rows:
+                    for f in date_fields:
+                        val = row.get(f)
+                        if val is not None:
+                            row[f] = val.strftime('%Y-%m-%d') if hasattr(val, 'strftime') else str(val)[:10]
+
                 # 批量附加货件明细（SKU + 中文名 + 数量）
                 if rows:
                     shipment_ids = [row['shipment_id'] for row in rows if row['shipment_id']]
@@ -498,6 +506,11 @@ def get_waybill(waybill_id):
 
                 if not row:
                     return jsonify({"status": "error", "message": "运单不存在"}), 404
+
+                for f in ['ship_date', 'eta_date', 'arrival_date', 'delivery_date']:
+                    val = row.get(f)
+                    if val is not None:
+                        row[f] = val.strftime('%Y-%m-%d') if hasattr(val, 'strftime') else str(val)[:10]
 
                 return jsonify({"status": "success", "data": row})
         finally:
