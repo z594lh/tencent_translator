@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime
 import os
-from blueprints.video_enhanced import video_bp
+
 from config import config
 
 # 导入各个功能模块的 Blueprint
@@ -123,7 +123,7 @@ app.register_blueprint(translation_bp)
 app.register_blueprint(ai_image_bp)
 
 # 注册视频相关路由
-app.register_blueprint(video_bp)
+
 
 # 注册记账路由
 app.register_blueprint(expenses_bp)
