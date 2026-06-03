@@ -337,6 +337,7 @@ def list_waybills():
         provider_id = request.args.get('provider_id', '').strip() or None
         status = request.args.get('status', '').strip() or None
         keyword = request.args.get('keyword', '').strip() or None
+        waybill_no = request.args.get('waybill_no', '').strip() or None
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('page_size', 20))
 
@@ -358,6 +359,10 @@ def list_waybills():
                 if status is not None:
                     conditions.append("wb.status = %s")
                     params.append(int(status))
+
+                if waybill_no:
+                    conditions.append("wb.waybill_no = %s")
+                    params.append(waybill_no)
 
                 if keyword:
                     conditions.append(
