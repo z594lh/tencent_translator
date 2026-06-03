@@ -81,7 +81,7 @@ def parse_crontab():
         r'(.+)$'
     )
 
-    target_script = '/home/root/tencent_translator/scripts/cron_jobs.py'
+    cron_dir = '/home/root/tencent_translator/scripts/cron'
 
     for line in lines:
         line = line.rstrip('\n')
@@ -101,27 +101,24 @@ def parse_crontab():
         if match:
             minute, hour, dom, month, dow, command = match.groups()
 
-            if target_script not in command:
+            # 匹配子模块路径: scripts/cron/xxx.py [--arg]
+            task_name = ''
+            display_command = command
+            m = re.search(r'scripts/cron/(\w+)\.py(?:\s+(--\S+))?', command)
+
+            if m:
+                module = m.group(1)
+                arg = m.group(2) or ''
+                task_name = (module + (f' {arg}' if arg else '')).strip()
+                display_command = f"cron/{module}.py{arg and ' ' + arg or ''}"
+            else:
                 pending_comment = []
                 continue
-
-            task_name = ''
-            m = re.search(r'cron_jobs\.py\s+(\S+)', command)
-            if m:
-                task_name = m.group(1)
 
             log_path = ''
             m = re.search(r'>+\s+(\S+)', command)
             if m:
                 log_path = m.group(1)
-
-            display_command = command
-            if 'cron_jobs.py' in command:
-                parts = command.split()
-                for i, p in enumerate(parts):
-                    if p.endswith('cron_jobs.py') and i + 1 < len(parts):
-                        display_command = f"cron_jobs.py {parts[i + 1]}"
-                        break
 
             raw_desc = ' '.join(pending_comment) if pending_comment else ''
             clean_desc = re.sub(r'=+', '', raw_desc).strip()

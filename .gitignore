@@ -36,6 +36,7 @@ doc/
 docs/
 sql/
 scripts/*
-!scripts/cron_jobs.py
+!scripts/cron/
+!scripts/cron/*
 migrations/
 test.py
