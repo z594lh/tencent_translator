@@ -23,6 +23,7 @@
 # 导入
 # ============================================================
 import io
+import json
 from datetime import datetime, date
 
 import openpyxl
@@ -405,6 +406,59 @@ def list_waybills():
                     LIMIT %s OFFSET %s
                 """, tuple(params + [page_size, offset]))
                 rows = cursor.fetchall()
+
+                # 批量附加货件明细（SKU + 中文名 + 数量）
+                if rows:
+                    shipment_ids = [row['shipment_id'] for row in rows if row['shipment_id']]
+                    if shipment_ids:
+                        placeholders2 = ', '.join(['%s'] * len(shipment_ids))
+                        cursor.execute(f"""
+                            SELECT shipment_id, items_json
+                            FROM amazon_inbound_plan_boxes
+                            WHERE shipment_id IN ({placeholders2})
+                        """, tuple(shipment_ids))
+                        boxes = cursor.fetchall()
+
+                        # 按 shipment_id 聚合 SKU 数量
+                        sku_qty_map = {}  # {shipment_id: {sku: qty}}
+                        all_skus = set()
+                        for box in boxes:
+                            sid = box['shipment_id']
+                            items = json.loads(box.get('items_json') or '[]')
+                            if isinstance(items, list):
+                                for it in items:
+                                    sku = it.get('msku', '')
+                                    qty = int(it.get('quantity', 0))
+                                    if sku:
+                                        sku_qty_map.setdefault(sid, {}).setdefault(sku, 0)
+                                        sku_qty_map[sid][sku] += qty
+                                        all_skus.add(sku)
+
+                        # 批量查产品中文名
+                        sku_name_map = {}
+                        if all_skus:
+                            sku_placeholders = ', '.join(['%s'] * len(all_skus))
+                            cursor.execute(f"""
+                                SELECT seller_sku, COALESCE(product_name, declare_name_cn, '') as product_name
+                                FROM products WHERE seller_sku IN ({sku_placeholders})
+                            """, tuple(all_skus))
+                            for p in cursor.fetchall():
+                                sku_name_map[p['seller_sku']] = p['product_name']
+
+                        # 附加到行
+                        for row in rows:
+                            sid = row['shipment_id']
+                            if sid in sku_qty_map:
+                                row['items'] = [
+                                    {
+                                        'seller_sku': sku,
+                                        'product_name': sku_name_map.get(sku, ''),
+                                        'quantity': qty,
+                                    }
+                                    for sku, qty in sku_qty_map[sid].items()
+                                ]
+                            else:
+                                row['items'] = []
 
                 return jsonify({
                     "status": "success",

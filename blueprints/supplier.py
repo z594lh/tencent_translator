@@ -389,6 +389,27 @@ def list_purchase_orders():
                 """, tuple(params + [page_size, offset]))
                 rows = cursor.fetchall()
 
+                # 批量附加明细（SKU + 中文名 + 数量）
+                if rows:
+                    order_ids = [row['id'] for row in rows]
+                    placeholders2 = ', '.join(['%s'] * len(order_ids))
+                    cursor.execute(f"""
+                        SELECT poi.order_id, poi.seller_sku, poi.quantity,
+                               COALESCE(p.product_name, p.declare_name_cn, '') as product_name
+                        FROM purchase_order_items poi
+                        LEFT JOIN products p ON poi.seller_sku = p.seller_sku
+                        WHERE poi.order_id IN ({placeholders2})
+                    """, tuple(order_ids))
+                    items_map = {}
+                    for item in cursor.fetchall():
+                        items_map.setdefault(item['order_id'], []).append({
+                            'seller_sku': item['seller_sku'],
+                            'product_name': item['product_name'],
+                            'quantity': item['quantity'],
+                        })
+                    for row in rows:
+                        row['items'] = items_map.get(row['id'], [])
+
                 return jsonify({
                     "status": "success",
                     "data": {"list": rows, "total": total, "page": page, "page_size": page_size}
