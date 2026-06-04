@@ -9,7 +9,7 @@
   GET  /api/options/logistics-providers   货代列表
   GET  /api/options/users                 用户列表
   GET  /api/options/amazon/warehouses     FBA 仓库列表（?shop_id=）
-  GET  /api/options/amazon/shipments      FBA 可绑定货件列表
+  GET  /api/options/amazon/shipments      FBA 货件列表
   GET  /api/options/amazon/inbound-plans  亚马逊入仓计划列表
   GET  /api/options/product-board/filters 备货看板筛选选项
 
@@ -74,7 +74,7 @@ def option_products():
                 cursor.execute("""
                     SELECT id, fnsku,declare_name_en,model,seller_sku, COALESCE(product_name, declare_name_cn, '') as product_name
                     FROM products WHERE status = 1
-                    ORDER BY seller_sku
+                    ORDER BY created_at desc
                 """)
                 return jsonify({"status": "success", "data": cursor.fetchall()})
         finally:
@@ -111,7 +111,7 @@ def option_logistics_providers():
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT id, name FROM logistics_providers WHERE status = 1 ORDER BY name")
+                cursor.execute("SELECT id, name FROM logistics_providers WHERE status = 1 ORDER BY created_at DESC")
                 return jsonify({"status": "success", "data": cursor.fetchall()})
         finally:
             conn.close()
@@ -129,7 +129,7 @@ def option_users():
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT id, username, nickname FROM users WHERE status = 1 ORDER BY nickname, username")
+                cursor.execute("SELECT id, username, nickname FROM users WHERE status = 1 ORDER BY created_at desc")
                 return jsonify({"status": "success", "data": cursor.fetchall()})
         finally:
             conn.close()
@@ -151,15 +151,10 @@ def option_amazon_warehouses():
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT marketplace_id FROM amazon_shops WHERE id = %s", (int(shop_id),))
-                shop = cursor.fetchone()
-                if not shop or not shop['marketplace_id']:
-                    return jsonify({"status": "success", "data": []})
-
                 cursor.execute("""
                     SELECT warehouse_id FROM fba_warehouses
-                    WHERE marketplace_id = %s ORDER BY warehouse_id
-                """, (shop['marketplace_id'],))
+                    WHERE shop_id = %s ORDER BY sync_time DESC
+                """, (shop_id,))
                 return jsonify({"status": "success", "data": cursor.fetchall()})
         finally:
             conn.close()
