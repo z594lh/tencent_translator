@@ -549,7 +549,7 @@ class AmazonSpApiClient:
         if page_size:
             params["pageSize"] = page_size
         if next_token:
-            params["nextToken"] = next_token
+            params["pageToken"] = next_token
 
         return self._request("GET", self._listings_base_path(), params=params)
 

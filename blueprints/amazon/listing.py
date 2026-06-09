@@ -1461,6 +1461,9 @@ def _sync_listings(shop_id, included_data=None, page_size=20):
             total_fetched += len(items)
 
             next_token = payload.get('nextToken') or payload.get('pagination', {}).get('nextToken')
+
+            if not items:
+                break
             if not next_token:
                 break
 
