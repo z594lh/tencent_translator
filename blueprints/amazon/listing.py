@@ -1360,6 +1360,13 @@ def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
                     if sched and isinstance(sched, list):
                         our_price = sched[0].get('value_with_tax')
 
+                discounted_price = None
+                dp = off.get('discounted_price', [])
+                if dp and isinstance(dp, list) and dp[0].get('schedule'):
+                    sched = dp[0]['schedule']
+                    if sched and isinstance(sched, list):
+                        discounted_price = sched[0].get('value_with_tax')
+
                 offers.append({
                     'shop_id': shop_id,
                     'sku': sku,
@@ -1367,6 +1374,7 @@ def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
                     'currency': off.get('currency'),
                     'audience': off.get('audience', 'ALL'),
                     'our_price': our_price,
+                    'discounted_price': discounted_price,
                     'start_at': _iso_to_datetime(off.get('start_at', {}).get('value')) if isinstance(off.get('start_at'), dict) else None,
                     'end_at': _iso_to_datetime(off.get('end_at', {}).get('value')) if isinstance(off.get('end_at'), dict) else None,
                 })
@@ -1672,10 +1680,10 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                 for off in offers:
                     cursor.execute(
                         """INSERT INTO amazon_listing_offers
-                           (shop_id, sku, marketplace_id, currency, audience, our_price, start_at, end_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                           (shop_id, sku, marketplace_id, currency, audience, our_price, discounted_price, start_at, end_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         (off['shop_id'], off['sku'], off['marketplace_id'], off['currency'], off['audience'],
-                         off['our_price'], off['start_at'], off['end_at'])
+                         off['our_price'], off['discounted_price'], off['start_at'], off['end_at'])
                     )
 
                 count += 1
@@ -1819,7 +1827,7 @@ def _get_listing_detail_from_db(shop_id, sku):
             row['issues'] = cursor.fetchall()
 
             cursor.execute("""
-                SELECT currency, audience, our_price, start_at, end_at
+                SELECT currency, audience, our_price, discounted_price, start_at, end_at
                 FROM amazon_listing_offers
                 WHERE shop_id = %s AND sku = %s
                 ORDER BY id ASC
