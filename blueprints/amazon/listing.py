@@ -153,9 +153,13 @@ def sync_listings():
             page_size=page_size
         )
 
+        msg = f"同步完成，共处理 {result.get('synced_count', 0)} 条 Listing"
+        deleted = result.get('deleted_listings', 0)
+        if deleted:
+            msg += f"，标记 {deleted} 条已删除"
         return jsonify({
             "status": "success",
-            "message": f"同步完成，共处理 {result.get('synced_count', 0)} 条 Listing",
+            "message": msg,
             "data": result
         })
 
@@ -1471,6 +1475,33 @@ def _sync_listings(shop_id, included_data=None, page_size=20):
 
         synced_count, error, new_skus = sync_listings_to_db(shop_id, marketplace_id, seller_id, all_items)
 
+        deleted_count = 0
+        if not error:
+            amazon_skus = set()
+            for item in all_items:
+                sku = item.get('sku', '')
+                if sku:
+                    amazon_skus.add(sku)
+
+            if amazon_skus:
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cursor:
+                        placeholders = ','.join(['%s'] * len(amazon_skus))
+                        cursor.execute(
+                            f"UPDATE amazon_listings SET is_deleted = 1 WHERE shop_id = %s AND sku NOT IN ({placeholders})",
+                            [shop_id] + list(amazon_skus)
+                        )
+                        deleted_count = cursor.rowcount
+                    conn.commit()
+                except Exception as e:
+                    print(f"[Listing Sync][shop_id={shop_id}] 标记已删除 Listing 失败: {str(e)}")
+                finally:
+                    conn.close()
+
+            if deleted_count:
+                print(f"[Listing Sync][shop_id={shop_id}] 标记 {deleted_count} 条 Amazon 已删除的 Listing")
+
         if new_skus:
             print(f"[Listing Sync][shop_id={shop_id}] 检测到 {len(new_skus)} 个新增 Listing，后台异步同步到产品表...")
             threading.Thread(
@@ -1483,6 +1514,7 @@ def _sync_listings(shop_id, included_data=None, page_size=20):
             "synced_count": synced_count,
             "total_fetched": total_fetched,
             "new_listings": len(new_skus),
+            "deleted_listings": deleted_count,
             "error": error,
             "next_token": None
         }
@@ -1545,7 +1577,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                         list_price, list_price_currency, number_of_items,
                         parent_sku, parentage_level, child_relationship_type, variation_theme,
                         country_of_origin, manufacturer, product_description,
-                        attributes_json, issues_json, sync_time
+                        attributes_json, issues_json, sync_time, is_deleted
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s,
@@ -1553,7 +1585,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                         %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s, NOW()
+                        %s, %s, NOW(), 0
                     )
                     ON DUPLICATE KEY UPDATE
                         asin = VALUES(asin),
@@ -1580,6 +1612,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                         product_description = VALUES(product_description),
                         attributes_json = VALUES(attributes_json),
                         issues_json = VALUES(issues_json),
+                        is_deleted = 0,
                         sync_time = NOW()
                 """
                 cursor.execute(sql_main, (
@@ -1663,7 +1696,7 @@ def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, statu
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = ["shop_id = %s"]
+            conditions = ["shop_id = %s", "is_deleted = 0"]
             params = [shop_id]
 
             if sku:
@@ -1754,7 +1787,7 @@ def _get_listing_detail_from_db(shop_id, sku):
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT * FROM amazon_listings
-                WHERE shop_id = %s AND sku = %s
+                WHERE shop_id = %s AND sku = %s AND is_deleted = 0
             """, (shop_id, sku))
             row = cursor.fetchone()
 
