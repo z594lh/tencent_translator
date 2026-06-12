@@ -47,6 +47,26 @@ def _get_conn():
     return get_db_connection()
 
 
+_PROVIDER_COLUMN_MAPPINGS = {
+    1: {
+        'header_row': 6,
+        'columns': {
+            'waybill_no': 3,
+            'shipment_id': 12,
+            'route_name': 4,
+            'total_cartons': 6,
+            'total_weight_kg': 7,
+            'cost_per_kg': 8,
+            'freight_cost_cny': 9,
+            'misc_cost_cny': 10,
+            'total_cost_cny': 11,
+            'destination_warehouse': 13,
+            'ship_date': 2,
+        },
+    },
+}
+
+
 def _val_or_none(val, cast_type=None):
     """如果值为 None 或空字符串则返回 None，否则按类型转换"""
     if val is None or val == '':
@@ -778,73 +798,16 @@ def delete_waybill(waybill_id):
 # ============================================================
 
 def _find_header_row(ws):
-    """在 Excel 工作表中查找表头行号"""
-    for row_idx in range(1, min(ws.max_row + 1, 10)):
+    """在 Excel 前 20 行中找非空单元格最多的行作为表头行"""
+    best_row = 1
+    best_cnt = 0
+    for row_idx in range(1, min(ws.max_row + 1, 20)):
         row_values = [ws.cell(row=row_idx, column=col).value for col in range(1, ws.max_column + 1)]
-        if any(v and ('运单号' in str(v) or '货代' in str(v)) for v in row_values):
-            return row_idx
-    return 1
-
-
-def _build_col_indices(headers):
-    """根据表头建立字段名到列索引的映射"""
-    index_map = {}
-    for idx, header in enumerate(headers, 1):
-        if header is None:
-            continue
-        h = str(header).strip()
-        if not h:
-            continue
-        h_lower = h.lower()
-        if '运单号' in h:
-            index_map['waybill_no'] = idx
-        elif '货代' in h:
-            index_map['provider_name'] = idx
-        elif '货件' in h or 'shipment' in h_lower:
-            index_map['shipment_id'] = idx
-        elif '运输' in h:
-            index_map['transport_type'] = idx
-        elif '路线' in h or 'route' in h_lower:
-            index_map['route_name'] = idx
-        elif '启运' in h or '起运' in h or 'departure' in h_lower:
-            index_map['departure_port'] = idx
-        elif '目的港' in h or 'destination_port' in h_lower:
-            index_map['destination_port'] = idx
-        elif '目的仓' in h or 'destination_warehouse' in h_lower or '仓库' in h:
-            index_map['destination_warehouse'] = idx
-        elif '重量' in h or 'weight' in h_lower:
-            index_map['total_weight_kg'] = idx
-        elif '体积' in h or 'volume' in h_lower or 'cbm' in h_lower:
-            index_map['total_volume_cbm'] = idx
-        elif '箱数' in h or '件数' in h or 'carton' in h_lower:
-            index_map['total_cartons'] = idx
-        elif '运费' in h or 'freight' in h_lower:
-            index_map['freight_cost_cny'] = idx
-        elif '税' in h or 'tax' in h_lower:
-            index_map['tax_cost_cny'] = idx
-        elif '杂费' in h or 'misc' in h_lower or '其他费' in h:
-            index_map['misc_cost_cny'] = idx
-        elif '总费' in h or '总成本' in h or '合计' in h:
-            index_map['total_cost_cny'] = idx
-        elif '单价' in h or 'cost_per_kg' in h_lower:
-            index_map['cost_per_kg'] = idx
-        elif '币种' in h or 'currency' in h_lower:
-            index_map['currency'] = idx
-        elif '状态' in h:
-            index_map['status'] = idx
-        elif '发货日' in h or 'ship_date' in h_lower or '出运日' in h:
-            index_map['ship_date'] = idx
-        elif '预计' in h or 'ETA' in h_lower or 'eta' in h_lower:
-            index_map['eta_date'] = idx
-        elif '到港' in h or 'arrival' in h_lower:
-            index_map['arrival_date'] = idx
-        elif '签收' in h or 'delivery' in h_lower or '派送' in h:
-            index_map['delivery_date'] = idx
-        elif '跟踪' in h or 'tracking' in h_lower:
-            index_map['tracking_url'] = idx
-        elif '备注' in h or 'remark' in h_lower:
-            index_map['remark'] = idx
-    return index_map
+        cnt = sum(1 for v in row_values if v is not None and str(v).strip())
+        if cnt > best_cnt:
+            best_cnt = cnt
+            best_row = row_idx
+    return best_row
 
 
 def _parse_date(val):
@@ -906,12 +869,17 @@ def import_waybills():
         wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
         ws = wb.active
 
-        header_row = _find_header_row(ws)
-        headers = [ws.cell(row=header_row, column=col).value for col in range(1, ws.max_column + 1)]
-        index_map = _build_col_indices(headers)
+        header_row_str = request.form.get('header_row', '').strip()
+        if provider_id not in _PROVIDER_COLUMN_MAPPINGS:
+            return jsonify({"status": "error", "message": f"货代 {provider_id} 未配置列映射，请联系管理员"}), 400
+        provider_cfg = _PROVIDER_COLUMN_MAPPINGS[provider_id]
+        index_map = provider_cfg['columns']
 
-        if not index_map:
-            return jsonify({"status": "error", "message": "未识别到有效表头，请检查 Excel 格式"}), 400
+        if header_row_str:
+            header_row = int(header_row_str)
+        else:
+            header_row = provider_cfg.get('header_row', 0) or _find_header_row(ws)
+        headers = [ws.cell(row=header_row, column=col).value for col in range(1, ws.max_column + 1)]
 
         conn = _get_conn()
         try:
@@ -921,7 +889,10 @@ def import_waybills():
                     return jsonify({"status": "error", "message": "货代不存在"}), 400
 
                 import_count = 0
+                skip_count = 0
+                row_count = 0
                 for row_idx in range(header_row + 1, ws.max_row + 1):
+                    row_count += 1
                     def get_cell(key):
                         col = index_map.get(key)
                         if col:
@@ -931,6 +902,7 @@ def import_waybills():
                     waybill_no = str(get_cell('waybill_no') or '').strip() or None
                     shipment_id = str(get_cell('shipment_id') or '').strip() or None
                     if not waybill_no and not shipment_id:
+                        skip_count += 1
                         continue
 
                     fields = [
@@ -978,7 +950,14 @@ def import_waybills():
                 return jsonify({
                     "status": "success",
                     "message": f"导入成功，共 {import_count} 条运单",
-                    "data": {"count": import_count}
+                    "data": {
+                        "count": import_count,
+                        "header_row": header_row,
+                        "total_data_rows": row_count,
+                        "skipped_rows": skip_count,
+                        "mapped_columns": dict(index_map),
+                        "raw_headers": [str(h).strip() if h else '' for h in headers]
+                    }
                 })
         finally:
             conn.close()
