@@ -766,6 +766,112 @@ def delete_listing(sku):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@amazon_listing_bp.route('/amazon/listings/<sku>/language', methods=['PATCH'])
+@login_required
+@permission_required('amazon_listings:edit')
+def switch_listing_language(sku):
+    """
+    切换 Listing 所有节点的 language_tag 并提交到 SP-API
+    先从 SP-API 拉取最新数据，统一修改所有 language_tag，再推送回亚马逊
+    请求体（必填）:
+        shop_id       - 店铺ID
+        language_tag  - 目标语言标签 (zh_CN 或 en_US)
+    """
+    try:
+        data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
+        language_tag = data.get('language_tag', '').strip()
+
+        if language_tag not in ('zh_CN', 'en_US'):
+            return jsonify({"status": "error", "message": "language_tag 必须是 zh_CN 或 en_US"}), 400
+
+        client = get_sp_api_client(shop_id=shop_id)
+        seller_id = client.seller_id or ''
+        marketplace_id = client.marketplace_id
+        included_data = ["summaries", "attributes", "issues"]
+
+        result = client.get_listings_item(sku=sku, included_data=included_data)
+        if not result or not isinstance(result, dict) or not result.get('sku'):
+            return jsonify({
+                "status": "error",
+                "message": f"SP-API 未返回 Listing {sku} 数据"
+            }), 404
+
+        summaries = result.get('summaries', [])
+        summary = summaries[0] if summaries and isinstance(summaries, list) else {}
+        product_type = summary.get('productType', '')
+        condition_type = summary.get('conditionType')
+
+        attributes = result.get('attributes', {})
+        if not attributes or not isinstance(attributes, dict):
+            return jsonify({"status": "error", "message": "SP-API 返回数据缺少 attributes"}), 400
+
+        attrs_updated = _normalize_attributes_language(attributes, language_tag)
+
+        sp_result = client.put_listings_item(
+            sku=sku,
+            product_type=product_type,
+            attributes=attributes,
+            requirements="LISTING",
+            condition_type=condition_type
+        )
+
+        synced_count, error, _ = sync_listings_to_db(
+            shop_id, marketplace_id, seller_id, [result]
+        )
+        if error:
+            return jsonify({"status": "error", "message": f"同步到数据库失败: {error}"}), 500
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE amazon_listing_bullets
+                    SET language_tag = %s
+                    WHERE shop_id = %s AND sku = %s
+                """, (language_tag, shop_id, sku))
+                bullets_updated = cursor.rowcount
+
+                cursor.execute("""
+                    SELECT attributes_json FROM amazon_listings
+                    WHERE shop_id = %s AND sku = %s AND is_deleted = 0
+                """, (shop_id, sku))
+                row = cursor.fetchone()
+
+                if row:
+                    db_attributes = json.loads(row.get('attributes_json', '{}')) if row.get('attributes_json') else {}
+                    _normalize_attributes_language(db_attributes, language_tag)
+                    cursor.execute("""
+                        UPDATE amazon_listings
+                        SET attributes_json = %s
+                        WHERE shop_id = %s AND sku = %s
+                    """, (json.dumps(db_attributes, ensure_ascii=False), shop_id, sku))
+
+                conn.commit()
+        finally:
+            conn.close()
+
+        detail = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
+
+        return jsonify({
+            "status": "success",
+            "message": f"语言切换成功，共更新 {bullets_updated + attrs_updated} 个节点，已同步至亚马逊",
+            "data": {
+                "bullets_updated": bullets_updated,
+                "attributes_updated": attrs_updated,
+                "language_tag": language_tag,
+                "sp_api_result": sp_result,
+                "listing": detail
+            }
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Amazon Listing] 语言切换异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @amazon_listing_bp.route('/amazon/listings/upload-image', methods=['POST'])
 @login_required
 @permission_required('amazon_listings:upload_image')
@@ -1229,6 +1335,67 @@ def _extract_first_media_location(attr_list):
         if isinstance(item, dict) and item.get('media_location'):
             return item['media_location']
     return None
+
+
+def _update_language_tags(obj, language_tag):
+    """递归更新 JSON 对象中所有的 language_tag 字段（用于深层嵌套）"""
+    count = 0
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == 'language_tag' and isinstance(value, str) and value != language_tag:
+                obj[key] = language_tag
+                count += 1
+            else:
+                count += _update_language_tags(value, language_tag)
+    elif isinstance(obj, list):
+        for item in obj:
+            count += _update_language_tags(item, language_tag)
+    return count
+
+
+def _normalize_attributes_language(attributes, language_tag):
+    """
+    规范化 attributes 中所有条目的 language_tag：
+    - 若某属性数组中已有目标语言条目，删除其他语言条目
+    - 若没有目标语言条目，切换所有语言条目的 tag
+    - 同时递归更新深层嵌套的 language_tag
+    """
+    count = 0
+    if not isinstance(attributes, dict):
+        return count
+
+    for key, value in list(attributes.items()):
+        if isinstance(value, list) and len(value) > 0:
+            target_entries = []
+            other_lang_entries = []
+            no_tag_entries = []
+
+            for item in value:
+                if isinstance(item, dict) and 'language_tag' in item:
+                    if item['language_tag'] == language_tag:
+                        target_entries.append(item)
+                    else:
+                        other_lang_entries.append(item)
+                else:
+                    no_tag_entries.append(item)
+                    count += _update_language_tags(item, language_tag)
+
+            if target_entries and other_lang_entries:
+                attributes[key] = target_entries + no_tag_entries
+                count += len(other_lang_entries)
+            elif not target_entries and other_lang_entries:
+                for item in other_lang_entries:
+                    item['language_tag'] = language_tag
+                    count += 1
+                    count += _update_language_tags(item, language_tag)
+
+        elif isinstance(value, list):
+            for item in value:
+                count += _update_language_tags(item, language_tag)
+        elif isinstance(value, dict):
+            count += _normalize_attributes_language(value, language_tag)
+
+    return count
 
 
 def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
