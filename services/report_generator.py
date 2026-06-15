@@ -217,7 +217,7 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     total_headway = Decimal('0')
     for sku, qty in sku_qty.items():
         try:
-            unit_costs = get_unit_costs(cursor, sku, exchange_rate)
+            unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
             total_product_cost += Decimal(str(unit_costs.purchase_cost)) * qty
             total_headway += Decimal(str(unit_costs.headway_cost)) * qty
         except Exception as e:
@@ -674,7 +674,7 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         avg_price = Decimal(str(row['avg_price'] or 0))
 
                         # 统一成本入口（2026-05-26 重构）
-                        unit_costs = get_unit_costs(cursor, sku, exchange_rate)
+                        unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
                         product_name = unit_costs.product_name or ''
 
                         # 广告费（按 ASIN 汇总，无数据则记0）
@@ -880,7 +880,7 @@ def generate_inventory_turnover(shop_id=None):
                         suggested = max(0, int((avg_daily_sales * Decimal('60') - Decimal(str(total_available))).to_integral_value(rounding=ROUND_HALF_UP)))
 
                         # 单位成本（统一入口，2026-05-26 重构）
-                        unit_costs = get_unit_costs(cursor, sku, exchange_rate)
+                        unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
                         unit_cost = unit_costs.purchase_cost_usd + unit_costs.headway_cost_usd
 
                         inventory_value = unit_cost * Decimal(str(current_stock))

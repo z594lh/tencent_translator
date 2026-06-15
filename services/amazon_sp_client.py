@@ -387,6 +387,91 @@ class AmazonSpApiClient:
             params=params,
         )
 
+    # -------------------- Product Fees API --------------------
+
+    def get_my_fees_estimate(self, sku: str, price_usd: float, price_currency: str = "USD") -> dict:
+        """
+        获取商品预估费用（佣金 + FBA配送费）
+
+        简介: 调用 Product Fees API v0，用 SKU 端点，传当前售价，返回 ReferralFee 和 FBA 费用。
+
+        Args:
+            sku: 商品 SKU (SellerSKU)
+            price_usd: 当前售价（USD），后端自动从 amazon_listing_offers 获取
+            price_currency: 币种，默认 USD
+
+        Returns:
+            {
+                "referral_fee": float,   # 佣金金额
+                "fba_fee": float,        # FBA配送费总额
+                "currency": str,         # 币种
+                "fees_detail": dict,     # 原始费用明细 {FeeType: amount}
+                "raw": dict              # API原始响应
+            }
+            失败返回 None
+        """
+        body = {
+            "FeesEstimateRequest": {
+                "MarketplaceId": self.marketplace_id,
+                "IsAmazonFulfilled": True,
+                "PriceToEstimateFees": {
+                    "ListingPrice": {
+                        "CurrencyCode": price_currency,
+                        "Amount": float(price_usd),
+                    }
+                },
+                "Identifier": sku,
+                "IdType": "SellerSKU",
+            }
+        }
+        try:
+            resp = self._request(
+                "POST",
+                f"/products/fees/v0/listings/{sku}/feesEstimate",
+                json_data=body,
+            )
+        except Exception as e:
+            print(f"[SP-API Fees] 请求异常: {e}")
+            return None
+
+        try:
+            payload = resp.get("payload", resp) if isinstance(resp, dict) else {}
+            result = payload.get("FeesEstimateResult", {}) if isinstance(payload, dict) else {}
+            if result.get("Status") != "Success":
+                error = result.get("Error", {})
+                print(f"[SP-API Fees] API返回错误: {error.get('Message', 'Unknown error')}")
+                return None
+
+            fee_detail_list = result.get("FeesEstimate", {}).get("FeeDetailList", [])
+            if not fee_detail_list:
+                print("[SP-API Fees] 未返回费用明细")
+                return None
+
+            referral_fee = 0.0
+            fba_fee = 0.0
+            fees_detail = {}
+
+            for fee in fee_detail_list:
+                fee_type = fee.get("FeeType", "")
+                amount = float(fee.get("FeeAmount", {}).get("Amount", 0))
+                fees_detail[fee_type] = amount
+
+                if fee_type == "ReferralFee":
+                    referral_fee = amount
+                elif "FBA" in fee_type or fee_type.startswith("FBAPerUnit"):
+                    fba_fee += amount
+
+            return {
+                "referral_fee": referral_fee,
+                "fba_fee": fba_fee,
+                "currency": price_currency,
+                "fees_detail": fees_detail,
+                "raw": resp,
+            }
+        except Exception as e:
+            print(f"[SP-API Fees] 解析响应异常: {e}")
+            return None
+
     # -------------------- Catalog Items API --------------------
 
     def search_catalog_items(

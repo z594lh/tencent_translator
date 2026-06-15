@@ -147,48 +147,165 @@ def get_exchange_rate(cursor, from_currency: str = "CNY", to_currency: str = "US
     return _DEFAULT_EXCHANGE_RATE
 
 
-def get_commission_rate(cursor, seller_sku: str) -> Tuple[Decimal, str]:
+def get_commission_rate(cursor, seller_sku: str, shop_id: int = None) -> Tuple[Decimal, str]:
     """
-    根据 products.category_id 查佣金比例。
+    从 amazon_product_fees 按 SKU 查佣金比例。
+
     返回 (commission_rate, source)
     """
     try:
-        cursor.execute(
-            "SELECT category_id FROM products WHERE seller_sku = %s LIMIT 1",
-            (seller_sku,),
-        )
+        sql = "SELECT commission_rate FROM amazon_product_fees WHERE sku = %s"
+        params = [seller_sku]
+        if shop_id is not None:
+            sql += " AND shop_id = %s"
+            params.append(shop_id)
+        sql += " ORDER BY fetched_at DESC LIMIT 1"
+        cursor.execute(sql, tuple(params))
         row = cursor.fetchone()
-        if row and row.get("category_id"):
-            cid = int(row["category_id"])
-            cursor.execute(
-                "SELECT commission_rate FROM category_commission_rates WHERE id = %s LIMIT 1",
-                (cid,),
-            )
-            r = cursor.fetchone()
-            if r and r.get("commission_rate") is not None:
-                return Decimal(str(r["commission_rate"])), f"product_category_id:{cid}"
+        if row and row.get("commission_rate") is not None:
+            return Decimal(str(row["commission_rate"])), f"amazon_product_fees (SKU: {seller_sku})"
     except Exception:
         pass
     return _DEFAULT_COMMISSION_RATE, "default:0.15"
 
 
-def get_fba_fee(cursor, billable_weight_kg) -> Tuple[Decimal, Optional[str]]:
-    """根据计费重量查 FBA 配送费，返回 (fee_usd, tier_name)"""
-    w = float(billable_weight_kg)
-    cursor.execute(
-        """
-        SELECT fee_usd, tier_name FROM fba_tier_fees
-        WHERE weight_min_kg <= %s
-          AND (weight_max_kg IS NULL OR weight_max_kg > %s)
-        ORDER BY weight_min_kg DESC
-        LIMIT 1
-        """,
-        (w, w),
-    )
-    row = cursor.fetchone()
-    if row and row.get("fee_usd") is not None:
-        return Decimal(str(row["fee_usd"])), row.get("tier_name")
+def get_fba_fee(cursor, billable_weight_kg, seller_sku: str = None, shop_id: int = None) -> Tuple[Decimal, Optional[str]]:
+    """
+    从 amazon_product_fees 按 SKU 查 FBA 配送费。
+
+    返回 (fee_usd, tier_name)
+    """
+    try:
+        if seller_sku:
+            sql = "SELECT fba_fee FROM amazon_product_fees WHERE sku = %s"
+            params = [seller_sku]
+            if shop_id is not None:
+                sql += " AND shop_id = %s"
+                params.append(shop_id)
+            sql += " ORDER BY fetched_at DESC LIMIT 1"
+            cursor.execute(sql, tuple(params))
+            row = cursor.fetchone()
+            if row and row.get("fba_fee") is not None:
+                fee = Decimal(str(row["fba_fee"]))
+                return fee, f"amazon_product_fees (SKU: {seller_sku})"
+    except Exception:
+        pass
     return _DEFAULT_FBA_FEE, "Small Standard (default)"
+
+
+def _upsert_product_fee(shop_id: int, sku: str, asin: str, commission_rate: Decimal, fba_fee: Decimal):
+    """将 API 获取的费率写入 amazon_product_fees 缓存表（SKU维度）"""
+    try:
+        from services.mysql_service import get_db_connection
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO amazon_product_fees (shop_id, sku, asin, commission_rate, fba_fee, currency, fetched_at)
+                       VALUES (%s, %s, %s, %s, %s, 'USD', NOW())
+                       ON DUPLICATE KEY UPDATE
+                           asin = VALUES(asin),
+                           commission_rate = VALUES(commission_rate),
+                           fba_fee = VALUES(fba_fee),
+                           fetched_at = NOW()""",
+                    (shop_id, sku, asin, float(commission_rate), float(fba_fee)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[ProfitCalculator] 写入缓存表失败 (sku={sku}): {e}")
+
+
+def get_fees_from_api(seller_sku: str, shop_id: int) -> dict:
+    """
+    实时从 Amazon Product Fees API 获取佣金比例+FBA费用。
+    传固定 $10 参考价，拿到 ReferralFee 金额反除得比例（与售价无关）。
+
+    Returns:
+        {
+            "commission_rate": Decimal,   # 佣金比例 (如 0.15)
+            "fba_fee_usd": Decimal,       # FBA配送费(USD)
+            "success": bool,
+            "source": str,
+        }
+    """
+    _REF_PRICE = 10.0
+    result = {"commission_rate": _DEFAULT_COMMISSION_RATE, "fba_fee_usd": _DEFAULT_FBA_FEE,
+              "success": False, "source": "default"}
+
+    try:
+        from services.shop_service import get_sp_api_client as _get_client
+        from services.mysql_service import get_db_connection
+
+        client = _get_client(shop_id=shop_id)
+        if not client.marketplace_id:
+            result["source"] = "api_skipped: no marketplace_id"
+            return result
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT asin FROM products WHERE seller_sku = %s LIMIT 1", (seller_sku,))
+                prod = cursor.fetchone()
+        finally:
+            conn.close()
+
+        asin = prod.get("asin") if prod else ""
+        if not asin:
+            result["source"] = "api_skipped: no asin"
+            return result
+
+        fee_data = client.get_my_fees_estimate(sku=seller_sku, price_usd=_REF_PRICE)
+        if not fee_data:
+            result["source"] = "api_failed: no response"
+            return result
+
+        referral_amount = Decimal(str(fee_data["referral_fee"]))
+        fba_fee = Decimal(str(fee_data["fba_fee"]))
+
+        commission_rate = referral_amount / Decimal(str(_REF_PRICE))
+        commission_rate = commission_rate.quantize(Decimal("0.0001"))
+
+        result["commission_rate"] = commission_rate
+        result["fba_fee_usd"] = fba_fee
+        result["success"] = True
+        result["source"] = f"Amazon Product Fees API (SKU: {seller_sku}, ref_price=${_REF_PRICE})"
+
+        _upsert_product_fee(shop_id, seller_sku, asin, commission_rate, fba_fee)
+
+        return result
+    except Exception as e:
+        print(f"[ProfitCalculator] API费率获取失败: {e}")
+        result["source"] = f"api_failed: {str(e)[:100]}"
+        return result
+
+
+def get_unit_costs_with_api(cursor, seller_sku: str, exchange_rate: Decimal,
+                            shop_id: Optional[int] = None) -> UnitCostBreakdown:
+    """
+    优先 API 获取佣金比例+FBA费用，失败则 fallback 到 amazon_product_fees 缓存表。
+    与 get_unit_costs 返回相同结构，额外记录数据来源。
+    """
+    result = get_unit_costs(cursor, seller_sku, exchange_rate)
+
+    if shop_id is None:
+        result.sources["fee_method"] = "amazon_product_fees (no shop_id)"
+        return result
+
+    api_result = get_fees_from_api(seller_sku=seller_sku, shop_id=shop_id)
+
+    if api_result["success"]:
+        result.commission_rate = api_result["commission_rate"]
+        result.fba_fee_usd = api_result["fba_fee_usd"]
+        result.fba_tier = "API实时费率"
+        result.sources["commission"] = api_result["source"]
+        result.sources["fba"] = api_result["source"]
+        result.sources["fee_method"] = "api"
+    else:
+        result.sources["fee_method"] = f"amazon_product_fees (fallback: {api_result['source']})"
+
+    return result
 
 
 def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, dict]:
@@ -339,7 +456,8 @@ def get_purchase_cost(cursor, seller_sku: str, exchange_rate: Decimal) -> Tuple[
 # 统一对外接口
 # ---------------------------------------------------------------------------
 
-def get_unit_costs(cursor, seller_sku: str, exchange_rate: Optional[Decimal] = None) -> UnitCostBreakdown:
+def get_unit_costs(cursor, seller_sku: str, exchange_rate: Optional[Decimal] = None,
+                   shop_id: Optional[int] = None) -> UnitCostBreakdown:
     """
     统一获取单件 SKU 的全部单位成本。
     这是「利润计算」的唯一入口，所有需要成本拆分的地方都应调用此函数。
@@ -348,6 +466,7 @@ def get_unit_costs(cursor, seller_sku: str, exchange_rate: Optional[Decimal] = N
         cursor: 数据库游标
         seller_sku: SKU
         exchange_rate: 汇率，传 None 则自动查询
+        shop_id: 店铺ID，传则从 amazon_product_fees 表读取费率
 
     Returns:
         UnitCostBreakdown 数据类
@@ -388,7 +507,7 @@ def get_unit_costs(cursor, seller_sku: str, exchange_rate: Optional[Decimal] = N
     if result.weight_kg is not None:
         bw = get_billable_weight(result.weight_kg, prod.get("dimensions_cm") if prod else None)
         result.billable_weight_kg = bw
-        fba_fee, fba_tier = get_fba_fee(cursor, bw)
+        fba_fee, fba_tier = get_fba_fee(cursor, bw, seller_sku=seller_sku, shop_id=shop_id)
         result.fba_fee_usd = fba_fee
         result.fba_tier = fba_tier
         result.sources["fba"] = f"tier:{fba_tier}, weight:{float(bw):.3f}kg"
@@ -397,7 +516,7 @@ def get_unit_costs(cursor, seller_sku: str, exchange_rate: Optional[Decimal] = N
         result.sources["fba"] = "default: weight not found"
 
     # 佣金
-    comm_rate, comm_src = get_commission_rate(cursor, seller_sku)
+    comm_rate, comm_src = get_commission_rate(cursor, seller_sku, shop_id=shop_id)
     result.commission_rate = comm_rate
     result.sources["commission"] = comm_src
 

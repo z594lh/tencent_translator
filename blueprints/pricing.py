@@ -16,6 +16,7 @@ from services.mysql_service import get_db_connection
 from blueprints.user_auth import login_required, permission_required
 from services.profit_calculator import (
     get_unit_costs,
+    get_unit_costs_with_api,
     get_exchange_rate,
     calculate_suggested_price,
 )
@@ -64,13 +65,17 @@ def _build_calc_node(variable_name, variable_label, variable_value=None, formula
     }
 
 
-def _calculate_with_tree(cursor, seller_sku, target_profit_rate, ad_rate, refund_rate):
+def _calculate_with_tree(cursor, seller_sku, target_profit_rate, ad_rate, refund_rate,
+                         shop_id=None):
     """
     执行单个 SKU 的售价计算，并返回 (result_dict, error_msg, calc_tree)。
-    calc_tree 为计算过程树形结构，供前端追溯。
+    传 shop_id 则实时调 Amazon API 获取准确费率，不传则走缓存表。
     """
     exchange_rate = get_exchange_rate(cursor, 'CNY', 'USD')
-    costs = get_unit_costs(cursor, seller_sku, exchange_rate)
+    if shop_id is not None:
+        costs = get_unit_costs_with_api(cursor, seller_sku, exchange_rate, shop_id)
+    else:
+        costs = get_unit_costs(cursor, seller_sku, exchange_rate)
 
     headway_detail = costs.sources.get("headway", {})
     shipment_id = headway_detail.get("shipment_id")
@@ -203,9 +208,10 @@ def _calculate_with_tree(cursor, seller_sku, target_profit_rate, ad_rate, refund
     fba_node = _build_calc_node(
         "fba_fee_usd", VARIABLE_LABELS.get("fba_fee_usd"),
         f"{float(costs.fba_fee_usd):.2f}",
-        f"查表计费重量({float(costs.billable_weight_kg):.4f}kg)对应 tier",
-        source_table="fba_tier_fees", source_field="fee_usd",
-        source_condition=f"WHERE weight_min_kg <= {float(costs.billable_weight_kg):.4f} AND (weight_max_kg IS NULL OR weight_max_kg > {float(costs.billable_weight_kg):.4f})",
+        f"计费重量({float(costs.billable_weight_kg):.4f}kg)对应费率",
+        source_table="amazon_product_fees" if costs.sources.get("fee_method", "").startswith("amazon")
+        else "Amazon Product Fees API", source_field="fba_fee",
+        source_condition=costs.sources.get("fba", ""),
         source_value=f"{float(costs.fba_fee_usd):.2f}",
         is_leaf=1,
     )
@@ -223,8 +229,9 @@ def _calculate_with_tree(cursor, seller_sku, target_profit_rate, ad_rate, refund
         "commission_rate", VARIABLE_LABELS.get("commission_rate"),
         f"{float(costs.commission_rate):.4f}",
         None,
-        source_table="category_commission_rates", source_field="commission_rate",
-        source_condition=f"JOIN products ON category_commission_rates.id = products.category_id WHERE products.seller_sku = '{seller_sku}'",
+        source_table="amazon_product_fees" if costs.sources.get("fee_method", "").startswith("amazon")
+        else "Amazon Product Fees API", source_field="commission_rate",
+        source_condition=costs.sources.get("commission", ""),
         source_value=f"{float(costs.commission_rate):.4f}" if costs.commission_rate != Decimal("0.15") else "0.15 (default)",
         is_leaf=1,
     )
@@ -304,9 +311,10 @@ def calculate_price():
     SKU 售价反算接口（含计算过程树）
     请求体:
       seller_sku           必填  SKU
-      target_profit_rate   必填  目标利润率(小数)
-      ad_rate              必填  广告费率(ACoS)
-      refund_rate          必填  退货率
+       target_profit_rate   必填  目标利润率(小数)
+       ad_rate              必填  广告费率(ACoS)
+       refund_rate          必填  退货率
+       shop_id              可选  店铺ID，传则自动取当前售价调 Amazon API 获取实时费率
     """
     try:
         data = request.get_json() or {}
@@ -325,6 +333,13 @@ def calculate_price():
         ad_rate = Decimal(str(data.get('ad_rate', 0.20)))
         refund_rate = Decimal(str(data.get('refund_rate', 0.03)))
 
+        shop_id = data.get('shop_id')
+        if shop_id is not None:
+            try:
+                shop_id = int(shop_id)
+            except (ValueError, TypeError):
+                return jsonify({"status": "error", "message": "shop_id 必须是整数"}), 400
+
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
@@ -340,7 +355,8 @@ def calculate_price():
                     return jsonify({"status": "error", "message": "未找到该 SKU 的采购成本"}), 400
 
                 result, err, calc_tree = _calculate_with_tree(
-                    cursor, seller_sku, target_profit_rate, ad_rate, refund_rate
+                    cursor, seller_sku, target_profit_rate, ad_rate, refund_rate,
+                    shop_id=shop_id
                 )
 
                 if err:
