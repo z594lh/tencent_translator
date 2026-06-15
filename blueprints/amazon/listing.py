@@ -1871,52 +1871,60 @@ def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, statu
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = ["shop_id = %s", "is_deleted = 0"]
+            conditions = ["l.shop_id = %s", "l.is_deleted = 0"]
             params = [shop_id]
 
             if sku:
-                conditions.append("sku = %s")
+                conditions.append("l.sku = %s")
                 params.append(sku)
             if asin:
-                conditions.append("asin = %s")
+                conditions.append("l.asin = %s")
                 params.append(asin)
             if product_type:
-                conditions.append("product_type = %s")
+                conditions.append("l.product_type = %s")
                 params.append(product_type)
             if status:
-                conditions.append("status LIKE %s")
+                conditions.append("l.status LIKE %s")
                 params.append(f"%{status}%")
             if parent_sku:
-                conditions.append("parent_sku = %s")
+                conditions.append("l.parent_sku = %s")
                 params.append(parent_sku)
             if keyword:
-                conditions.append("(item_name LIKE %s OR brand LIKE %s OR sku LIKE %s)")
+                conditions.append("(l.item_name LIKE %s OR l.brand LIKE %s OR l.sku LIKE %s)")
                 like = f"%{keyword}%"
                 params.extend([like, like, like])
             if has_issues and has_issues.lower() in ('1', 'true', 'yes', 'on'):
                 conditions.append(
-                    "EXISTS (SELECT 1 FROM amazon_listing_issues WHERE shop_id = amazon_listings.shop_id AND sku = amazon_listings.sku)"
+                    "EXISTS (SELECT 1 FROM amazon_listing_issues WHERE shop_id = l.shop_id AND sku = l.sku)"
                 )
-
             where_clause = " AND ".join(conditions)
 
-            cursor.execute(f"SELECT COUNT(*) as total FROM amazon_listings WHERE {where_clause}", tuple(params))
+            cursor.execute(f"SELECT COUNT(*) as total FROM amazon_listings l WHERE {where_clause}", tuple(params))
             total = cursor.fetchone()['total']
 
             offset = (page - 1) * page_size
             sql = f"""
                 SELECT
-                    id, shop_id, marketplace_id, seller_id, sku, asin, product_type,
-                    condition_type, status, fn_sku, item_name, brand,
-                    created_date, last_updated_date,
-                    main_image_url, main_image_height, main_image_width,
-                    list_price, list_price_currency, number_of_items,
-                    parent_sku, parentage_level, child_relationship_type, variation_theme,
-                    country_of_origin, manufacturer,
-                    sync_time, created_at, updated_at
-                FROM amazon_listings
+                    l.id, l.shop_id, l.marketplace_id, l.seller_id, l.sku, l.asin, l.product_type,
+                    l.condition_type, l.status, l.fn_sku, l.item_name, l.brand,
+                    l.created_date, l.last_updated_date,
+                    l.main_image_url, l.main_image_height, l.main_image_width,
+                    o.our_price,
+                    o.discounted_price,
+                    o.currency,
+                    l.number_of_items,
+                    l.parent_sku, l.parentage_level, l.child_relationship_type, l.variation_theme,
+                    l.country_of_origin, l.manufacturer,
+                    l.sync_time, l.created_at, l.updated_at
+                FROM amazon_listings l
+                LEFT JOIN amazon_listing_offers o
+                    ON o.shop_id = l.shop_id AND o.sku = l.sku AND o.audience = 'ALL'
+                    AND o.id = (
+                        SELECT MIN(o2.id) FROM amazon_listing_offers o2
+                        WHERE o2.shop_id = l.shop_id AND o2.sku = l.sku AND o2.audience = 'ALL'
+                    )
                 WHERE {where_clause}
-                ORDER BY last_updated_date DESC
+                ORDER BY l.created_date DESC, l.last_updated_date DESC
                 LIMIT %s OFFSET %s
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
