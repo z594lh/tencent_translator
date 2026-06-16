@@ -1607,9 +1607,11 @@ def _auto_sync_products(shop_id, skus):
     print(f"[AutoSync][shop_id={shop_id}] 异步产品同步完成")
 
 
-def _sync_listings(shop_id, included_data=None, page_size=20):
+def _sync_listings(shop_id, included_data=None, page_size=20, sync_products_async=True):
     """
     同步 Listing 数据到数据库（自动处理分页）
+    sync_products_async=True: 后台线程异步同步产品表（适合前端接口，秒返）
+    sync_products_async=False: 同步等待产品表写入完成（适合 cron，避免进程退出杀线程）
     """
     client = get_sp_api_client(shop_id=shop_id)
     seller_id = client.seller_id or ''
@@ -1678,12 +1680,16 @@ def _sync_listings(shop_id, included_data=None, page_size=20):
                 print(f"[Listing Sync][shop_id={shop_id}] 标记 {deleted_count} 条 Amazon 已删除的 Listing")
 
         if new_skus:
-            print(f"[Listing Sync][shop_id={shop_id}] 检测到 {len(new_skus)} 个新增 Listing，后台异步同步到产品表...")
-            threading.Thread(
-                target=_auto_sync_products,
-                args=(shop_id, new_skus),
-                daemon=True
-            ).start()
+            if sync_products_async:
+                print(f"[Listing Sync][shop_id={shop_id}] 检测到 {len(new_skus)} 个新增 Listing，后台异步同步到产品表...")
+                threading.Thread(
+                    target=_auto_sync_products,
+                    args=(shop_id, new_skus),
+                    daemon=True
+                ).start()
+            else:
+                print(f"[Listing Sync][shop_id={shop_id}] 检测到 {len(new_skus)} 个新增 Listing，同步到产品表...")
+                _auto_sync_products(shop_id, new_skus)
 
         return {
             "synced_count": synced_count,

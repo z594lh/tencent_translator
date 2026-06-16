@@ -26,7 +26,8 @@ def run():
             result = _sync_listings(
                 shop_id=shop_id,
                 included_data=["summaries", "attributes", "issues"],
-                page_size=20
+                page_size=20,
+                sync_products_async=False
             )
             err_msg = f", error={result['error']}" if result.get('error') else ''
             print(f"[{_now_str()}] [Cron] 店铺[{shop_name}] Listing 同步完成: synced={result.get('synced_count', 0)}, fetched={result.get('total_fetched', 0)}{err_msg}")
