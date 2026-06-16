@@ -14,6 +14,8 @@
   按实际销售额/销量计算利润（适用于日报、SKU利润表、库存估值）。
 - calculate_suggested_price(fixed_cost_usd, commission_rate, ad_rate, refund_rate, target_profit_rate)
   售价反推（适用于定价模块）。
+- calculate_profit_rate(fixed_cost_usd, selling_price, commission_rate, ad_rate, refund_rate)
+  售价反推利润率（适用于定价模块）。
 """
 
 import json
@@ -604,6 +606,7 @@ def calculate_suggested_price(
             "commission": None,
             "ad_cost": None,
             "refund_cost": None,
+            "variable_cost": None,
             "total_cost": None,
             "profit_amount": None,
             "actual_profit_rate": None,
@@ -617,7 +620,8 @@ def calculate_suggested_price(
     commission = suggested_price * commission_rate
     ad_cost = suggested_price * ad_rate
     refund_cost = suggested_price * refund_rate
-    total_cost = fixed_cost_usd + commission + ad_cost + refund_cost
+    variable_cost = commission + ad_cost + refund_cost
+    total_cost = fixed_cost_usd + variable_cost
     profit_amount = suggested_price - total_cost
     actual_profit_rate = profit_amount / suggested_price if suggested_price > 0 else Decimal("0")
 
@@ -626,8 +630,58 @@ def calculate_suggested_price(
         "commission": commission.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "ad_cost": ad_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "refund_cost": refund_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "variable_cost": variable_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "total_cost": total_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "profit_amount": profit_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "actual_profit_rate": actual_profit_rate.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        "calc_note": None,
+    }
+
+
+def calculate_profit_rate(
+    fixed_cost_usd: Decimal,
+    selling_price: Decimal,
+    commission_rate: Decimal,
+    ad_rate: Decimal,
+    refund_rate: Decimal,
+) -> dict:
+    """
+    售价反推利润率（pricing.py 专用）。
+
+    公式：
+      variable_cost = selling_price * (commission_rate + ad_rate + refund_rate)
+      total_cost = fixed_cost + variable_cost
+      profit_amount = selling_price - total_cost
+      profit_rate = profit_amount / selling_price
+    """
+    if selling_price <= 0:
+        return {
+            "profit_rate": None,
+            "commission": None,
+            "ad_cost": None,
+            "refund_cost": None,
+            "variable_cost": None,
+            "total_cost": None,
+            "profit_amount": None,
+            "calc_note": "售价必须大于 0",
+        }
+
+    variable_rate = commission_rate + ad_rate + refund_rate
+    commission = selling_price * commission_rate
+    ad_cost = selling_price * ad_rate
+    refund_cost = selling_price * refund_rate
+    variable_cost = commission + ad_cost + refund_cost
+    total_cost = fixed_cost_usd + variable_cost
+    profit_amount = selling_price - total_cost
+    profit_rate = profit_amount / selling_price
+
+    return {
+        "profit_rate": profit_rate.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        "commission": commission.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "ad_cost": ad_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "refund_cost": refund_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "variable_cost": variable_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "total_cost": total_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "profit_amount": profit_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "calc_note": None,
     }
