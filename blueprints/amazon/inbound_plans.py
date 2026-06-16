@@ -308,7 +308,7 @@ def sync_amazon_inbound_shipment_detail(shipment_id):
 # =============================================================================
 
 def _sync_inbound_plans(shop_id, status=None):
-    """同步入库计划列表（自动处理分页）"""
+    """同步入库计划列表（自动处理分页），新计划自动同步货件列表+箱子+详情"""
     client = get_sp_api_client(shop_id=shop_id)
     all_plans = []
     next_token = None
@@ -335,19 +335,56 @@ def _sync_inbound_plans(shop_id, status=None):
 
             time.sleep(0.5)
 
-        synced_count, error = sync_inbound_plans_to_db(shop_id, client.marketplace_id, all_plans)
+        synced_count, new_plan_ids, error = sync_inbound_plans_to_db(shop_id, client.marketplace_id, all_plans)
+
+        total_shipments_synced = 0
+        total_boxes_synced = 0
+        total_details_synced = 0
+        sync_errors = []
+
+        if new_plan_ids:
+            print(f"[Inbound Plans Sync][shop_id={shop_id}] 发现 {len(new_plan_ids)} 个新入库计划，开始同步货件+箱子+详情...")
+            for plan_id in new_plan_ids:
+                shipment_result = _sync_inbound_plan_shipments(shop_id=shop_id, plan_id=plan_id)
+                total_shipments_synced += shipment_result.get('synced_count', 0)
+                if shipment_result.get('error'):
+                    sync_errors.append({"plan_id": plan_id, "type": "shipments", "error": shipment_result['error']})
+                time.sleep(0.3)
+
+                box_result = _sync_inbound_plan_boxes(shop_id=shop_id, plan_id=plan_id)
+                total_boxes_synced += box_result.get('synced_count', 0)
+                if box_result.get('error'):
+                    sync_errors.append({"plan_id": plan_id, "type": "boxes", "error": box_result['error']})
+                time.sleep(0.3)
+
+                for shipment_id in shipment_result.get('shipment_ids', []):
+                    detail_result = _sync_inbound_shipment_detail(shop_id=shop_id, plan_id=plan_id, shipment_id=shipment_id)
+                    total_details_synced += detail_result.get('synced_count', 0)
+                    if detail_result.get('error'):
+                        sync_errors.append({"plan_id": plan_id, "shipment_id": shipment_id, "type": "detail", "error": detail_result['error']})
+                    time.sleep(0.3)
 
         return {
             "synced_count": synced_count,
             "total_fetched": len(all_plans),
-            "error": error
+            "error": error,
+            "new_plan_ids": new_plan_ids,
+            "new_shipments_synced": total_shipments_synced,
+            "new_boxes_synced": total_boxes_synced,
+            "new_details_synced": total_details_synced,
+            "new_sync_errors": sync_errors
         }
 
     except Exception as e:
         return {
             "synced_count": 0,
             "total_fetched": len(all_plans),
-            "error": str(e)
+            "error": str(e),
+            "new_plan_ids": [],
+            "new_shipments_synced": 0,
+            "new_boxes_synced": 0,
+            "new_details_synced": 0,
+            "new_sync_errors": []
         }
 
 
@@ -670,15 +707,28 @@ def _sync_warehouse_to_db(warehouse_id, marketplace_id):
 # =============================================================================
 
 def sync_inbound_plans_to_db(shop_id, marketplace_id, plans):
-    """同步入库计划列表到数据库"""
+    """同步入库计划列表到数据库，返回 (synced_count, new_plan_ids, error)"""
     if not plans:
-        return 0, None
+        return 0, [], None
 
     conn = get_db_connection()
     count = 0
+    new_plan_ids = []
     try:
         with conn.cursor() as cursor:
+            plan_ids = [p.get('inboundPlanId') for p in plans if p.get('inboundPlanId')]
+            existing_ids = set()
+            if plan_ids:
+                placeholders = ','.join(['%s'] * len(plan_ids))
+                cursor.execute(
+                    f"SELECT inbound_plan_id FROM amazon_inbound_plans WHERE shop_id = %s AND inbound_plan_id IN ({placeholders})",
+                    [shop_id] + plan_ids
+                )
+                existing_ids = {row['inbound_plan_id'] for row in cursor.fetchall()}
+
             for plan in plans:
+                plan_id = plan.get('inboundPlanId')
+
                 source = plan.get('sourceAddress', {})
                 marketplace_ids = plan.get('marketplaceIds', [])
 
@@ -720,7 +770,7 @@ def sync_inbound_plans_to_db(shop_id, marketplace_id, plans):
 
                 params = (
                     shop_id,
-                    plan.get('inboundPlanId'),
+                    plan_id,
                     marketplace_id,
                     json.dumps(marketplace_ids) if marketplace_ids else '[]',
                     plan.get('name'),
@@ -742,14 +792,17 @@ def sync_inbound_plans_to_db(shop_id, marketplace_id, plans):
                 cursor.execute(sql, params)
                 count += 1
 
+                if plan_id and plan_id not in existing_ids:
+                    new_plan_ids.append(plan_id)
+
             conn.commit()
     except Exception as e:
         conn.rollback()
-        return count, str(e)
+        return count, new_plan_ids, str(e)
     finally:
         conn.close()
 
-    return count, None
+    return count, new_plan_ids, None
 
 
 def sync_inbound_shipments_to_db(shop_id, plan_id, shipments):
