@@ -131,10 +131,11 @@ def generate_amazon_label_v4(
         y -= other_gap
 
     # --- 5. 绘制底部信息（SKU + Made In China，固定贴底）---
-    c.setFont("SimHei", 8)
+    bottom_font_size = 6 if is_tight else 8
+    c.setFont("SimHei", bottom_font_size)
     c.drawString(3 * mm, bottom_baseline, f"SKU:{sku}")
     mic_text = "Made In China"
-    mic_width = c.stringWidth(mic_text, "SimHei", 8)
+    mic_width = c.stringWidth(mic_text, "SimHei", bottom_font_size)
     c.drawString(width - 3 * mm - mic_width, bottom_baseline, mic_text)
 
     c.save()
