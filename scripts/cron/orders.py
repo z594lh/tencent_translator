@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from scripts.cron import _now_str
 from services.mysql_service import get_db_connection
 from services.shop_service import get_all_active_shops
+import services.notification_handlers
 
 
 def _get_recent_order_ids(shop_id, hours):

@@ -9,6 +9,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
 
 from scripts.cron import _now_str
 from services.shop_service import get_all_active_shops
+import services.notification_handlers
 
 
 def run():
