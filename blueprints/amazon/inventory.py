@@ -372,7 +372,7 @@ def get_inventory_summaries_from_db(shop_id, marketplace_id=None, seller_sku=Non
                 FROM amazon_inventory i
                 LEFT JOIN products p ON i.seller_sku = p.seller_sku
                 WHERE {where_clause}
-                ORDER BY i.sync_time DESC
+                ORDER BY i.last_updated_time ASC
                 LIMIT %s OFFSET %s
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
