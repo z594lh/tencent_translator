@@ -291,7 +291,7 @@ def _sync_orders(shop_id, created_after=None, created_before=None, last_updated_
 
             time.sleep(0.5)
 
-        synced_count, error = sync_orders_to_db(shop_id, client.marketplace_id, all_orders)
+        synced_count, error = sync_orders_to_db(shop_id, all_orders)
 
         return {
             "synced_count": synced_count,
@@ -315,13 +315,18 @@ def _sync_order_items(shop_id, order_id):
     all_items = []
     next_token = None
     page = 0
+    max_pages = 50
 
     try:
         while True:
             page += 1
+            if page > max_pages:
+                print(f"[Order Items Sync][shop_id={shop_id}] Order {order_id} 达到最大页数限制 {max_pages}")
+                break
+
             print(f"[Order Items Sync][shop_id={shop_id}] Order {order_id} 正在获取第 {page} 页...")
 
-            result = client.get_order_items(order_id)
+            result = client.get_order_items(order_id, next_token=next_token)
             payload = result.get('payload', {})
             items = payload.get('OrderItems', [])
             all_items.extend(items)
@@ -399,7 +404,7 @@ def _parse_money(money_obj):
     return money_obj.get('CurrencyCode'), money_obj.get('Amount')
 
 
-def sync_orders_to_db(shop_id, marketplace_id, orders):
+def sync_orders_to_db(shop_id, orders):
     """
     同步订单列表到数据库
     """
@@ -418,6 +423,7 @@ def sync_orders_to_db(shop_id, marketplace_id, orders):
                 fulfillment = order.get('FulfillmentInstruction', {}) or {}
                 automated = order.get('AutomatedShippingSettings', {}) or {}
                 order_total = order.get('OrderTotal', {}) or {}
+                order_marketplace_id = order.get('MarketplaceId')
 
                 total_currency, total_amount = _parse_money(order_total)
 
@@ -440,6 +446,7 @@ def sync_orders_to_db(shop_id, marketplace_id, orders):
                         buyer_tax_taxing_region, buyer_tax_tax_classifications,
                         purchase_order_number,
                         default_ship_from_name, default_ship_from_address_line1,
+                        default_ship_from_address_line2, default_ship_from_address_line3,
                         default_ship_from_city, default_ship_from_state_or_region,
                         default_ship_from_postal_code, default_ship_from_country_code,
                         default_ship_from_phone, default_ship_from_address_type,
@@ -472,11 +479,13 @@ def sync_orders_to_db(shop_id, marketplace_id, orders):
                         %s, %s,
                         %s, %s,
                         %s, %s,
+                        %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s,
                         %s, %s,
                         %s, %s, %s,
+                        %s, %s,
                         %s, %s,
                         NOW()
                     )
@@ -520,6 +529,8 @@ def sync_orders_to_db(shop_id, marketplace_id, orders):
                         purchase_order_number = VALUES(purchase_order_number),
                         default_ship_from_name = VALUES(default_ship_from_name),
                         default_ship_from_address_line1 = VALUES(default_ship_from_address_line1),
+                        default_ship_from_address_line2 = VALUES(default_ship_from_address_line2),
+                        default_ship_from_address_line3 = VALUES(default_ship_from_address_line3),
                         default_ship_from_city = VALUES(default_ship_from_city),
                         default_ship_from_state_or_region = VALUES(default_ship_from_state_or_region),
                         default_ship_from_postal_code = VALUES(default_ship_from_postal_code),
@@ -554,7 +565,7 @@ def sync_orders_to_db(shop_id, marketplace_id, orders):
                 params = (
                     shop_id,
                     order.get('AmazonOrderId'),
-                    marketplace_id,
+                    order_marketplace_id,
                     order.get('SellerOrderId'),
                     _iso_to_datetime(order.get('PurchaseDate')),
                     _iso_to_datetime(order.get('LastUpdateDate')),
@@ -593,6 +604,8 @@ def sync_orders_to_db(shop_id, marketplace_id, orders):
                     buyer.get('PurchaseOrderNumber'),
                     default_ship.get('Name'),
                     default_ship.get('AddressLine1'),
+                    default_ship.get('AddressLine2'),
+                    default_ship.get('AddressLine3'),
                     default_ship.get('City'),
                     default_ship.get('StateOrRegion'),
                     default_ship.get('PostalCode'),
@@ -644,9 +657,13 @@ def sync_order_items_to_db(shop_id, order_id, marketplace_id, items):
     try:
         with conn.cursor() as cursor:
             for item in items:
+                buyer_info = item.get('BuyerInfo', {}) or {}
+                buyer_customized = buyer_info.get('BuyerCustomizedInfo', {}) or {}
+                buyer_cancel = item.get('BuyerRequestedCancel', {}) or {}
+
                 item_price = item.get('ItemPrice', {}) or {}
                 shipping_price = item.get('ShippingPrice', {}) or {}
-                gift_wrap_price = item.get('GiftWrapPrice', {}) or {}
+                gift_wrap_price = buyer_info.get('GiftWrapPrice', {}) or {}
                 item_tax = item.get('ItemTax', {}) or {}
                 shipping_tax = item.get('ShippingTax', {}) or {}
                 gift_wrap_tax = item.get('GiftWrapTax', {}) or {}
@@ -655,9 +672,6 @@ def sync_order_items_to_db(shop_id, order_id, marketplace_id, items):
                 cod_fee = item.get('CODFee', {}) or {}
                 cod_fee_discount = item.get('CODFeeDiscount', {}) or {}
                 points = item.get('PointsGranted', {}) or {}
-                buyer_info = item.get('BuyerInfo', {}) or {}
-                buyer_customized = buyer_info.get('BuyerCustomizedInfo', {}) or {}
-                buyer_cancel = item.get('BuyerRequestedCancel', {}) or {}
 
                 item_price_currency, item_price_amount = _parse_money(item_price)
                 shipping_price_currency, shipping_price_amount = _parse_money(shipping_price)
@@ -712,6 +726,7 @@ def sync_order_items_to_db(shop_id, order_id, marketplace_id, items):
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
+                        %s, %s,
                         %s, %s,
                         NOW()
                     )

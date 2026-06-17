@@ -264,9 +264,12 @@ class AmazonSpApiClient:
         """获取单个订单详情"""
         return self._request("GET", f"/orders/v0/orders/{order_id}")
 
-    def get_order_items(self, order_id: str) -> dict:
+    def get_order_items(self, order_id: str, next_token: str = None, max_results: int = 100) -> dict:
         """获取订单商品列表"""
-        return self._request("GET", f"/orders/v0/orders/{order_id}/orderItems")
+        params = {"MaxResultsPerPage": max(1, min(max_results, 100))}
+        if next_token:
+            params["NextToken"] = next_token
+        return self._request("GET", f"/orders/v0/orders/{order_id}/orderItems", params=params)
 
     def get_order_buyer_info(self, order_id: str) -> dict:
         """获取订单买家信息（PII 权限需要额外申请）"""

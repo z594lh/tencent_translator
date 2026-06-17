@@ -1,6 +1,7 @@
 import requests
 
-WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=683438ad-4e77-45f1-81f0-bed6a442f8eb"
+WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=cde2481c-b2ef-44d2-9da7-af8ea1d28bb0"
+# WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=683438ad-4e77-45f1-81f0-bed6a442f8eb"
 
 
 def send_text(content: str, mentioned_list: list = None, mentioned_mobile_list: list = None) -> bool:
