@@ -12,6 +12,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
+from services.notification_dispatcher import fire
 
 amazon_inventory_bp = Blueprint('amazon_inventory', __name__, url_prefix='/api')
 
@@ -204,6 +205,12 @@ def sync_inventory_summaries_to_db(shop_id, marketplace_id, inventory_items):
     count = 0
     try:
         with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT seller_sku, fulfillable_quantity FROM amazon_inventory WHERE shop_id = %s",
+                (shop_id,)
+            )
+            old_stock = {row['seller_sku']: (row['fulfillable_quantity'] or 0) for row in cursor.fetchall()}
+
             for item in inventory_items:
                 details = item.get('inventoryDetails', {})
                 reserved = details.get('reservedQuantity', {})
@@ -307,6 +314,18 @@ def sync_inventory_summaries_to_db(shop_id, marketplace_id, inventory_items):
 
                 cursor.execute(sql, params)
                 count += 1
+
+                sku = item.get('sellerSku')
+                new_qty = details.get('fulfillableQuantity', 0) or 0
+                old_qty = old_stock.get(sku, 0)
+                if (old_qty == 0 and new_qty > 0) or (old_qty > 0 and new_qty == 0):
+                    fire('inventory_stock_changed',
+                         shop_id=shop_id,
+                         sku=sku,
+                         asin=item.get('asin', ''),
+                         product_name=item.get('productName', ''),
+                         old_qty=old_qty,
+                         new_qty=new_qty)
 
             conn.commit()
     except Exception as e:

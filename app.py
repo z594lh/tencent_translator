@@ -31,6 +31,8 @@ from blueprints.cron import cron_bp
 from blueprints.permissions import permissions_bp
 from blueprints.options import options_bp
 
+import services.notification_handlers
+
 # 定时任务已迁移到 Ubuntu crontab，通过 scripts/cron/ 子模块执行
 # 不再使用 APScheduler，避免与系统计划任务重复运行
 # 如需查看原 APScheduler 代码，参考 services/scheduler.py

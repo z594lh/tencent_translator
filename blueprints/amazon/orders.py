@@ -12,6 +12,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
+from services.notification_dispatcher import fire
 
 amazon_orders_bp = Blueprint('amazon_orders', __name__, url_prefix='/api')
 
@@ -415,6 +416,12 @@ def sync_orders_to_db(shop_id, orders):
     count = 0
     try:
         with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT amazon_order_id, order_status FROM amazon_orders WHERE shop_id = %s",
+                (shop_id,)
+            )
+            old_orders = {row['amazon_order_id']: row['order_status'] for row in cursor.fetchall()}
+
             for order in orders:
                 shipping = order.get('ShippingAddress', {}) or {}
                 buyer = order.get('BuyerInfo', {}) or {}
@@ -634,6 +641,23 @@ def sync_orders_to_db(shop_id, orders):
 
                 cursor.execute(sql, params)
                 count += 1
+
+                oid = order.get('AmazonOrderId')
+                new_status = order.get('OrderStatus')
+                old_status = old_orders.get(oid)
+                if old_status is None:
+                    fire('order_new',
+                         shop_id=shop_id,
+                         order_id=oid,
+                         order_status=new_status,
+                         buyer_name=(buyer or {}).get('BuyerName', ''),
+                         purchase_date=order.get('PurchaseDate', ''),
+                         item_count=(order.get('NumberOfItemsUnshipped', 0) or 0) + (order.get('NumberOfItemsShipped', 0) or 0))
+                elif old_status != 'Canceled' and new_status == 'Canceled':
+                    fire('order_cancelled',
+                         shop_id=shop_id,
+                         order_id=oid,
+                         buyer_name=(buyer or {}).get('BuyerName', ''))
 
             conn.commit()
     except Exception as e:
