@@ -22,6 +22,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
+from blueprints.amazon.listing import sync_listings_to_db, _auto_sync_products
 
 amazon_inbound_plans_bp = Blueprint('amazon_inbound_plans', __name__, url_prefix='/api')
 
@@ -416,7 +417,7 @@ def _sync_inbound_plan_shipments(shop_id, plan_id):
 
 
 def _sync_inbound_plan_boxes(shop_id, plan_id):
-    """同步指定入库计划的箱子列表（自动处理分页）"""
+    """同步指定入库计划的箱子列表（自动处理分页），并自动发现新 Listing"""
     client = get_sp_api_client(shop_id=shop_id)
     all_boxes = []
     next_token = None
@@ -441,6 +442,65 @@ def _sync_inbound_plan_boxes(shop_id, plan_id):
                 break
 
             time.sleep(0.5)
+
+        # ---------- Listing 自动发现（不阻塞箱子写入） ----------
+        try:
+            # 从箱子 items_json 中收集所有 msku
+            box_mskus = set()
+            for box in all_boxes:
+                items = box.get('items', [])
+                if isinstance(items, list):
+                    for item in items:
+                        msku = item.get('msku')
+                        if msku:
+                            box_mskus.add(msku)
+
+            # 检查哪些 msku 在本地 amazon_listings 表中不存在
+            new_skus = []
+            if box_mskus:
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cursor:
+                        placeholders = ','.join(['%s'] * len(box_mskus))
+                        cursor.execute(
+                            f"SELECT sku FROM amazon_listings WHERE shop_id = %s AND sku IN ({placeholders})",
+                            [shop_id] + list(box_mskus)
+                        )
+                        existing = {row['sku'] for row in cursor.fetchall()}
+                    new_skus = [sku for sku in box_mskus if sku not in existing]
+                finally:
+                    conn.close()
+
+            # 逐条同步未知 SKU 的 Listing
+            new_listing_skus = []
+            if new_skus:
+                print(f"[Inbound Plan Boxes Sync][shop_id={shop_id}] 发现 {len(new_skus)} 个未知 SKU，开始逐条同步 Listing...")
+                marketplace_id = client.marketplace_id
+                seller_id = client.seller_id or ''
+
+                for sku in new_skus:
+                    try:
+                        item = client.get_listings_item(sku=sku, included_data=["summaries", "attributes", "issues"])
+                        if item and isinstance(item, dict) and item.get('sku'):
+                            _, error, _ = sync_listings_to_db(shop_id, marketplace_id, seller_id, [item])
+                            if not error:
+                                new_listing_skus.append(sku)
+                                print(f"[Inbound Plan Boxes Sync][shop_id={shop_id}] Listing 同步成功 [{sku}]")
+                            else:
+                                print(f"[Inbound Plan Boxes Sync][shop_id={shop_id}] Listing 同步失败 [{sku}]: {error}")
+                        else:
+                            print(f"[Inbound Plan Boxes Sync][shop_id={shop_id}] SP-API 未返回 Listing [{sku}]")
+                    except Exception as e:
+                        print(f"[Inbound Plan Boxes Sync][shop_id={shop_id}] Listing 同步异常 [{sku}]: {e}")
+                    time.sleep(0.3)
+
+            # 将新 Listing 同步到产品表
+            if new_listing_skus:
+                _auto_sync_products(shop_id, new_listing_skus)
+
+        except Exception as e:
+            print(f"[Inbound Plan Boxes Sync][shop_id={shop_id}] Listing 自动发现异常: {e}")
+        # ---------- Listing 自动发现结束 ----------
 
         synced_count, error = sync_inbound_plan_boxes_to_db(shop_id, plan_id, all_boxes)
 
@@ -1028,6 +1088,7 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
                                        status=None, shipment_name=None, page=1, page_size=20):
     """
     从数据库分页查询入库计划货件列表（amazon_inbound_shipments 连表 amazon_inbound_shipments_detail）
+    返回每个货件包含的 sku 列表及中文名（从 boxes 的 items_json 解析并关联 products 表）
     """
     conn = get_db_connection()
     try:
@@ -1088,8 +1149,7 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
                     d.tracking_details_json,
                     d.dates_json,
                     d.sync_time AS detail_sync_time,
-                    p.created_at AS plan_created_at,
-                    (SELECT COUNT(*) FROM amazon_inbound_plan_boxes b WHERE b.shipment_id = d.shipment_confirmation_id AND b.shop_id = s.shop_id) AS box_count
+                    p.created_at AS plan_created_at
                 FROM amazon_inbound_shipments s
                 LEFT JOIN amazon_inbound_shipments_detail d ON s.shipment_id = d.shipment_id AND d.shop_id = s.shop_id
                 LEFT JOIN amazon_inbound_plans p ON s.inbound_plan_id = p.inbound_plan_id AND s.shop_id = p.shop_id
@@ -1099,6 +1159,8 @@ def get_inbound_shipments_list_from_db(shop_id, inbound_plan_id=None, shipment_c
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
             rows = cursor.fetchall()
+
+            _enrich_shipments_with_skus_and_box_count(shop_id, rows)
 
             return {
                 "list": rows,
@@ -1182,6 +1244,91 @@ def get_inbound_plan_ids_from_db(shop_id, status=None):
             return [row['inbound_plan_id'] for row in cursor.fetchall()]
     finally:
         conn.close()
+
+
+def _enrich_shipments_with_skus_and_box_count(shop_id, rows):
+    """
+    批量查询箱子和产品表，为每个货件附加：
+    - skus: [{ sku, name_cn, quantity }]  去重后的 SKU 列表、中文名及总数
+    - box_count: 箱子数量
+
+    仅需 2 次 DB 查询（箱子 + 产品），替代原有的每行子查询，性能开销最小。
+    """
+    if not rows:
+        return
+
+    for row in rows:
+        row['skus'] = []
+        row['box_count'] = 0
+
+    valid_ids = [r['shipment_confirmation_id'] for r in rows if r.get('shipment_confirmation_id')]
+    if not valid_ids:
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ','.join(['%s'] * len(valid_ids))
+
+            cursor.execute(
+                f"""
+                    SELECT shipment_id, items_json
+                    FROM amazon_inbound_plan_boxes
+                    WHERE shop_id = %s AND shipment_id IN ({placeholders})
+                """,
+                [shop_id] + valid_ids
+            )
+
+            shipment_sku_qty = {}   # shipment_id -> { msku: total_qty }
+            shipment_box_count = {}
+            all_mskus = set()
+
+            for box in cursor.fetchall():
+                sid = box['shipment_id']
+                shipment_box_count[sid] = shipment_box_count.get(sid, 0) + 1
+
+                items_str = box.get('items_json') or '[]'
+                try:
+                    items = json.loads(items_str)
+                    if isinstance(items, list):
+                        qty_map = shipment_sku_qty.get(sid)
+                        if qty_map is None:
+                            qty_map = {}
+                            shipment_sku_qty[sid] = qty_map
+                        for item in items:
+                            msku = item.get('msku')
+                            if msku:
+                                qty = int(item.get('quantity', 0))
+                                qty_map[msku] = qty_map.get(msku, 0) + qty
+                                all_mskus.add(msku)
+                except Exception:
+                    continue
+
+            sku_name_map = {}
+            if all_mskus:
+                placeholders2 = ','.join(['%s'] * len(all_mskus))
+                cursor.execute(
+                    f"""
+                        SELECT seller_sku, COALESCE(NULLIF(declare_name_cn, ''), product_name) AS name_cn
+                        FROM products
+                        WHERE seller_sku IN ({placeholders2})
+                    """,
+                    tuple(all_mskus)
+                )
+                for prod in cursor.fetchall():
+                    sku_name_map[prod['seller_sku']] = prod.get('name_cn') or ''
+    finally:
+        conn.close()
+
+    for row in rows:
+        sid = row.get('shipment_confirmation_id')
+        if sid:
+            row['box_count'] = shipment_box_count.get(sid, 0)
+            qty_map = shipment_sku_qty.get(sid, {})
+            row['skus'] = [
+                {"sku": sku, "name_cn": sku_name_map.get(sku, ''), "quantity": qty}
+                for sku, qty in qty_map.items()
+            ]
 
 
 def _enrich_boxes_with_product_names(rows):
