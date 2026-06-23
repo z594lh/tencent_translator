@@ -68,6 +68,8 @@ def run_recent():
             last_updated_after = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
             result = _sync_orders(shop_id=shop_id, last_updated_after=last_updated_after)
             print(f"[{now_str}] [Cron] 店铺[{shop_name}] 近期订单列表同步完成: fetched={result.get('total_fetched', 0)}, synced={result.get('synced_count', 0)}")
+            if result.get('error'):
+                print(f"[{now_str}] [Cron] 店铺[{shop_name}] 近期订单列表同步错误: {result['error']}")
 
             order_ids = _get_recent_order_ids(shop_id=shop_id, hours=24)
             if order_ids:
@@ -96,6 +98,8 @@ def run_week():
             last_updated_after = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
             result = _sync_orders(shop_id=shop_id, last_updated_after=last_updated_after)
             print(f"[{now_str}] [Cron] 店铺[{shop_name}] 本周订单列表同步完成: fetched={result.get('total_fetched', 0)}, synced={result.get('synced_count', 0)}")
+            if result.get('error'):
+                print(f"[{now_str}] [Cron] 店铺[{shop_name}] 本周订单列表同步错误: {result['error']}")
 
             since_24h = (now - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
             since_7d = (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
@@ -137,6 +141,8 @@ def run_month():
             last_updated_after = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
             result = _sync_orders(shop_id=shop_id, last_updated_after=last_updated_after)
             print(f"[{now_str}] [Cron] 店铺[{shop_name}] 本月订单列表同步完成: fetched={result.get('total_fetched', 0)}, synced={result.get('synced_count', 0)}")
+            if result.get('error'):
+                print(f"[{now_str}] [Cron] 店铺[{shop_name}] 本月订单列表同步错误: {result['error']}")
         except Exception as e:
             print(f"[{now_str}] [Cron] 店铺[{shop_name}] 本月订单同步异常: {e}")
 
