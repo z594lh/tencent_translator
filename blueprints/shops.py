@@ -36,10 +36,24 @@ def _validate_shop_data(data: dict, is_update: bool = False) -> dict:
         errors['seller_id'] = 'Seller ID 不能超过50个字符'
     cleaned['seller_id'] = seller_id
 
-    refresh_token = data.get('refresh_token', '').strip()
-    if not refresh_token:
-        errors['refresh_token'] = 'Refresh Token 不能为空'
-    cleaned['refresh_token'] = refresh_token
+    sp_refresh_token = (data.get('sp_refresh_token') or data.get('refresh_token') or '').strip()
+    if not sp_refresh_token:
+        errors['sp_refresh_token'] = 'SP-API Refresh Token 不能为空'
+    cleaned['sp_refresh_token'] = sp_refresh_token
+
+    credential_group_id = data.get('credential_group_id', 1)
+    try:
+        cleaned['credential_group_id'] = int(credential_group_id) if credential_group_id else 1
+    except (ValueError, TypeError):
+        errors['credential_group_id'] = 'credential_group_id 必须是整数'
+        cleaned['credential_group_id'] = 1
+
+    cleaned['ads_refresh_token'] = (data.get('ads_refresh_token') or '').strip() or None
+
+    ads_profile_id = (data.get('ads_profile_id') or '').strip()
+    if ads_profile_id and len(ads_profile_id) > 32:
+        errors['ads_profile_id'] = 'ads_profile_id 不能超过32个字符'
+    cleaned['ads_profile_id'] = ads_profile_id or None
 
     marketplace_id = data.get('marketplace_id', '').strip()
     if not marketplace_id:
@@ -116,7 +130,8 @@ def list_all_shops():
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT id, shop_name, seller_id, marketplace_id, region,
+                    SELECT id, credential_group_id, shop_name, seller_id,
+                           marketplace_id, region,
                            status, is_default, created_at, updated_at
                     FROM amazon_shops
                     ORDER BY id
@@ -145,7 +160,8 @@ def get_shop(shop_id):
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT id, shop_name, seller_id, refresh_token,
+                    SELECT id, credential_group_id, shop_name, seller_id,
+                           sp_refresh_token, ads_refresh_token, ads_profile_id,
                            marketplace_id, region, status, is_default,
                            created_at, updated_at
                     FROM amazon_shops
@@ -193,12 +209,16 @@ def create_shop():
 
                 cursor.execute("""
                     INSERT INTO amazon_shops
-                    (shop_name, seller_id, refresh_token, marketplace_id, region, status, is_default)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (credential_group_id, shop_name, seller_id, sp_refresh_token,
+                     ads_refresh_token, ads_profile_id, marketplace_id, region, status, is_default)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
+                    cleaned['credential_group_id'],
                     cleaned['shop_name'],
                     cleaned['seller_id'],
-                    cleaned['refresh_token'],
+                    cleaned['sp_refresh_token'],
+                    cleaned['ads_refresh_token'],
+                    cleaned['ads_profile_id'],
                     cleaned['marketplace_id'],
                     cleaned['region'],
                     cleaned['status'],
@@ -260,18 +280,24 @@ def update_shop(shop_id):
 
                 cursor.execute("""
                     UPDATE amazon_shops SET
+                        credential_group_id = %s,
                         shop_name = %s,
                         seller_id = %s,
-                        refresh_token = %s,
+                        sp_refresh_token = %s,
+                        ads_refresh_token = %s,
+                        ads_profile_id = %s,
                         marketplace_id = %s,
                         region = %s,
                         status = %s,
                         is_default = %s
                     WHERE id = %s
                 """, (
+                    cleaned['credential_group_id'],
                     cleaned['shop_name'],
                     cleaned['seller_id'],
-                    cleaned['refresh_token'],
+                    cleaned['sp_refresh_token'],
+                    cleaned['ads_refresh_token'],
+                    cleaned['ads_profile_id'],
                     cleaned['marketplace_id'],
                     cleaned['region'],
                     cleaned['status'],

@@ -235,11 +235,12 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     refund_row = cursor.fetchone()
     refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
 
-    # 5. 广告费（仍从 amazon_ad_spend 读取）
+    # 5. 广告费（从 amazon_ads_raw_reports 汇总）
     cursor.execute("""
-        SELECT COALESCE(SUM(ad_spend), 0) AS ad_sum
-        FROM amazon_ad_spend
-        WHERE shop_id = %s AND date = %s
+        SELECT COALESCE(SUM(cost), 0) AS ad_sum
+        FROM amazon_ads_raw_reports
+        WHERE shop_id = %s AND report_date = %s
+          AND report_type = 'spCampaigns'
     """, (sid, report_date))
     ad_row = cursor.fetchone()
     ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
@@ -677,12 +678,13 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
                         product_name = unit_costs.product_name or ''
 
-                        # 广告费（按 ASIN 汇总，无数据则记0）
+                        # 广告费（从 amazon_ads_raw_reports 按 ASIN 汇总）
                         cursor.execute("""
-                            SELECT COALESCE(SUM(ad_spend), 0) AS ad_sum
-                            FROM amazon_ad_spend
-                            WHERE shop_id = %s AND asin = %s
-                              AND date BETWEEN %s AND %s
+                            SELECT COALESCE(SUM(cost), 0) AS ad_sum
+                            FROM amazon_ads_raw_reports
+                            WHERE shop_id = %s AND advertised_asin = %s
+                              AND report_date BETWEEN %s AND %s
+                              AND report_type = 'spAdvertisedProduct'
                         """, (sid, asin, period_start, period_end))
                         ad_row = cursor.fetchone()
                         ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
@@ -933,7 +935,134 @@ def generate_inventory_turnover(shop_id=None):
         conn.close()
 
 
-# ==================== 4. 广告效果报表生成 ====================
+# ==================== 4. 广告效果报表生成（新数据源: amazon_ads_raw_reports）====================
+
+
+def _generate_advertising_from_raw(cursor, shop_id, report_type, report_date,
+                                   report_week, report_month, date_start, date_end):
+    """
+    从 amazon_ads_raw_reports 聚合生成广告效果报表
+
+    简介: 从 Ads API 全量宽表聚合 overall / campaign / ad_group / asin 四个维度。
+          相比旧版 _generate_advertising_from_ads（依赖 amazon_ad_spend）：
+            - 数据源更全：收录 spCampaigns/spAdGroups/spAdvertisedProduct/spTargeting/spSearchTerm 全部字段
+            - 归因窗口完整：purchases_7d/14d/30d + sales_7d/14d/30d
+            - 自动按 report_type 去重：每个维度只取对应报告类型，避免跨类型重复累加
+    """
+    total_affected = 0
+
+    # 1. overall 维度 — 汇总 spCampaigns 报告（不含 spAdGroups 避免 double-count）
+    cursor.execute("""
+        SELECT
+            COALESCE(SUM(impressions), 0) AS impressions,
+            COALESCE(SUM(clicks), 0) AS clicks,
+            COALESCE(SUM(cost), 0) AS ad_spend,
+            COALESCE(SUM(purchases_7d), 0) AS orders_7d,
+            COALESCE(SUM(purchases_30d), 0) AS orders_30d,
+            COALESCE(SUM(sales_7d), 0) AS sales_7d,
+            COALESCE(SUM(sales_30d), 0) AS sales_30d
+        FROM amazon_ads_raw_reports
+        WHERE shop_id = %s AND report_date BETWEEN %s AND %s
+          AND report_type = 'spCampaigns'
+    """, (shop_id, date_start, date_end))
+    row = cursor.fetchone()
+    if row and row['ad_spend'] is not None and float(row['ad_spend']) > 0:
+        _insert_advertising_report(
+            cursor, report_type, report_date, report_week, report_month,
+            shop_id, 'overall', '', '', '', '', '', '',
+            int(row['impressions'] or 0), int(row['clicks'] or 0), Decimal(str(row['ad_spend'] or 0)),
+            int(row['orders_7d'] or 0), int(row['orders_30d'] or 0),
+            Decimal(str(row['sales_7d'] or 0)), Decimal(str(row['sales_30d'] or 0))
+        )
+        total_affected += cursor.rowcount
+
+    # 2. campaign 维度 — 从 spCampaigns 取
+    cursor.execute("""
+        SELECT
+            campaign_id,
+            MAX(campaign_name) AS campaign_name,
+            COALESCE(SUM(impressions), 0) AS impressions,
+            COALESCE(SUM(clicks), 0) AS clicks,
+            COALESCE(SUM(cost), 0) AS ad_spend,
+            COALESCE(SUM(purchases_7d), 0) AS orders_7d,
+            COALESCE(SUM(purchases_30d), 0) AS orders_30d,
+            COALESCE(SUM(sales_7d), 0) AS sales_7d,
+            COALESCE(SUM(sales_30d), 0) AS sales_30d
+        FROM amazon_ads_raw_reports
+        WHERE shop_id = %s AND report_date BETWEEN %s AND %s
+          AND report_type = 'spCampaigns' AND campaign_id != ''
+        GROUP BY campaign_id
+    """, (shop_id, date_start, date_end))
+    for row in cursor.fetchall():
+        _insert_advertising_report(
+            cursor, report_type, report_date, report_week, report_month,
+            shop_id, 'campaign', row['campaign_id'], row['campaign_name'] or '',
+            '', '', '', '',
+            int(row['impressions'] or 0), int(row['clicks'] or 0), Decimal(str(row['ad_spend'] or 0)),
+            int(row['orders_7d'] or 0), int(row['orders_30d'] or 0),
+            Decimal(str(row['sales_7d'] or 0)), Decimal(str(row['sales_30d'] or 0))
+        )
+        total_affected += cursor.rowcount
+
+    # 3. ad_group 维度 — 从 spAdvertisedProduct 聚合 (含 adGroupId/adGroupName)
+    cursor.execute("""
+        SELECT
+            campaign_id,
+            MAX(campaign_name) AS campaign_name,
+            ad_group_id,
+            MAX(ad_group_name) AS ad_group_name,
+            COALESCE(SUM(impressions), 0) AS impressions,
+            COALESCE(SUM(clicks), 0) AS clicks,
+            COALESCE(SUM(cost), 0) AS ad_spend,
+            COALESCE(SUM(purchases_7d), 0) AS orders_7d,
+            COALESCE(SUM(purchases_30d), 0) AS orders_30d,
+            COALESCE(SUM(sales_7d), 0) AS sales_7d,
+            COALESCE(SUM(sales_30d), 0) AS sales_30d
+        FROM amazon_ads_raw_reports
+        WHERE shop_id = %s AND report_date BETWEEN %s AND %s
+          AND report_type = 'spAdvertisedProduct' AND ad_group_id != ''
+        GROUP BY campaign_id, ad_group_id
+    """, (shop_id, date_start, date_end))
+    for row in cursor.fetchall():
+        _insert_advertising_report(
+            cursor, report_type, report_date, report_week, report_month,
+            shop_id, 'ad_group', row['campaign_id'], row['campaign_name'] or '',
+            row['ad_group_id'], row['ad_group_name'] or '', '', '',
+            int(row['impressions'] or 0), int(row['clicks'] or 0), Decimal(str(row['ad_spend'] or 0)),
+            int(row['orders_7d'] or 0), int(row['orders_30d'] or 0),
+            Decimal(str(row['sales_7d'] or 0)), Decimal(str(row['sales_30d'] or 0))
+        )
+        total_affected += cursor.rowcount
+
+    # 4. asin 维度 — 从 spAdvertisedProduct 取
+    cursor.execute("""
+        SELECT
+            advertised_asin AS asin,
+            MAX(advertised_sku) AS sku,
+            COALESCE(SUM(impressions), 0) AS impressions,
+            COALESCE(SUM(clicks), 0) AS clicks,
+            COALESCE(SUM(cost), 0) AS ad_spend,
+            COALESCE(SUM(purchases_7d), 0) AS orders_7d,
+            COALESCE(SUM(purchases_30d), 0) AS orders_30d,
+            COALESCE(SUM(sales_7d), 0) AS sales_7d,
+            COALESCE(SUM(sales_30d), 0) AS sales_30d
+        FROM amazon_ads_raw_reports
+        WHERE shop_id = %s AND report_date BETWEEN %s AND %s
+          AND report_type = 'spAdvertisedProduct' AND advertised_asin != ''
+        GROUP BY advertised_asin
+    """, (shop_id, date_start, date_end))
+    for row in cursor.fetchall():
+        _insert_advertising_report(
+            cursor, report_type, report_date, report_week, report_month,
+            shop_id, 'asin', '', '', '', '', row['asin'], row['sku'] or '',
+            int(row['impressions'] or 0), int(row['clicks'] or 0), Decimal(str(row['ad_spend'] or 0)),
+            int(row['orders_7d'] or 0), int(row['orders_30d'] or 0),
+            Decimal(str(row['sales_7d'] or 0)), Decimal(str(row['sales_30d'] or 0))
+        )
+        total_affected += cursor.rowcount
+
+    return total_affected
+
 
 def _calc_ad_metrics(impressions, clicks, ad_spend, sales_7d, sales_30d):
     """
@@ -1126,7 +1255,7 @@ def generate_advertising_daily(report_date, shop_id=None):
     """
     生成单日广告效果报表
 
-    简介: 从 amazon_ad_spend 拉取单日数据，生成 4 个维度的广告报表。
+    简介: 从 amazon_ads_raw_reports 拉取单日数据，生成 4 个维度的广告报表。
     """
     report_type = 'advertising_daily'
     period = report_date
@@ -1145,7 +1274,7 @@ def generate_advertising_daily(report_date, shop_id=None):
             log_id = _log_generation_start(report_type, period, sid)
             try:
                 with conn.cursor() as cursor:
-                    affected = _generate_advertising_from_ads(
+                    affected = _generate_advertising_from_raw(
                         cursor, sid, 'daily', report_date, '', '', report_date, report_date
                     )
                     total_affected += affected
@@ -1167,7 +1296,7 @@ def generate_advertising_weekly(start_date, end_date, shop_id=None):
     """
     生成周度广告效果报表
 
-    简介: 对指定周内的 amazon_ad_spend 数据聚合，生成 4 维度广告周报。
+    简介: 对指定周内的 amazon_ads_raw_reports 数据聚合，生成 4 维度广告周报。
     """
     report_type = 'advertising_weekly'
     period = f"{start_date}~{end_date}"
@@ -1187,7 +1316,7 @@ def generate_advertising_weekly(start_date, end_date, shop_id=None):
             log_id = _log_generation_start(report_type, period, sid)
             try:
                 with conn.cursor() as cursor:
-                    affected = _generate_advertising_from_ads(
+                    affected = _generate_advertising_from_raw(
                         cursor, sid, 'weekly', start_date, report_week_label, '', start_date, end_date
                     )
                     total_affected += affected
@@ -1209,7 +1338,7 @@ def generate_advertising_monthly(month_str, shop_id=None):
     """
     生成月度广告效果报表
 
-    简介: 对指定月的 amazon_ad_spend 数据聚合，生成 4 维度广告月报。
+    简介: 对指定月的 amazon_ads_raw_reports 数据聚合，生成 4 维度广告月报。
     """
     report_type = 'advertising_monthly'
     period = month_str
@@ -1236,7 +1365,7 @@ def generate_advertising_monthly(month_str, shop_id=None):
             try:
                 with conn.cursor() as cursor:
                     month_start = start_date
-                    affected = _generate_advertising_from_ads(
+                    affected = _generate_advertising_from_raw(
                         cursor, sid, 'monthly', month_start, '', month_str, start_date, end_date
                     )
                     total_affected += affected

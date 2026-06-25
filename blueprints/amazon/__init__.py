@@ -1,6 +1,6 @@
 """
 Amazon 业务模块聚合
-包含库存、货件、入库计划、发票导出、订单、Listing、财务 七个子模块
+包含库存、货件、入库计划、发票导出、订单、Listing、财务、广告 八个子模块
 """
 from blueprints.amazon.inventory import amazon_inventory_bp
 from blueprints.amazon.shipments import amazon_shipments_bp
@@ -9,6 +9,7 @@ from blueprints.amazon.invoice_export import amazon_invoice_export_bp
 from blueprints.amazon.orders import amazon_orders_bp
 from blueprints.amazon.listing import amazon_listing_bp
 from blueprints.amazon.finances import amazon_finances_bp
+from blueprints.amazon.advertising import advertising_bp
 
 __all__ = [
     'amazon_inventory_bp',
@@ -18,4 +19,5 @@ __all__ = [
     'amazon_orders_bp',
     'amazon_listing_bp',
     'amazon_finances_bp',
+    'advertising_bp',
 ]
