@@ -2,16 +2,19 @@
 下拉选项模块 — 所有前端 el-select 下拉框接口统一入口
 
 路由一览:
-  GET  /api/options/shops                 店铺列表
-  GET  /api/options/suppliers             供应商列表
-  GET  /api/options/products              产品列表
-  GET  /api/options/products/categories    产品分类列表
-  GET  /api/options/logistics-providers   货代列表
-  GET  /api/options/users                 用户列表
-  GET  /api/options/amazon/warehouses     FBA 仓库列表（?shop_id=）
-  GET  /api/options/amazon/shipments      FBA 货件列表
-  GET  /api/options/amazon/inbound-plans  亚马逊入仓计划列表
-  GET  /api/options/product-board/filters 备货看板筛选选项
+  GET  /api/options/shops                     店铺列表
+  GET  /api/options/suppliers                 供应商列表
+  GET  /api/options/products                  产品列表
+  GET  /api/options/products/categories        产品分类列表
+  GET  /api/options/logistics-providers       货代列表
+  GET  /api/options/users                     用户列表
+  GET  /api/options/amazon/warehouses         FBA 仓库列表（?shop_id=）
+  GET  /api/options/amazon/shipments          FBA 货件列表
+  GET  /api/options/amazon/inbound-plans      亚马逊入仓计划列表
+  GET  /api/options/product-board/filters     备货看板筛选选项
+  GET  /api/options/advertising/campaigns     广告活动下拉（?shop_id=）
+  GET  /api/options/advertising/ad-groups     广告组下拉（?shop_id=&campaign_id=）
+  GET  /api/options/advertising/asins         推广ASIN下拉（?shop_id=&campaign_id=）
 
 注意：响应统一为 {status, data: [...]}，无分页，字段名与原端点一致。
 """
@@ -233,6 +236,114 @@ def option_product_board_filters():
                 """)
                 rows = [r['amazon_status'] for r in cursor.fetchall()]
                 return jsonify({"status": "success", "data": {"amazon_statuses": rows}})
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# 广告活动下拉 — GET /api/options/advertising/campaigns
+# ============================================================
+
+@options_bp.route('/advertising/campaigns', methods=['GET'])
+def option_ad_campaigns():
+    """广告活动下拉：从原始数据去重 campaign_id + campaign_name"""
+    try:
+        shop_id = request.args.get('shop_id', '').strip()
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                if shop_id:
+                    cursor.execute("""
+                        SELECT DISTINCT campaign_id, MAX(campaign_name) AS campaign_name
+                        FROM amazon_ads_raw_reports
+                        WHERE shop_id = %s AND campaign_id != ''
+                        GROUP BY campaign_id
+                        ORDER BY campaign_name
+                    """, (shop_id,))
+                else:
+                    cursor.execute("""
+                        SELECT DISTINCT campaign_id, MAX(campaign_name) AS campaign_name
+                        FROM amazon_ads_raw_reports
+                        WHERE campaign_id != ''
+                        GROUP BY campaign_id
+                        ORDER BY campaign_name
+                    """)
+                return jsonify({"status": "success", "data": cursor.fetchall()})
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# 广告组下拉 — GET /api/options/advertising/ad-groups
+# ============================================================
+
+@options_bp.route('/advertising/ad-groups', methods=['GET'])
+def option_ad_groups():
+    """广告组下拉：按 campaign_id 联动筛选"""
+    try:
+        shop_id = request.args.get('shop_id', '').strip()
+        campaign_id = request.args.get('campaign_id', '').strip()
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                where = ["ad_group_id != ''"]
+                params = []
+                if shop_id:
+                    where.append("shop_id = %s")
+                    params.append(shop_id)
+                if campaign_id:
+                    where.append("campaign_id = %s")
+                    params.append(campaign_id)
+                where_sql = "WHERE " + " AND ".join(where)
+                cursor.execute(f"""
+                    SELECT DISTINCT ad_group_id, MAX(ad_group_name) AS ad_group_name
+                    FROM amazon_ads_raw_reports
+                    {where_sql}
+                    GROUP BY ad_group_id
+                    ORDER BY ad_group_name
+                """, params)
+                return jsonify({"status": "success", "data": cursor.fetchall()})
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# 推广ASIN下拉 — GET /api/options/advertising/asins
+# ============================================================
+
+@options_bp.route('/advertising/asins', methods=['GET'])
+def option_ad_asins():
+    """推广ASIN下拉：按 campaign_id 联动筛选"""
+    try:
+        shop_id = request.args.get('shop_id', '').strip()
+        campaign_id = request.args.get('campaign_id', '').strip()
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                where = ["advertised_asin != ''"]
+                params = []
+                if shop_id:
+                    where.append("shop_id = %s")
+                    params.append(shop_id)
+                if campaign_id:
+                    where.append("campaign_id = %s")
+                    params.append(campaign_id)
+                where_sql = "WHERE " + " AND ".join(where)
+                cursor.execute(f"""
+                    SELECT DISTINCT advertised_asin AS asin,
+                           MAX(advertised_sku) AS sku
+                    FROM amazon_ads_raw_reports
+                    {where_sql}
+                    GROUP BY advertised_asin
+                    ORDER BY advertised_asin
+                """, params)
+                return jsonify({"status": "success", "data": cursor.fetchall()})
         finally:
             conn.close()
     except Exception as e:

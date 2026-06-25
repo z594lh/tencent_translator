@@ -1306,6 +1306,364 @@ def trigger_advertising_report():
 
 
 # ============================================================
+# 6.5 广告原始数据详情 (amazon_ads_raw_reports 宽表查询)
+# ============================================================
+
+# 通用可排序字段：数据库实列 + 前端计算列
+_ALL_SORT_COLS = [
+    # 数据库实列
+    "impressions", "clicks", "cost",
+    "purchases_7d", "purchases_14d", "purchases_30d",
+    "sales_7d", "sales_14d", "sales_30d",
+    "report_date",
+    # 字符串列 (仅部分接口支持)
+    "customer_search_term", "keyword_text", "keyword_type",
+    "campaign_name", "advertised_asin", "advertised_sku",
+    # 前端计算指标 (内存排序)
+    "ctr", "cpc", "acos_7d", "acos_14d", "acos_30d",
+    "roas_7d", "roas_14d", "roas_30d",
+]
+
+# 枚举值 → 中文标签 (参考 Amazon Ads API 官方文档)
+_AD_ENUM_LABELS = {
+    # 关键词类型 / 匹配类型
+    "BROAD": "广泛匹配",
+    "PHRASE": "词组匹配",
+    "EXACT": "精准匹配",
+    "NEGATIVE_BROAD": "否定广泛匹配",
+    "NEGATIVE_PHRASE": "否定词组匹配",
+    "NEGATIVE_EXACT": "否定精准匹配",
+    "TARGETING_EXPRESSION": "自动定向",
+    "TARGETING_EXPRESSION_PREDEFINED": "预设定向",
+    # 定向表达式 (keyword_text / targeting_expression)
+    "close-match": "紧密匹配",
+    "loose-match": "宽泛匹配",
+    "complements": "关联商品",
+    "substitutes": "替代商品",
+    # 活动状态
+    "ENABLED": "启用",
+    "PAUSED": "暂停",
+    "ARCHIVED": "归档",
+    # 预算类型
+    "daily": "每日预算",
+    "lifetime": "周期总预算",
+}
+
+
+def _add_labels(row):
+    """给原始数据行的枚举字段附加 _label 中文解释"""
+    for field in ("keyword_type", "keyword_match_type", "campaign_status",
+                  "campaign_budget_type"):
+        val = (row.get(field) or "").strip()
+        if val:
+            row[field + "_label"] = _AD_ENUM_LABELS.get(val, val)
+
+    # keyword_text / targeting_expression 可能是 close-match 等值
+    for field in ("keyword_text", "targeting_expression"):
+        val = (row.get(field) or "").strip()
+        if val and val in _AD_ENUM_LABELS:
+            row[field + "_label"] = _AD_ENUM_LABELS[val]
+
+    return row
+
+
+def _compute_raw_metrics(row):
+    """给原始数据行附加 CTR/CPC/ACOS/ROAS 计算字段"""
+    imp = row.get("impressions", 0) or 0
+    clk = row.get("clicks", 0) or 0
+    cost = float(row.get("cost", 0) or 0)
+    s7 = float(row.get("sales_7d", 0) or 0)
+    s14 = float(row.get("sales_14d", 0) or 0)
+    s30 = float(row.get("sales_30d", 0) or 0)
+
+    row["ctr"] = round(clk / imp, 6) if imp > 0 else None
+    row["cpc"] = round(cost / clk, 4) if clk > 0 else None
+    row["acos_7d"] = round(cost / s7, 4) if s7 > 0 else None
+    row["acos_14d"] = round(cost / s14, 4) if s14 > 0 else None
+    row["acos_30d"] = round(cost / s30, 4) if s30 > 0 else None
+    row["roas_7d"] = round(s7 / cost, 4) if cost > 0 else None
+    row["roas_14d"] = round(s14 / cost, 4) if cost > 0 else None
+    row["roas_30d"] = round(s30 / cost, 4) if cost > 0 else None
+    return row
+
+
+def _query_raw_reports(report_type, shop_id=None, start_date=None, end_date=None,
+                       campaign_id=None, ad_group_id=None, asin=None, keyword=None,
+                       sort_by="cost", sort_dir="desc", page=1, page_size=20):
+    """查询 amazon_ads_raw_reports 通用方法，返回分页列表 + 汇总 + 中文标签"""
+    conn = _get_conn()
+    try:
+        # 验证排序: 数据库实列 + 计算字段
+        sort_db_fields = {"impressions", "clicks", "cost",
+                          "purchases_7d", "purchases_14d", "purchases_30d",
+                          "sales_7d", "sales_14d", "sales_30d",
+                          "customer_search_term", "keyword_text", "keyword_type",
+                          "campaign_name", "advertised_asin", "advertised_sku",
+                          "report_date"}
+        if sort_by not in _ALL_SORT_COLS:
+            sort_by = "cost"
+        is_db_sort = sort_by in sort_db_fields
+        is_desc = sort_dir.lower() == "desc"
+
+        where = ["report_type = %s"]
+        params = [report_type]
+
+        if shop_id is not None:
+            where.append("shop_id = %s")
+            params.append(shop_id)
+        if start_date:
+            where.append("report_date >= %s")
+            params.append(start_date)
+        if end_date:
+            where.append("report_date <= %s")
+            params.append(end_date)
+        if campaign_id:
+            where.append("campaign_id = %s")
+            params.append(campaign_id)
+        if ad_group_id:
+            where.append("ad_group_id = %s")
+            params.append(ad_group_id)
+        if asin:
+            where.append("advertised_asin = %s")
+            params.append(asin)
+        if keyword:
+            where.append("(keyword_text LIKE %s OR customer_search_term LIKE %s)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+
+        where_sql = "WHERE " + " AND ".join(where)
+
+        with conn.cursor() as cur:
+            # 汇总
+            cur.execute(f"""
+                SELECT COUNT(1) AS total_rows,
+                       SUM(impressions) AS total_impressions,
+                       SUM(clicks) AS total_clicks,
+                       SUM(cost) AS total_cost,
+                       SUM(purchases_7d) AS total_purchases_7d,
+                       SUM(purchases_14d) AS total_purchases_14d,
+                       SUM(purchases_30d) AS total_purchases_30d,
+                       SUM(sales_7d) AS total_sales_7d,
+                       SUM(sales_14d) AS total_sales_14d,
+                       SUM(sales_30d) AS total_sales_30d
+                FROM amazon_ads_raw_reports {where_sql}
+            """, params)
+            summary = cur.fetchone()
+            if summary:
+                summary = dict(summary)
+                summary = _compute_raw_metrics(summary)
+
+            # 根据报告类型选择返回字段
+            if report_type == "spSearchTerm":
+                select_cols = ("campaign_name, ad_group_name, keyword_text, keyword_type, "
+                               "keyword_match_type, customer_search_term, "
+                               "impressions, clicks, cost, purchases_7d, sales_7d, report_date")
+            elif report_type == "spTargeting":
+                select_cols = ("campaign_name, ad_group_name, keyword_text, keyword_type, "
+                               "keyword_match_type, targeting_expression, "
+                               "impressions, clicks, cost, purchases_7d, sales_7d, report_date")
+            elif report_type == "spCampaigns":
+                select_cols = ("campaign_name, campaign_status, campaign_budget, campaign_budget_type, "
+                               "impressions, clicks, cost, "
+                               "purchases_7d, purchases_14d, purchases_30d, "
+                               "sales_7d, sales_14d, sales_30d, report_date")
+            else:  # spAdvertisedProduct
+                select_cols = ("campaign_name, ad_group_name, advertised_asin, advertised_sku, "
+                               "impressions, clicks, cost, "
+                               "purchases_7d, purchases_30d, sales_7d, sales_30d, report_date")
+
+            # 数据库排序 vs 内存排序 (计算字段 ctr/cpc/acos/roas 需内存排序)
+            if is_db_sort:
+                sort_sql = f"ORDER BY {sort_by} {'DESC' if is_desc else 'ASC'}"
+                cur.execute(f"""
+                    SELECT {select_cols}
+                    FROM amazon_ads_raw_reports
+                    {where_sql}
+                    {sort_sql}
+                    LIMIT %s OFFSET %s
+                """, params + [page_size, (page - 1) * page_size])
+                rows = cur.fetchall()
+                cur.execute(f"SELECT COUNT(1) AS cnt FROM amazon_ads_raw_reports {where_sql}", params)
+                total = cur.fetchone()["cnt"]
+
+                list_data = []
+                for r in rows:
+                    d = dict(r)
+                    d = _compute_raw_metrics(d)
+                    d = _add_labels(d)
+                    list_data.append(d)
+            else:
+                # 计算字段排序: 先取全部 → 计算 → 内存排序 → 分页
+                cur.execute(f"""
+                    SELECT {select_cols}
+                    FROM amazon_ads_raw_reports
+                    {where_sql}
+                """, params)
+                all_rows = cur.fetchall()
+
+                list_data = []
+                for r in all_rows:
+                    d = dict(r)
+                    d = _compute_raw_metrics(d)
+                    d = _add_labels(d)
+                    list_data.append(d)
+
+                total = len(list_data)
+                # 内存排序 (None 排最后, 不管升序还是降序)
+                def _sort_key(d):
+                    v = d.get(sort_by)
+                    if v is None:
+                        return (1, 0) if is_desc else (1, float('inf'))
+                    return (0, float(v))
+                list_data.sort(key=_sort_key, reverse=is_desc)
+
+                # 内存分页
+                offset = (page - 1) * page_size
+                list_data = list_data[offset:offset + page_size]
+
+        return {
+            "list": _to_json_serializable(list_data),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "summary": _to_json_serializable(summary),
+        }
+    finally:
+        conn.close()
+
+
+@reports_bp.route('/reports/advertising/search-terms', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def list_search_terms():
+    """
+    客户搜索词详情 (spSearchTerm)
+
+    简介: 查看客户实际搜索的关键词表现，对标 Amazon 后台「搜索词」页签。
+
+    查询参数:
+        start_date / end_date  日期范围
+        campaign_id            按活动筛选
+        ad_group_id            按广告组筛选
+        keyword                按搜索词模糊搜索
+        shop_id                店铺ID
+        sort_by                排序字段 (impressions/clicks/cost/purchases_7d/sales_7d/customer_search_term)
+        sort_dir               asc / desc
+        page / page_size       分页
+    """
+    try:
+        p = _parse_pagination()
+        result = _query_raw_reports(
+            report_type="spSearchTerm",
+            shop_id=_get_shop_id_optional(),
+            start_date=request.args.get("start_date", "").strip() or None,
+            end_date=request.args.get("end_date", "").strip() or None,
+            campaign_id=request.args.get("campaign_id", "").strip() or None,
+            ad_group_id=request.args.get("ad_group_id", "").strip() or None,
+            keyword=request.args.get("keyword", "").strip() or None,
+            sort_by=request.args.get("sort_by", "cost").strip(),
+            sort_dir=request.args.get("sort_dir", "desc").strip(),
+            page=p[0], page_size=p[1],
+        )
+        return jsonify({"status": "success", "data": result})
+    except Exception as e:
+        print(f"[list_search_terms] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/targeting', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def list_targeting():
+    """
+    关键词定向详情 (spTargeting)
+
+    简介: 查看广告关键词/定向的表现，对标 Amazon 后台「定向」页签。
+
+    查询参数: 同 search-terms, sort_by 多了 keyword_text/keyword_type
+    """
+    try:
+        p = _parse_pagination()
+        result = _query_raw_reports(
+            report_type="spTargeting",
+            shop_id=_get_shop_id_optional(),
+            start_date=request.args.get("start_date", "").strip() or None,
+            end_date=request.args.get("end_date", "").strip() or None,
+            campaign_id=request.args.get("campaign_id", "").strip() or None,
+            ad_group_id=request.args.get("ad_group_id", "").strip() or None,
+            keyword=request.args.get("keyword", "").strip() or None,
+            sort_by=request.args.get("sort_by", "cost").strip(),
+            sort_dir=request.args.get("sort_dir", "desc").strip(),
+            page=p[0], page_size=p[1],
+        )
+        return jsonify({"status": "success", "data": result})
+    except Exception as e:
+        print(f"[list_targeting] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/campaigns', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def list_campaigns_detail():
+    """
+    广告活动详情 (spCampaigns)
+
+    简介: 查看每个活动的完整指标（含14d/30d归因），对标 Amazon 后台「广告活动」页签。
+
+    查询参数: 同 search-terms, sort_by 多了 campaign_name, purchases_14d, sales_14d 等
+    """
+    try:
+        p = _parse_pagination()
+        result = _query_raw_reports(
+            report_type="spCampaigns",
+            shop_id=_get_shop_id_optional(),
+            start_date=request.args.get("start_date", "").strip() or None,
+            end_date=request.args.get("end_date", "").strip() or None,
+            campaign_id=request.args.get("campaign_id", "").strip() or None,
+            keyword=request.args.get("keyword", "").strip() or None,
+            sort_by=request.args.get("sort_by", "cost").strip(),
+            sort_dir=request.args.get("sort_dir", "desc").strip(),
+            page=p[0], page_size=p[1],
+        )
+        return jsonify({"status": "success", "data": result})
+    except Exception as e:
+        print(f"[list_campaigns_detail] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/products', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def list_products_detail():
+    """
+    推广商品详情 (spAdvertisedProduct)
+
+    简介: 查看每个推广ASIN的表现，对标 Amazon 后台「推广的商品」页签。
+
+    查询参数: 同 search-terms, sort_by 多了 advertised_asin/advertised_sku
+    """
+    try:
+        p = _parse_pagination()
+        result = _query_raw_reports(
+            report_type="spAdvertisedProduct",
+            shop_id=_get_shop_id_optional(),
+            start_date=request.args.get("start_date", "").strip() or None,
+            end_date=request.args.get("end_date", "").strip() or None,
+            campaign_id=request.args.get("campaign_id", "").strip() or None,
+            ad_group_id=request.args.get("ad_group_id", "").strip() or None,
+            asin=request.args.get("asin", "").strip() or None,
+            keyword=request.args.get("keyword", "").strip() or None,
+            sort_by=request.args.get("sort_by", "cost").strip(),
+            sort_dir=request.args.get("sort_dir", "desc").strip(),
+            page=p[0], page_size=p[1],
+        )
+        return jsonify({"status": "success", "data": result})
+    except Exception as e:
+        print(f"[list_products_detail] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
 # 7. 一键生成昨日全部报表
 # ============================================================
 
