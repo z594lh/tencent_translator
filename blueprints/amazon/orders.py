@@ -388,13 +388,23 @@ def _get_order_ids(shop_id, order_statuses=None):
 # ==================== 数据库操作 ====================
 
 def _iso_to_datetime(iso_str):
-    """将 ISO 8601 时间字符串转为 MySQL DATETIME 格式"""
+    """将 Amazon SP-API 返回的 ISO 8601 UTC 时间转为北京时间 (UTC+8) MySQL DATETIME"""
     if not iso_str:
         return None
+    from datetime import datetime, timedelta, timezone
     if isinstance(iso_str, str):
-        iso_str = iso_str.replace('Z', '')
-        if '+' in iso_str:
-            iso_str = iso_str.split('+')[0]
+        s = iso_str.replace('Z', '+00:00')
+        try:
+            dt = datetime.fromisoformat(s)
+            # 转为北京时间
+            dt_cn = dt.astimezone(timezone(timedelta(hours=8)))
+            return dt_cn.strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, TypeError):
+            # 兜底: 旧格式兼容
+            s = iso_str.replace('Z', '')
+            if '+' in s:
+                s = s.split('+')[0]
+            return s
     return iso_str
 
 
