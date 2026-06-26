@@ -388,16 +388,35 @@ def _get_order_ids(shop_id, order_statuses=None):
 # ==================== 数据库操作 ====================
 
 def _iso_to_datetime(iso_str):
-    """将 Amazon SP-API 返回的 ISO 8601 UTC 时间转为 MySQL DATETIME (不含时区)"""
+    """将 Amazon SP-API 返回的 ISO 8601 UTC 时间转为 PDT (UTC-7) MySQL DATETIME
+    与 Amazon 卖家后台显示时间一致
+    """
     if not iso_str:
         return None
     if isinstance(iso_str, str):
-        s = iso_str.replace('Z', '')
-        if '+' in s:
-            s = s.split('+')[0]
-        if '-' in s and 'T' in s:  # 带负时区偏移
-            s = s.split('-')[0] if s.count('-') > 2 else s
-        return s.strip()
+        from datetime import datetime, timedelta, timezone as dt_timezone
+        s = iso_str.strip()
+        # 标准化为带时区的 ISO 8601
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        elif '+' not in s and '-' in s and 'T' in s:
+            # -07:00 / -08:00 等负偏移已带时区，无需处理
+            pass
+
+        try:
+            dt_utc = datetime.fromisoformat(s)
+            # 转为 PDT (UTC-7)，与 Amazon 卖家后台显示一致
+            pdt_tz = dt_timezone(timedelta(hours=-7))
+            dt_pdt = dt_utc.astimezone(pdt_tz)
+            return dt_pdt.strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, TypeError):
+            # 降级: 去除时区信息，保留原始值
+            s = iso_str.replace('Z', '')
+            if '+' in s:
+                s = s.split('+')[0]
+            if '-' in s and 'T' in s:
+                s = s.split('-')[0] if s.count('-') > 2 else s
+            return s.strip()
     return iso_str
 
 
@@ -467,7 +486,7 @@ def sync_orders_to_db(shop_id, orders):
                         fulfillment_supply_source_id, automated_shipping_has_settings,
                         seller_note, easy_ship_shipment_status, electronic_invoice_status,
                         cba_displayable_shipping_label, regulated_information,
-                        sync_time
+                        sync_time, timezone
                     ) VALUES (
                         %s, %s, %s, %s,
                         %s, %s, %s,
@@ -497,7 +516,8 @@ def sync_orders_to_db(shop_id, orders):
                         %s, %s, %s,
                         %s, %s,
                         %s, %s,
-                        NOW()
+                        NOW(),
+                        'America/Los_Angeles'
                     )
                     ON DUPLICATE KEY UPDATE
                         marketplace_id = VALUES(marketplace_id),
@@ -567,6 +587,7 @@ def sync_orders_to_db(shop_id, orders):
                         electronic_invoice_status = VALUES(electronic_invoice_status),
                         cba_displayable_shipping_label = VALUES(cba_displayable_shipping_label),
                         regulated_information = VALUES(regulated_information),
+                        timezone = VALUES(timezone),
                         sync_time = NOW()
                 """
 

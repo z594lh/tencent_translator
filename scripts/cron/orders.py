@@ -53,17 +53,17 @@ def _sync_order_items_batch(shop_id, order_ids, label=""):
 
 def run_recent():
     from blueprints.amazon.orders import _sync_orders
-    now = datetime.now()
+    now = datetime.utcnow()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     shops = get_all_active_shops()
     if not shops:
-        print(f"[{now_str}] [Cron] 没有启用的店铺，跳过订单同步")
+        print(f"[{now_str} UTC] [Cron] 没有启用的店铺，跳过订单同步")
         return
 
     for shop in shops:
         shop_name = shop.get('shop_name', f"shop_{shop['id']}")
         shop_id = shop['id']
-        print(f"[{now_str}] [Cron] 店铺[{shop_name}] 开始近期订单同步(24h)...")
+        print(f"[{now_str} UTC] [Cron] 店铺[{shop_name}] 开始近期订单同步(24h)...")
         try:
             last_updated_after = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
             result = _sync_orders(shop_id=shop_id, last_updated_after=last_updated_after)
@@ -83,7 +83,7 @@ def run_recent():
 
 def run_week():
     from blueprints.amazon.orders import _sync_orders
-    now = datetime.now()
+    now = datetime.utcnow()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     shops = get_all_active_shops()
     if not shops:
@@ -126,7 +126,7 @@ def run_week():
 
 def run_month():
     from blueprints.amazon.orders import _sync_orders
-    now = datetime.now()
+    now = datetime.utcnow()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     shops = get_all_active_shops()
     if not shops:
