@@ -278,8 +278,14 @@ def _extract_fees_from_items(items):
         for bd in item.get("breakdowns", []) or []:
             bt = bd.get("breakdownType", "")
             if bt == "ProductCharges":
-                for sub in bd.get("breakdowns", []) or []:
-                    amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+                subs = bd.get("breakdowns", []) or []
+                if subs:
+                    for sub in subs:
+                        amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+                        if amt > 0:
+                            pc += amt
+                else:
+                    amt = float((bd.get("breakdownAmount") or {}).get("currencyAmount", 0))
                     if amt > 0:
                         pc += amt
             elif bt == "AmazonFees":
@@ -301,24 +307,30 @@ def _extract_fees_from_items(items):
 def _update_product_real_fees(shop_id, items):
     """从 Shipment 的 items_json 解析每 SKU 的实际 FBA 费 + 佣金率，回写 amazon_product_fees"""
     for item in (items or []):
-        # 找 SKU
+        # 找 SKU + 数量
         sku = ""
+        qty = 1
         for ctx in (item.get("contexts", []) or []):
             if ctx.get("contextType") == "ProductContext":
                 sku = ctx.get("sku", "") or ""
+                qty = max(1, int(ctx.get("quantityShipped", 1) or 1))
                 break
         if not sku:
             continue
 
-        # 解析 item-level breakdowns 取实际费用
+        # 解析 item-level breakdowns (按件均摊) 取实际费用
         fba = 0.0
         comm = 0.0
         price = 0.0
         for bd in (item.get("breakdowns", []) or []):
             bt = bd.get("breakdownType", "")
             if bt == "ProductCharges":
-                for sub in (bd.get("breakdowns", []) or []):
-                    price += float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+                subs = bd.get("breakdowns", []) or []
+                if subs:
+                    for sub in subs:
+                        price += float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+                else:
+                    price += float((bd.get("breakdownAmount") or {}).get("currencyAmount", 0))
             elif bt == "AmazonFees":
                 for sub in (bd.get("breakdowns", []) or []):
                     amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
@@ -332,6 +344,8 @@ def _update_product_real_fees(shop_id, items):
         if fba <= 0 and comm <= 0:
             continue
 
+        # 按数量均摊到单件
+        fba_per_unit = round(fba / qty, 2)
         rate = round(comm / price, 4) if price > 0 else None
 
         conn = get_db_connection()
@@ -341,13 +355,13 @@ def _update_product_real_fees(shop_id, items):
                     UPDATE amazon_product_fees
                     SET real_fba_fee = %s, real_commission_rate = %s, updated_at = NOW()
                     WHERE shop_id = %s AND sku = %s
-                """, (round(fba, 2), rate, shop_id, sku))
+                """, (fba_per_unit, rate, shop_id, sku))
                 if c.rowcount == 0:
                     c.execute("""
                         INSERT INTO amazon_product_fees
                             (shop_id, sku, asin, commission_rate, fba_fee, real_fba_fee, real_commission_rate, currency)
                         VALUES (%s, %s, '', 0.15, 0, %s, %s, 'USD')
-                    """, (shop_id, sku, round(fba, 2), rate))
+                    """, (shop_id, sku, fba_per_unit, rate))
             conn.commit()
         finally:
             conn.close()
