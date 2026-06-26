@@ -153,57 +153,56 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     """
     生成 settled（完整已结算）日报数据
 
-    简介: 从 amazon_order_finances 拉取 Amazon 已结算的真实流水，结合内部成本计算利润。
+    简介: 按下单日期 (DATE(o.purchase_date)) 聚合已结算 Shipment 订单的费用和利润。
+          未结算或已取消的订单不参与聚合。
 
     详细:
       - total_sales: 优先用 product_charges（售价），旧数据回退 total_amount（净额）
       - fba_fees / commission: 从 items_json breakdowns 解析的真实费用
       - 内部成本: 从 profit_calculator 按 SKU 逐项计算（采购成本+头程）
-      - 退款: 从 finances 的 Refund 交易汇总
+      - 退款: 从 finances 按订单的 purchase_date 汇总 Refund 交易
       - 广告费: 从 amazon_ads_raw_reports 汇总
-      - 无 finance 数据时返回 None 让调用方回退到 estimated
+      - 无已结算订单时返回 None 让调用方回退到 estimated
     """
-    cursor.execute(
-        """SELECT 1 FROM amazon_order_finances
-           WHERE shop_id = %s AND DATE(posted_date) = %s
-             AND transaction_type = 'Shipment' LIMIT 1""",
-        (sid, report_date),
-    )
-    if not cursor.fetchone():
-        return None
-
-    # 1. Shipment 交易汇总（收入 + 费用，优先使用解析后的列）
+    # 1. 按 purchase_date 汇总 Shipment 收入 + 费用（JOIN orders 取 purchase_date）
     cursor.execute("""
         SELECT
-            COUNT(DISTINCT amazon_order_id) AS order_count,
-            COALESCE(SUM(product_charges), 0) AS total_product_charges,
-            COALESCE(SUM(total_amount), 0) AS total_net_sales,
-            COALESCE(SUM(fba_fees), 0) AS total_fba_fees,
-            COALESCE(SUM(commission), 0) AS total_commission
-        FROM amazon_order_finances
-        WHERE shop_id = %s
-          AND DATE(posted_date) = %s
-          AND transaction_type = 'Shipment'
+            COUNT(DISTINCT o.amazon_order_id) AS order_count,
+            COALESCE(SUM(f.product_charges), 0) AS total_product_charges,
+            COALESCE(SUM(f.total_amount), 0) AS total_net_sales,
+            COALESCE(SUM(f.fba_fees), 0) AS total_fba_fees,
+            COALESCE(SUM(f.commission), 0) AS total_commission
+        FROM amazon_orders o
+        JOIN amazon_order_finances f
+            ON o.amazon_order_id = f.amazon_order_id COLLATE utf8mb4_unicode_ci
+            AND o.shop_id = f.shop_id
+        WHERE o.shop_id = %s
+          AND DATE(o.purchase_date) = %s
+          AND f.transaction_type = 'Shipment'
+          AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
     """, (sid, report_date))
     ship_row = cursor.fetchone()
     order_count = int(ship_row['order_count'] or 0)
+    if order_count == 0:
+        return None
 
-    # 有 product_charges 新数据 → 用售价作为 total_sales (真实流水)
     if float(ship_row['total_product_charges'] or 0) > 0:
         total_sales = Decimal(str(ship_row['total_product_charges'] or 0))
         total_fba_fees = Decimal(str(ship_row['total_fba_fees'] or 0))
         total_commission = Decimal(str(ship_row['total_commission'] or 0))
     else:
-        # 旧数据兼容: product_charges 为空则用 net + fees=0
         total_sales = Decimal(str(ship_row['total_net_sales'] or 0))
         total_fba_fees = Decimal('0')
         total_commission = Decimal('0')
 
-    # 2. 获取所有 Shipment 交易的 items，解析 SKU 级别数据
+    # 2. 获取该日期已结算订单的 items，解析 SKU 级别数据
     cursor.execute("""
-        SELECT items_json FROM amazon_order_finances
-        WHERE shop_id = %s AND DATE(posted_date) = %s
-          AND transaction_type = 'Shipment'
+        SELECT f.items_json FROM amazon_order_finances f
+        JOIN amazon_orders o
+            ON o.amazon_order_id = f.amazon_order_id COLLATE utf8mb4_unicode_ci AND o.shop_id = f.shop_id
+        WHERE o.shop_id = %s AND DATE(o.purchase_date) = %s
+          AND f.transaction_type = 'Shipment'
+          AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
     """, (sid, report_date))
     txn_rows = cursor.fetchall()
 
@@ -237,13 +236,15 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
             print(f"[Report] SKU {sku} 成本计算异常: {e}")
             continue
 
-    # 4. 退款（从 finances Refund 交易）
+    # 4. 退款（按订单 purchase_date 汇总 Refund）
     cursor.execute("""
-        SELECT COALESCE(SUM(ABS(total_amount)), 0) AS refund_sum
-        FROM amazon_order_finances
-        WHERE shop_id = %s
-          AND DATE(posted_date) = %s
-          AND transaction_type = 'Refund'
+        SELECT COALESCE(SUM(ABS(f.total_amount)), 0) AS refund_sum
+        FROM amazon_order_finances f
+        JOIN amazon_orders o
+            ON o.amazon_order_id = f.amazon_order_id COLLATE utf8mb4_unicode_ci AND o.shop_id = f.shop_id
+        WHERE o.shop_id = %s
+          AND DATE(o.purchase_date) = %s
+          AND f.transaction_type = 'Refund'
     """, (sid, report_date))
     refund_row = cursor.fetchone()
     refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
@@ -258,7 +259,7 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     ad_row = cursor.fetchone()
     ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
 
-    # 6. 汇总计算 (总费用 = 采购成本 + 头程 + FBA费 + 佣金 + 退款 + 广告)
+    # 6. 汇总计算
     total_cost = total_product_cost + total_headway + total_fba_fees + total_commission + refund_amount + ad_cost
     gross_profit = total_sales - total_cost
     gross_profit_rate = (gross_profit / total_sales) if total_sales > 0 else Decimal('0')
@@ -373,7 +374,14 @@ def generate_business_daily(report_date, shop_id=None):
                     else:
                         d = _generate_estimated_daily(cursor, sid, report_date)
                         if d['total_sales'] == 0:
-                            print(f"[Report] {report_date} shop={sid}: 无销售数据，跳过")
+                            # 删除残留的旧报表数据 (如之前 posted_date 产生的错位行)
+                            cursor.execute(
+                                "DELETE FROM report_business WHERE shop_id=%s AND report_type='daily' AND report_date=%s",
+                                (sid, report_date))
+                            if cursor.rowcount:
+                                print(f"[Report] {report_date} shop={sid}: 无销售数据，清除旧记录 ({cursor.rowcount} 行)")
+                            else:
+                                print(f"[Report] {report_date} shop={sid}: 无销售数据，跳过")
                             continue
                         print(f"[Report] {report_date} shop={sid} estimated: sales={d['total_sales']}, "
                               f"orders={d['order_count']} (finance 未到达)")
@@ -923,6 +931,8 @@ def generate_inventory_turnover(shop_id=None):
 
                         last_sale_date = sales_map.get(sku, {}).get('last_sale_date')
                         if last_sale_date:
+                            if isinstance(last_sale_date, str):
+                                last_sale_date = datetime.strptime(last_sale_date, '%Y-%m-%d').date()
                             days_without_sale = (datetime.now().date() - last_sale_date).days
                         else:
                             days_without_sale = 999
