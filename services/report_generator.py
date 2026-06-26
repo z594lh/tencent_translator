@@ -156,11 +156,11 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     简介: 从 amazon_order_finances 拉取 Amazon 已结算的真实流水，结合内部成本计算利润。
 
     详细:
-      - total_sales: ship 交易的 totalAmount 汇总（Amazon 实际打款净额）
+      - total_sales: 优先用 product_charges（售价），旧数据回退 total_amount（净额）
+      - fba_fees / commission: 从 items_json breakdowns 解析的真实费用
       - 内部成本: 从 profit_calculator 按 SKU 逐项计算（采购成本+头程）
       - 退款: 从 finances 的 Refund 交易汇总
-      - 广告费: 从 amazon_ad_spend 读取
-      - platform_fees / fba_fees: 设为 0（已从 total_sales 中扣除）
+      - 广告费: 从 amazon_ads_raw_reports 汇总
       - 无 finance 数据时返回 None 让调用方回退到 estimated
     """
     cursor.execute(
@@ -172,19 +172,32 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     if not cursor.fetchone():
         return None
 
-    # 1. Shipment 交易汇总（收入）
+    # 1. Shipment 交易汇总（收入 + 费用，优先使用解析后的列）
     cursor.execute("""
         SELECT
             COUNT(DISTINCT amazon_order_id) AS order_count,
-            COALESCE(SUM(total_amount), 0) AS total_sales
+            COALESCE(SUM(product_charges), 0) AS total_product_charges,
+            COALESCE(SUM(total_amount), 0) AS total_net_sales,
+            COALESCE(SUM(fba_fees), 0) AS total_fba_fees,
+            COALESCE(SUM(commission), 0) AS total_commission
         FROM amazon_order_finances
         WHERE shop_id = %s
           AND DATE(posted_date) = %s
           AND transaction_type = 'Shipment'
     """, (sid, report_date))
     ship_row = cursor.fetchone()
-    total_sales = Decimal(str(ship_row['total_sales'] or 0))
     order_count = int(ship_row['order_count'] or 0)
+
+    # 有 product_charges 新数据 → 用售价作为 total_sales (真实流水)
+    if float(ship_row['total_product_charges'] or 0) > 0:
+        total_sales = Decimal(str(ship_row['total_product_charges'] or 0))
+        total_fba_fees = Decimal(str(ship_row['total_fba_fees'] or 0))
+        total_commission = Decimal(str(ship_row['total_commission'] or 0))
+    else:
+        # 旧数据兼容: product_charges 为空则用 net + fees=0
+        total_sales = Decimal(str(ship_row['total_net_sales'] or 0))
+        total_fba_fees = Decimal('0')
+        total_commission = Decimal('0')
 
     # 2. 获取所有 Shipment 交易的 items，解析 SKU 级别数据
     cursor.execute("""
@@ -218,8 +231,8 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     for sku, qty in sku_qty.items():
         try:
             unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
-            total_product_cost += Decimal(str(unit_costs.purchase_cost)) * qty
-            total_headway += Decimal(str(unit_costs.headway_cost)) * qty
+            total_product_cost += unit_costs.purchase_cost_usd * qty
+            total_headway += unit_costs.headway_cost_usd * qty
         except Exception as e:
             print(f"[Report] SKU {sku} 成本计算异常: {e}")
             continue
@@ -245,8 +258,8 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
     ad_row = cursor.fetchone()
     ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
 
-    # 6. 汇总计算
-    total_cost = total_product_cost + total_headway + refund_amount + ad_cost
+    # 6. 汇总计算 (总费用 = 采购成本 + 头程 + FBA费 + 佣金 + 退款 + 广告)
+    total_cost = total_product_cost + total_headway + total_fba_fees + total_commission + refund_amount + ad_cost
     gross_profit = total_sales - total_cost
     gross_profit_rate = (gross_profit / total_sales) if total_sales > 0 else Decimal('0')
     headway_ratio = (total_headway / total_sales) if total_sales > 0 else Decimal('0')
@@ -258,8 +271,8 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
         'sku_count': sku_count,
         'total_product_cost': total_product_cost,
         'total_headway': total_headway,
-        'total_fba_fees': Decimal('0'),
-        'total_commission': Decimal('0'),
+        'total_fba_fees': total_fba_fees,
+        'total_commission': total_commission,
         'ad_cost': ad_cost,
         'refund_amount': refund_amount,
         'refund_rate': refund_rate,
@@ -649,6 +662,48 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                     if exchange_rate is None:
                         exchange_rate = get_exchange_rate(cursor)
 
+                    # 0. 预聚合: 从 finances items_json 解析真实 FBA 费 + 佣金 (按 SKU/按 item)
+                    cursor.execute("""
+                        SELECT items_json
+                        FROM amazon_order_finances
+                        WHERE shop_id = %s
+                          AND transaction_type = 'Shipment'
+                          AND posted_date BETWEEN %s AND %s
+                    """, (sid, period_start, period_end))
+                    finance_rows = cursor.fetchall()
+
+                    sku_fees = {}
+                    for frow in finance_rows:
+                        items = frow['items_json']
+                        if isinstance(items, str):
+                            try:
+                                items = json.loads(items)
+                            except (json.JSONDecodeError, TypeError):
+                                items = []
+                        for item in (items or []):
+                            # 每 item 有独立的 breakdowns → 解析 item-level 费用
+                            it_fba = 0.0
+                            it_com = 0.0
+                            for bd in (item.get('breakdowns', []) or []):
+                                bt = bd.get('breakdownType', '')
+                                if bt == 'AmazonFees':
+                                    for sub in (bd.get('breakdowns', []) or []):
+                                        amt = float((sub.get('breakdownAmount') or {}).get('currencyAmount', 0))
+                                        st = sub.get('breakdownType', '')
+                                        if amt < 0:
+                                            if st.startswith('FBAPer'):
+                                                it_fba += abs(amt)
+                                            elif st == 'Commission':
+                                                it_com += abs(amt)
+                            # 找 SKU
+                            for ctx in (item.get('contexts', []) or []):
+                                if ctx.get('contextType') == 'ProductContext':
+                                    sku = ctx.get('sku', '') or ''
+                                    if sku and (it_fba > 0 or it_com > 0):
+                                        entry = sku_fees.setdefault(sku, {'fba': 0.0, 'commission': 0.0})
+                                        entry['fba'] += it_fba
+                                        entry['commission'] += it_com
+
                     # 1. 聚合销售数据
                     cursor.execute("""
                         SELECT
@@ -689,7 +744,7 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         ad_row = cursor.fetchone()
                         ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
 
-                        # 退款（按 ASIN 汇总，无数据则记0）
+                        # 退款（按 ASIN 汇总）
                         cursor.execute("""
                             SELECT COALESCE(SUM(refund_amount), 0) AS refund_sum
                             FROM amazon_refund_records
@@ -699,16 +754,25 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         refund_row = cursor.fetchone()
                         refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
 
+                        # 真实 FBA 费 + 佣金（从预聚合字典取，没有则回退估算）
+                        real_fba = Decimal(str(sku_fees.get(sku, {}).get('fba', 0)))
+                        real_commission = Decimal(str(sku_fees.get(sku, {}).get('commission', 0)))
+                        if real_fba > 0 or real_commission > 0:
+                            fba_fees = real_fba
+                            platform_fees = real_commission
+                        else:
+                            profit = calculate_profit(sales_amount, sales_qty, unit_costs, Decimal('0'), Decimal('0'))
+                            fba_fees = profit.fba_fees
+                            platform_fees = profit.commission
+
                         # 统一利润公式
-                        profit = calculate_profit(sales_amount, sales_qty, unit_costs, ad_cost, refund_amount)
-                        product_cost = profit.product_cost
-                        fba_fees = profit.fba_fees
-                        platform_fees = profit.commission
-                        headway_cost = profit.headway_cost
-                        gross_profit = profit.gross_profit
-                        net_profit = profit.net_profit
-                        profit_margin = profit.profit_margin
-                        other_fees = profit.other_fees
+                        product_cost = unit_costs.purchase_cost_usd * sales_qty
+                        headway_cost = unit_costs.headway_cost_usd * sales_qty
+                        total_cost = product_cost + headway_cost + fba_fees + platform_fees + ad_cost + refund_amount
+                        gross_profit = sales_amount - total_cost
+                        net_profit = gross_profit
+                        profit_margin = (net_profit / sales_amount) if sales_amount > 0 else Decimal('0')
+                        other_fees = Decimal('0')
 
                         cursor.execute("""
                             INSERT INTO sku_profit (

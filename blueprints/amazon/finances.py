@@ -211,8 +211,12 @@ def _fetch_transactions_from_api(shop_id, order_id):
     transactions = []
     next_token = None
 
+    from datetime import datetime, timedelta
+    posted_after = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     while True:
         resp = client.list_financial_transactions(
+            posted_after=posted_after,
             marketplace_id=client.marketplace_id,
             related_identifier=f"ORDER_ID={order_id}",
             next_token=next_token,
@@ -258,6 +262,39 @@ def _fetch_transactions_by_date_range(shop_id, posted_after, posted_before):
 
 
 # ============================================================
+# 辅助函数 — 费用解析
+# ============================================================
+
+def _extract_fees_from_items(items):
+    """从 items_json 数组的 breakdowns 中提取产品售价、FBA费、佣金
+
+    返回: (product_charges, fba_fees, commission) 均为正数
+    """
+    pc = 0.0   # ProductCharges (售价, 正数)
+    fb = 0.0   # FBA fees (正数=费用)
+    cm = 0.0   # Commission (正数=费用)
+
+    for item in (items or []):
+        for bd in item.get("breakdowns", []) or []:
+            bt = bd.get("breakdownType", "")
+            if bt == "ProductCharges":
+                for sub in bd.get("breakdowns", []) or []:
+                    amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+                    if amt > 0:
+                        pc += amt
+            elif bt == "AmazonFees":
+                for sub in bd.get("breakdowns", []) or []:
+                    amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+                    if amt < 0:
+                        if sub.get("breakdownType", "").startswith("FBAPer"):
+                            fb += abs(amt)
+                        elif sub.get("breakdownType", "") == "Commission":
+                            cm += abs(amt)
+
+    return round(pc, 2), round(fb, 2), round(cm, 2)
+
+
+# ============================================================
 # 辅助函数 — 数据库操作
 # ============================================================
 
@@ -289,29 +326,36 @@ def _save_transactions_to_db(shop_id, order_id, transactions):
                 marketplace_details = txn.get("marketplaceDetails", {}) or {}
                 marketplace_id = marketplace_details.get("marketplaceId", "")
 
-                items_json = json.dumps(txn.get("items", []), ensure_ascii=False)
-                breakdowns = txn.get("breakdowns", {}) or {}
-                breakdowns_json = json.dumps(breakdowns.get("breakdowns", []), ensure_ascii=False)
+                items = txn.get("items", []) or []
+                items_json = json.dumps(items, ensure_ascii=False)
+                breakdowns = txn.get("breakdowns", []) or []
+                breakdowns_json = json.dumps(breakdowns, ensure_ascii=False)
                 raw_json = json.dumps(txn, ensure_ascii=False)
 
-                # 如果传入了 order_id 参数就用它，否则从 relatedIdentifiers 中提取
-                effective_order_id = order_id
-                if not effective_order_id:
-                    for ri in txn.get("relatedIdentifiers", []):
-                        if ri.get("relatedIdentifierName") == "ORDER_ID":
-                            effective_order_id = ri.get("relatedIdentifierValue", "")
-                            break
+                # 解析费用明细
+                product_charges, fba_fees, commission = _extract_fees_from_items(items)
 
+                # 从 relatedIdentifiers 中提取真实的 ORDER_ID
+                effective_order_id = ""
+                for ri in txn.get("relatedIdentifiers", []):
+                    if ri.get("relatedIdentifierName") == "ORDER_ID":
+                        effective_order_id = ri.get("relatedIdentifierValue", "")
+                        break
+
+                # 没有 ORDER_ID 的是店铺级费用 (ServiceFee/ProductAdsPayment/月度仓储费等)，也保留
                 if not effective_order_id:
-                    continue
+                    effective_order_id = ""
+                    description = txn.get("description", "")
 
                 sql = """
                     INSERT INTO amazon_order_finances (
                         shop_id, amazon_order_id, transaction_id,
                         transaction_type, transaction_status, description,
                         posted_date, total_amount, total_currency_code,
+                        product_charges, fba_fees, commission,
                         marketplace_id, items_json, breakdowns_json, raw_json, sync_time
                     ) VALUES (
+                        %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
@@ -325,6 +369,9 @@ def _save_transactions_to_db(shop_id, order_id, transactions):
                         posted_date = VALUES(posted_date),
                         total_amount = VALUES(total_amount),
                         total_currency_code = VALUES(total_currency_code),
+                        product_charges = VALUES(product_charges),
+                        fba_fees = VALUES(fba_fees),
+                        commission = VALUES(commission),
                         marketplace_id = VALUES(marketplace_id),
                         items_json = VALUES(items_json),
                         breakdowns_json = VALUES(breakdowns_json),
@@ -339,6 +386,7 @@ def _save_transactions_to_db(shop_id, order_id, transactions):
                     posted_date,
                     total_amt.get("currencyAmount"),
                     total_amt.get("currencyCode", "USD"),
+                    product_charges or None, fba_fees or None, commission or None,
                     marketplace_id,
                     items_json,
                     breakdowns_json,
