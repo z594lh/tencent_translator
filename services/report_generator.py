@@ -105,46 +105,136 @@ def _check_finances_available(cursor, shop_id, report_date):
     return cursor.fetchone() is not None
 
 
-def _generate_estimated_daily(cursor, sid, report_date):
+def _generate_estimated_daily(cursor, sid, report_date, exchange_rate):
     """
-    生成 estimated（仅销售额）日报数据
+    生成 estimated（预估）日报数据
 
-    简介: 从 amazon_orders + amazon_order_items 仅拉取销售额/订单数/SKU数。
+    简介: 从 amazon_orders + amazon_order_items 拉取销售额/订单数/SKU数，
+          从 amazon_product_fees 估算 FBA 费 + 佣金（finance 数据未到达时用）。
 
     详细:
-      - 不计算成本/利润（finance 数据未到达）
-      - total_sales = 前台售价汇总（gross）
-      - 其他字段全部为 0
+      - total_sales = 前台售价汇总（gross），无 item_price 时取 listing_offers.our_price
+      - fba_fees = SUM(real_fba_fee or fba_fee × qty) 按 SKU 估算
+      - commission = SUM(price × (real_commission_rate or commission_rate or 0.15))
+      - 采购成本/头程 = 从 profit_calculator 按 SKU 计算
+      - 毛利/毛利率 = 销售额 - 全部成本
     """
+    # 1. 订单汇总 + 按 SKU 统计销量 (Pending 订单用 quantity_ordered)
     cursor.execute("""
         SELECT
-            COUNT(DISTINCT o.amazon_order_id) AS order_count,
-            COUNT(DISTINCT oi.seller_sku) AS sku_count,
-            COALESCE(SUM(oi.item_price_amount), 0) AS total_sales
+            oi.seller_sku AS sku,
+            SUM(GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)) AS qty,
+            COALESCE(SUM(oi.item_price_amount), 0) AS sales
         FROM amazon_orders o
-        LEFT JOIN amazon_order_items oi
+        JOIN amazon_order_items oi
             ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
         WHERE o.shop_id = %s
           AND DATE(o.purchase_date) = %s
           AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
+        GROUP BY oi.seller_sku
     """, (sid, report_date))
-    row = cursor.fetchone()
+    sku_rows = cursor.fetchall()
+
+    total_sales = Decimal('0')
+    order_count = 0
+    sku_count = 0
+    total_fba_fees = Decimal('0')
+    total_commission = Decimal('0')
+
+    for sr in sku_rows:
+        sku = sr['sku'] or ''
+        qty = int(sr['qty'] or 0)
+        sales = Decimal(str(sr['sales'] or 0))
+        if not sku or qty <= 0:
+            continue
+
+        # Pending 订单 item_price_amount 为 NULL → 用 listing 售价估算
+        if sales == 0:
+            cursor.execute("""
+                SELECT our_price FROM amazon_listing_offers
+                WHERE shop_id = %s AND sku = %s COLLATE utf8mb4_unicode_ci
+                ORDER BY updated_at DESC LIMIT 1
+            """, (sid, sku))
+            lp = cursor.fetchone()
+            if lp and lp['our_price']:
+                sales = Decimal(str(lp['our_price'])) * qty
+
+        total_sales += sales
+        sku_count += 1
+
+        # 查 amazon_product_fees 估算费率
+        cursor.execute("""
+            SELECT fba_fee, commission_rate, real_fba_fee, real_commission_rate
+            FROM amazon_product_fees
+            WHERE shop_id = %s AND sku = %s LIMIT 1
+        """, (sid, sku))
+        fee_row = cursor.fetchone()
+        if fee_row:
+            fba = Decimal(str(fee_row['real_fba_fee'] or fee_row['fba_fee'] or 0))
+            rate = Decimal(str(fee_row['real_commission_rate'] or fee_row['commission_rate'] or '0.15'))
+        else:
+            fba = Decimal('0')
+            rate = Decimal('0.15')
+
+        total_fba_fees += fba * qty
+        total_commission += (sales * rate).quantize(Decimal('0.01'))
+
+    # 2. 订单数
+    if total_sales > 0 or sku_count > 0:
+        cursor.execute("""
+            SELECT COUNT(DISTINCT amazon_order_id) AS order_count
+            FROM amazon_orders
+            WHERE shop_id = %s
+              AND DATE(purchase_date) = %s
+              AND order_status NOT IN ('Canceled', 'PendingAvailability')
+        """, (sid, report_date))
+        order_count = int(cursor.fetchone()['order_count'] or 0)
+
+    # 3. 内部成本（按 SKU 计算采购成本+头程）
+    total_product_cost = Decimal('0')
+    total_headway = Decimal('0')
+    for sr in sku_rows:
+        sku = sr['sku'] or ''
+        qty = int(sr['qty'] or 0)
+        if not sku or qty <= 0:
+            continue
+        try:
+            unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
+            total_product_cost += unit_costs.purchase_cost_usd * qty
+            total_headway += unit_costs.headway_cost_usd * qty
+        except Exception:
+            continue
+
+    # 4. 广告费
+    cursor.execute("""
+        SELECT COALESCE(SUM(cost), 0) AS ad_sum
+        FROM amazon_ads_raw_reports
+        WHERE shop_id = %s AND report_date = %s
+          AND report_type = 'spCampaigns'
+    """, (sid, report_date))
+    ad_cost = Decimal(str(cursor.fetchone()['ad_sum'] or 0))
+
+    # 5. 汇总
+    total_cost = total_product_cost + total_headway + total_fba_fees + total_commission + ad_cost
+    gross_profit = total_sales - total_cost
+    gross_profit_rate = (gross_profit / total_sales) if total_sales > 0 else Decimal('0')
+    headway_ratio = (total_headway / total_sales) if total_sales > 0 else Decimal('0')
 
     return {
-        'total_sales': Decimal(str(row['total_sales'] or 0)),
-        'order_count': int(row['order_count'] or 0),
-        'sku_count': int(row['sku_count'] or 0),
-        'total_product_cost': Decimal('0'),
-        'total_headway': Decimal('0'),
-        'total_fba_fees': Decimal('0'),
-        'total_commission': Decimal('0'),
-        'ad_cost': Decimal('0'),
+        'total_sales': total_sales,
+        'order_count': order_count,
+        'sku_count': sku_count,
+        'total_product_cost': total_product_cost,
+        'total_headway': total_headway,
+        'total_fba_fees': total_fba_fees,
+        'total_commission': total_commission,
+        'ad_cost': ad_cost,
         'refund_amount': Decimal('0'),
         'refund_rate': Decimal('0'),
-        'total_cost': Decimal('0'),
-        'gross_profit': Decimal('0'),
-        'gross_profit_rate': Decimal('0'),
-        'headway_ratio': Decimal('0'),
+        'total_cost': total_cost,
+        'gross_profit': gross_profit,
+        'gross_profit_rate': gross_profit_rate,
+        'headway_ratio': headway_ratio,
         'data_status': 'estimated',
     }
 
@@ -372,9 +462,9 @@ def generate_business_daily(report_date, shop_id=None):
                         print(f"[Report] {report_date} shop={sid} settled: sales={d['total_sales']}, "
                               f"orders={d['order_count']}, profit={d['gross_profit']}")
                     else:
-                        d = _generate_estimated_daily(cursor, sid, report_date)
-                        if d['total_sales'] == 0:
-                            # 删除残留的旧报表数据 (如之前 posted_date 产生的错位行)
+                        d = _generate_estimated_daily(cursor, sid, report_date, exchange_rate)
+                        if d['total_sales'] == 0 and d['order_count'] == 0:
+                            # 真无数据: 删除残留旧记录
                             cursor.execute(
                                 "DELETE FROM report_business WHERE shop_id=%s AND report_type='daily' AND report_date=%s",
                                 (sid, report_date))

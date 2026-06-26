@@ -156,16 +156,18 @@ def get_commission_rate(cursor, seller_sku: str, shop_id: int = None) -> Tuple[D
     返回 (commission_rate, source)
     """
     try:
-        sql = "SELECT commission_rate FROM amazon_product_fees WHERE sku = %s"
+        sql = "SELECT commission_rate, real_commission_rate FROM amazon_product_fees WHERE sku = %s"
         params = [seller_sku]
         if shop_id is not None:
             sql += " AND shop_id = %s"
             params.append(shop_id)
-        sql += " ORDER BY fetched_at DESC LIMIT 1"
+        sql += " ORDER BY updated_at DESC LIMIT 1"
         cursor.execute(sql, tuple(params))
         row = cursor.fetchone()
-        if row and row.get("commission_rate") is not None:
-            return Decimal(str(row["commission_rate"])), f"amazon_product_fees (SKU: {seller_sku})"
+        if row:
+            rate = row.get("real_commission_rate") or row.get("commission_rate")
+            if rate is not None:
+                return Decimal(str(rate)), f"amazon_product_fees (SKU: {seller_sku})"
     except Exception:
         pass
     return _DEFAULT_COMMISSION_RATE, "default:0.15"
@@ -179,17 +181,18 @@ def get_fba_fee(cursor, billable_weight_kg, seller_sku: str = None, shop_id: int
     """
     try:
         if seller_sku:
-            sql = "SELECT fba_fee FROM amazon_product_fees WHERE sku = %s"
+            sql = "SELECT fba_fee, real_fba_fee FROM amazon_product_fees WHERE sku = %s"
             params = [seller_sku]
             if shop_id is not None:
                 sql += " AND shop_id = %s"
                 params.append(shop_id)
-            sql += " ORDER BY fetched_at DESC LIMIT 1"
+            sql += " ORDER BY updated_at DESC LIMIT 1"
             cursor.execute(sql, tuple(params))
             row = cursor.fetchone()
-            if row and row.get("fba_fee") is not None:
-                fee = Decimal(str(row["fba_fee"]))
-                return fee, f"amazon_product_fees (SKU: {seller_sku})"
+            if row:
+                fee = row.get("real_fba_fee") or row.get("fba_fee")
+                if fee is not None:
+                    return Decimal(str(fee)), f"amazon_product_fees (SKU: {seller_sku})"
     except Exception:
         pass
     return _DEFAULT_FBA_FEE, "Small Standard (default)"

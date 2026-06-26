@@ -295,6 +295,65 @@ def _extract_fees_from_items(items):
 
 
 # ============================================================
+# 辅助函数 — 回写实际费率
+# ============================================================
+
+def _update_product_real_fees(shop_id, items):
+    """从 Shipment 的 items_json 解析每 SKU 的实际 FBA 费 + 佣金率，回写 amazon_product_fees"""
+    for item in (items or []):
+        # 找 SKU
+        sku = ""
+        for ctx in (item.get("contexts", []) or []):
+            if ctx.get("contextType") == "ProductContext":
+                sku = ctx.get("sku", "") or ""
+                break
+        if not sku:
+            continue
+
+        # 解析 item-level breakdowns 取实际费用
+        fba = 0.0
+        comm = 0.0
+        price = 0.0
+        for bd in (item.get("breakdowns", []) or []):
+            bt = bd.get("breakdownType", "")
+            if bt == "ProductCharges":
+                for sub in (bd.get("breakdowns", []) or []):
+                    price += float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+            elif bt == "AmazonFees":
+                for sub in (bd.get("breakdowns", []) or []):
+                    amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
+                    if amt < 0:
+                        st = sub.get("breakdownType", "")
+                        if st.startswith("FBAPer"):
+                            fba += abs(amt)
+                        elif st == "Commission":
+                            comm += abs(amt)
+
+        if fba <= 0 and comm <= 0:
+            continue
+
+        rate = round(comm / price, 4) if price > 0 else None
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as c:
+                c.execute("""
+                    UPDATE amazon_product_fees
+                    SET real_fba_fee = %s, real_commission_rate = %s, updated_at = NOW()
+                    WHERE shop_id = %s AND sku = %s
+                """, (round(fba, 2), rate, shop_id, sku))
+                if c.rowcount == 0:
+                    c.execute("""
+                        INSERT INTO amazon_product_fees
+                            (shop_id, sku, asin, commission_rate, fba_fee, real_fba_fee, real_commission_rate, currency)
+                        VALUES (%s, %s, '', 0.15, 0, %s, %s, 'USD')
+                    """, (shop_id, sku, round(fba, 2), rate))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ============================================================
 # 辅助函数 — 数据库操作
 # ============================================================
 
@@ -393,6 +452,10 @@ def _save_transactions_to_db(shop_id, order_id, transactions):
                     raw_json,
                 ))
                 saved += 1
+
+                # Shipment: 回写实际费率到 amazon_product_fees
+                if txn.get("transactionType") == "Shipment":
+                    _update_product_real_fees(shop_id, items)
 
             conn.commit()
     except Exception:
