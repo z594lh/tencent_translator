@@ -877,40 +877,46 @@ def get_orders_from_db(shop_id, order_status=None, amazon_order_id=None,
                        buyer_name=None, purchase_date_from=None, purchase_date_to=None,
                        page=1, page_size=20):
     """
-    从数据库分页查询订单列表
+    从数据库分页查询订单列表，每个订单附带商品汇总：
+    - sku: seller_sku
+    - quantity: quantity_ordered
+    - name_cn: 本地产品表的中文名（优先 declare_name_cn，其次 product_name）
     """
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            conditions = ["shop_id = %s"]
+            conditions = ["o.shop_id = %s"]
             params = [shop_id]
 
             if order_status:
-                conditions.append("order_status = %s")
+                conditions.append("o.order_status = %s")
                 params.append(order_status)
             if amazon_order_id:
-                conditions.append("amazon_order_id = %s")
+                conditions.append("o.amazon_order_id = %s")
                 params.append(amazon_order_id)
             if buyer_name:
-                conditions.append("buyer_name LIKE %s")
+                conditions.append("o.buyer_name LIKE %s")
                 params.append(f"%{buyer_name}%")
             if purchase_date_from:
-                conditions.append("purchase_date >= %s")
+                conditions.append("o.purchase_date >= %s")
                 params.append(purchase_date_from)
             if purchase_date_to:
-                conditions.append("purchase_date < DATE_ADD(%s, INTERVAL 1 DAY)")
+                conditions.append("o.purchase_date < DATE_ADD(%s, INTERVAL 1 DAY)")
                 params.append(purchase_date_to)
 
             where_clause = " AND ".join(conditions)
 
-            cursor.execute(f"SELECT COUNT(*) as total FROM amazon_orders WHERE {where_clause}", tuple(params))
+            # 1. 查总数
+            cursor.execute(
+                f"SELECT COUNT(*) as total FROM amazon_orders o WHERE {where_clause}",
+                tuple(params)
+            )
             total = cursor.fetchone()['total']
 
+            # 2. 查分页订单
             offset = (page - 1) * page_size
             sql = f"""
-                SELECT
-                    o.*,
-                    (SELECT COUNT(*) FROM amazon_order_items i WHERE i.shop_id = o.shop_id AND i.amazon_order_id = o.amazon_order_id) as item_count
+                SELECT o.*
                 FROM amazon_orders o
                 WHERE {where_clause}
                 ORDER BY o.purchase_date DESC
@@ -918,6 +924,50 @@ def get_orders_from_db(shop_id, order_status=None, amazon_order_id=None,
             """
             cursor.execute(sql, tuple(params + [page_size, offset]))
             rows = cursor.fetchall()
+
+            # 3. 批量查当前页所有订单的商品项（连表 products 取中文名）
+            items_map = {}  # key: amazon_order_id -> list of items
+            if rows:
+                order_ids = [(r['shop_id'], r['amazon_order_id']) for r in rows]
+                # 构建 IN 条件
+                placeholders = ', '.join(['(%s, %s)'] * len(order_ids))
+                flat_ids = [v for pair in order_ids for v in pair]
+
+                items_sql = f"""
+                    SELECT
+                        i.shop_id,
+                        i.amazon_order_id,
+                        i.seller_sku,
+                        i.quantity_ordered,
+                        i.title,
+                        i.asin,
+                        COALESCE(NULLIF(p.declare_name_cn, ''), p.product_name) AS name_cn,
+                        p.image_url AS local_image_url
+                    FROM amazon_order_items i
+                    LEFT JOIN products p ON i.seller_sku = p.seller_sku
+                    WHERE (i.shop_id, i.amazon_order_id) IN ({placeholders})
+                    ORDER BY i.shop_id, i.amazon_order_id, i.id ASC
+                """
+                cursor.execute(items_sql, tuple(flat_ids))
+                for item_row in cursor.fetchall():
+                    oid = item_row['amazon_order_id']
+                    if oid not in items_map:
+                        items_map[oid] = []
+                    items_map[oid].append({
+                        'seller_sku': item_row['seller_sku'],
+                        'quantity_ordered': item_row['quantity_ordered'],
+                        'title': item_row['title'],
+                        'asin': item_row['asin'],
+                        'name_cn': item_row['name_cn'] or '',
+                        'local_image_url': item_row['local_image_url'] or '',
+                    })
+
+            # 4. 将商品列表挂到每个订单上
+            for row in rows:
+                oid = row['amazon_order_id']
+                items = items_map.get(oid, [])
+                row['items'] = items
+                row['item_count'] = len(items)
 
             return {
                 "list": rows,
