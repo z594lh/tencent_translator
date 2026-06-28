@@ -352,16 +352,14 @@ def _update_product_real_fees(shop_id, items):
         try:
             with conn.cursor() as c:
                 c.execute("""
-                    UPDATE amazon_product_fees
-                    SET real_fba_fee = %s, real_commission_rate = %s, updated_at = NOW()
-                    WHERE shop_id = %s AND sku = %s
-                """, (fba_per_unit, rate, shop_id, sku))
-                if c.rowcount == 0:
-                    c.execute("""
-                        INSERT INTO amazon_product_fees
-                            (shop_id, sku, asin, commission_rate, fba_fee, real_fba_fee, real_commission_rate, currency, fetched_at)
-                        VALUES (%s, %s, '', 0.15, 0, %s, %s, 'USD', NOW())
-                    """, (shop_id, sku, fba_per_unit, rate))
+                    INSERT INTO amazon_product_fees
+                        (shop_id, sku, asin, commission_rate, fba_fee, real_fba_fee, real_commission_rate, currency, fetched_at)
+                    VALUES (%s, %s, '', 0.15, 0, %s, %s, 'USD', NOW())
+                    ON DUPLICATE KEY UPDATE
+                        real_fba_fee = VALUES(real_fba_fee),
+                        real_commission_rate = VALUES(real_commission_rate),
+                        updated_at = NOW()
+                """, (shop_id, sku, fba_per_unit, rate))
             conn.commit()
         finally:
             conn.close()
