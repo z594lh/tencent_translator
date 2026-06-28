@@ -359,8 +359,8 @@ def _update_product_real_fees(shop_id, items):
                 if c.rowcount == 0:
                     c.execute("""
                         INSERT INTO amazon_product_fees
-                            (shop_id, sku, asin, commission_rate, fba_fee, real_fba_fee, real_commission_rate, currency)
-                        VALUES (%s, %s, '', 0.15, 0, %s, %s, 'USD')
+                            (shop_id, sku, asin, commission_rate, fba_fee, real_fba_fee, real_commission_rate, currency, fetched_at)
+                        VALUES (%s, %s, '', 0.15, 0, %s, %s, 'USD', NOW())
                     """, (shop_id, sku, fba_per_unit, rate))
             conn.commit()
         finally:
