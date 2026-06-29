@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""财务明细同步（每30分钟：3~7天前订单）"""
+"""财务明细同步（每天：通过日期范围拉取最近30天财务信息）"""
 import os
 import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -11,15 +11,14 @@ from scripts.cron import _now_str
 
 
 def run():
-    from blueprints.amazon.finances import sync_finances_recent
+    from blueprints.amazon.finances import sync_finances_date_range
     now_str = _now_str()
-    print(f"[{now_str}] [Cron] 开始财务明细同步(3~7d ago)...")
+    print(f"[{now_str}] [Cron] 开始财务明细同步(最近30天，日期范围)...")
     try:
-        results = sync_finances_recent(days_to=3, days_from=7)
-        total_orders = sum(r.get('total_orders', 0) for r in results.values())
-        total_success = sum(r.get('success', 0) for r in results.values())
-        total_failed = sum(r.get('failed', 0) for r in results.values())
-        print(f"[{now_str}] [Cron] 财务明细同步完成: 店铺={len(results)}, 订单={total_orders}, 成功={total_success}, 失败={total_failed}")
+        results = sync_finances_date_range(days=30)
+        total_fetched = sum(r.get('transactions_fetched', 0) for r in results.values())
+        total_saved = sum(r.get('saved', 0) for r in results.values())
+        print(f"[{now_str}] [Cron] 财务明细同步完成: 店铺={len(results)}, 拉取={total_fetched}, 入库={total_saved}")
     except Exception as e:
         print(f"[{now_str}] [Cron] 财务明细同步异常: {e}")
 

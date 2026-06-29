@@ -140,7 +140,7 @@ def list_business_reports():
 
     返回:
         { status, data: { list, total, page, page_size } }
-        每行含 data_status 字段: estimated=预估 / settled=已结算
+        每行含 data_status 字段: estimated=预估 / partial=部分结算 / settled=已结算
     """
     try:
         report_type = request.args.get('type', '').strip() or None
@@ -1672,10 +1672,10 @@ def list_products_detail():
 @permission_required('reports:generate')
 def trigger_yesterday_reports():
     """
-    一键生成昨日全部报表
+    一键生成最近10天全部报表
 
-    简介: 同时执行 T-1/T-2 预估日报 + T-3 已结算日报 + SKU利润 + 库存周转 + 广告日报，
-          并检查是否需要生周报（周三）或月报（3号）。
+    简介: 生成最近10天日报 + SKU利润 + 库存周转 + 最近10天广告日报，
+          并检查是否需要生最近3周周报（周三）或最近2个月月报（3号）。
     """
     try:
         results = generate_yesterday_reports()

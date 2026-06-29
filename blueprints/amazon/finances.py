@@ -672,7 +672,7 @@ def _sync_finances_for_shop(shop_id, days_to=3, days_from=7, order_ids=None):
 
 def sync_finances_recent(days_to=3, days_from=7):
     """
-    批量同步所有启用店铺的已结算订单财务数据（Cron 入口）
+    批量同步所有启用店铺的已结算订单财务数据（Cron 入口 — 旧逻辑，按订单遍历）
 
     简介: 遍历所有 active 店铺，为已过结算周期（默认 3~7 天前）的订单拉取财务交易。
 
@@ -699,5 +699,55 @@ def sync_finances_recent(days_to=3, days_from=7):
         except Exception as e:
             results[shop_id] = {"error": str(e)}
             print(f"[Finances Sync] 店铺[{shop_name}] 异常: {e}")
+
+    return results
+
+
+def sync_finances_date_range(days=30):
+    """
+    按日期范围同步财务数据（新入口 — 不依赖订单号）
+
+    简介: 直接调用 SP-API Finances 按 posted_date 范围拉取最近 N 天的所有财务交易。
+          无需遍历订单，一次 API 分页调用即可获取全部数据。
+          API 文档: 销售伙伴财务 API 支持按 postedAfter/postedBefore 日期范围查询。
+
+    详细:
+      - 对每个店铺调用 _fetch_transactions_by_date_range 拉取最近 days 天的交易
+      - 交易数据直接入 amazon_order_finances 表（按 transaction_id 去重）
+      - 比旧 sync_finances_recent 更高效：1 次 API 调用 vs N 次（N=订单数）
+
+    参数:
+        days: 拉取最近多少天的财务数据，默认 30 天
+
+    返回:
+        dict: { shop_id: result, ... }
+    """
+    from datetime import datetime, timedelta
+
+    results = {}
+    shops = get_all_active_shops()
+    if not shops:
+        print("[Finances DateRange Sync] 没有启用的店铺，跳过")
+        return results
+
+    posted_after = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+    posted_before = datetime.now().strftime("%Y-%m-%dT23:59:59Z")
+
+    for shop in shops:
+        shop_name = shop.get("shop_name", f"shop_{shop['id']}")
+        shop_id = shop["id"]
+        try:
+            transactions = _fetch_transactions_by_date_range(shop_id, posted_after, posted_before)
+            if not transactions:
+                results[shop_id] = {"transactions_fetched": 0, "saved": 0}
+                print(f"[Finances DateRange Sync] 店铺[{shop_name}]: 0 笔交易")
+                continue
+
+            saved = _save_transactions_to_db(shop_id, "", transactions)
+            results[shop_id] = {"transactions_fetched": len(transactions), "saved": saved}
+            print(f"[Finances DateRange Sync] 店铺[{shop_name}] 完成: fetched={len(transactions)}, saved={saved}")
+        except Exception as e:
+            results[shop_id] = {"error": str(e)}
+            print(f"[Finances DateRange Sync] 店铺[{shop_name}] 异常: {e}")
 
     return results

@@ -1,7 +1,12 @@
-import requests
+import os
 
-# WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=cde2481c-b2ef-44d2-9da7-af8ea1d28bb0"
-WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=683438ad-4e77-45f1-81f0-bed6a442f8eb"
+import requests
+from dotenv import load_dotenv
+
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_project_root, ".env"), override=True)
+
+WEBHOOK_URL = os.getenv("WECOM_WEBHOOK_URL", "")
 
 
 def send_text(content: str, mentioned_list: list = None, mentioned_mobile_list: list = None) -> bool:
