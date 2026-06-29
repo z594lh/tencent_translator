@@ -212,7 +212,7 @@ def _fetch_transactions_from_api(shop_id, order_id):
     next_token = None
 
     from datetime import datetime, timedelta
-    posted_after = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    posted_after = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     while True:
         resp = client.list_financial_transactions(
@@ -730,8 +730,9 @@ def sync_finances_date_range(days=30):
         print("[Finances DateRange Sync] 没有启用的店铺，跳过")
         return results
 
-    posted_after = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
-    posted_before = datetime.now().strftime("%Y-%m-%dT23:59:59Z")
+    now = datetime.utcnow()
+    posted_after = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    posted_before = (now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for shop in shops:
         shop_name = shop.get("shop_name", f"shop_{shop['id']}")
