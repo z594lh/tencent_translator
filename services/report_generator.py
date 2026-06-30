@@ -358,8 +358,8 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
                 continue
             sku_qty[sku] = sku_qty.get(sku, 0) + qty
 
-            sales = Decimal(str(nsr['sales'] or 0))
-            if sales == 0:
+            unsettled_sales = Decimal(str(nsr['sales'] or 0))
+            if unsettled_sales == 0:
                 cursor.execute("""
                     SELECT our_price FROM amazon_listing_offers
                     WHERE shop_id = %s AND sku = %s COLLATE utf8mb4_unicode_ci
@@ -367,8 +367,23 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
                 """, (sid, sku))
                 lp = cursor.fetchone()
                 if lp and lp['our_price']:
-                    sales = Decimal(str(lp['our_price'])) * qty
-            total_sales += sales
+                    unsettled_sales = Decimal(str(lp['our_price'])) * qty
+            total_sales += unsettled_sales
+
+            cursor.execute("""
+                SELECT fba_fee, commission_rate, real_fba_fee, real_commission_rate
+                FROM amazon_product_fees
+                WHERE shop_id = %s AND sku = %s LIMIT 1
+            """, (sid, sku))
+            fee_row = cursor.fetchone()
+            if fee_row:
+                fba = Decimal(str(fee_row['real_fba_fee'] or fee_row['fba_fee'] or 0))
+                rate = Decimal(str(fee_row['real_commission_rate'] or fee_row['commission_rate'] or '0.15'))
+            else:
+                fba = Decimal('0')
+                rate = Decimal('0.15')
+            total_fba_fees += fba * qty
+            total_commission += (unsettled_sales * rate).quantize(Decimal('0.01'))
 
     sku_count = len(sku_qty)
 
