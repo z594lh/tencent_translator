@@ -444,6 +444,8 @@ def sync_orders_to_db(shop_id, orders):
             )
             old_orders = {row['amazon_order_id']: row['order_status'] for row in cursor.fetchall()}
 
+            new_orders = []
+
             for order in orders:
                 shipping = order.get('ShippingAddress', {}) or {}
                 buyer = order.get('BuyerInfo', {}) or {}
@@ -674,13 +676,13 @@ def sync_orders_to_db(shop_id, orders):
                 new_status = order.get('OrderStatus')
                 old_status = old_orders.get(oid)
                 if old_status is None:
-                    fire('order_new',
-                         shop_id=shop_id,
-                         order_id=oid,
-                         order_status=new_status,
-                         buyer_name=(buyer or {}).get('BuyerName', ''),
-                         purchase_date=order.get('PurchaseDate', ''),
-                         item_count=(order.get('NumberOfItemsUnshipped', 0) or 0) + (order.get('NumberOfItemsShipped', 0) or 0))
+                    new_orders.append({
+                        'order_id': oid,
+                        'order_status': new_status,
+                        'buyer_name': (buyer or {}).get('BuyerName', ''),
+                        'purchase_date': order.get('PurchaseDate', ''),
+                        'item_count': (order.get('NumberOfItemsUnshipped', 0) or 0) + (order.get('NumberOfItemsShipped', 0) or 0)
+                    })
                 elif old_status != 'Canceled' and new_status == 'Canceled':
                     fire('order_cancelled',
                          shop_id=shop_id,
@@ -693,6 +695,19 @@ def sync_orders_to_db(shop_id, orders):
         return count, str(e)
     finally:
         conn.close()
+
+    for order_data in new_orders:
+        try:
+            _sync_order_items(shop_id, order_data['order_id'])
+        except Exception as e:
+            print(f"[Order Sync] 同步新订单 {order_data['order_id']} 商品失败: {e}")
+        fire('order_new',
+             shop_id=shop_id,
+             order_id=order_data['order_id'],
+             order_status=order_data['order_status'],
+             buyer_name=order_data['buyer_name'],
+             purchase_date=order_data['purchase_date'],
+             item_count=order_data['item_count'])
 
     return count, None
 
