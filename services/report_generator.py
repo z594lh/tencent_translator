@@ -36,6 +36,14 @@ from services.profit_calculator import (
     calculate_profit,
 )
 
+# 价格兜底 SQL：item_price 为 NULL 时取 listing_offers 最新 our_price
+_PRICE_FALLBACK_SQL = """COALESCE(oi.item_price_amount, (
+    SELECT our_price
+    FROM amazon_listing_offers lo
+    WHERE lo.shop_id = oi.shop_id AND lo.sku = oi.seller_sku COLLATE utf8mb4_unicode_ci
+    ORDER BY lo.updated_at DESC LIMIT 1
+))"""
+
 
 def _log_generation_start(report_type, period, shop_id=0):
     """
@@ -120,11 +128,14 @@ def _generate_estimated_daily(cursor, sid, report_date, exchange_rate):
       - 毛利/毛利率 = 销售额 - 全部成本
     """
     # 1. 订单汇总 + 按 SKU 统计销量 (Pending 订单用 quantity_ordered)
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             oi.seller_sku AS sku,
             SUM(GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)) AS qty,
-            COALESCE(SUM(oi.item_price_amount), 0) AS sales
+            COALESCE(SUM(
+                {_PRICE_FALLBACK_SQL}
+                * GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)
+            ), 0) AS sales
         FROM amazon_orders o
         JOIN amazon_order_items oi
             ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
@@ -148,16 +159,8 @@ def _generate_estimated_daily(cursor, sid, report_date, exchange_rate):
         if not sku or qty <= 0:
             continue
 
-        # Pending 订单 item_price_amount 为 NULL → 用 listing 售价估算
         if sales == 0:
-            cursor.execute("""
-                SELECT our_price FROM amazon_listing_offers
-                WHERE shop_id = %s AND sku = %s COLLATE utf8mb4_unicode_ci
-                ORDER BY updated_at DESC LIMIT 1
-            """, (sid, sku))
-            lp = cursor.fetchone()
-            if lp and lp['our_price']:
-                sales = Decimal(str(lp['our_price'])) * qty
+            print(f"[Report] {report_date} SKU {sku} qty={qty}: item_price 和 listing_offers 均无价格数据，销售额为 0")
 
         total_sales += sales
         sku_count += 1
@@ -248,7 +251,7 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
 
     详细:
       - order_count = 当天全部有效订单数（含未结算），而非仅已结算订单数
-      - total_sales: 已结算部分用 product_charges，未结算部分用 item_price_amount 估算
+      - total_sales: 已结算部分用 product_charges，未结算部分用 item_price_amount 估算（缺失时取 listing_offers.our_price 兜底）
       - fba_fees / commission: 从 items_json breakdowns 解析的真实费用（仅已结算部分）
       - 内部成本: 从 profit_calculator 按 SKU 逐项计算（含已结算+未结算 SKU）
       - 退款: 从 finances 按订单的 purchase_date 汇总 Refund 交易
@@ -333,11 +336,14 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
 
     # 3. 补充未结算订单的 SKU 销量 + 预估销售额
     if data_status == 'partial':
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT
                 oi.seller_sku AS sku,
                 SUM(GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)) AS qty,
-                COALESCE(SUM(oi.item_price_amount), 0) AS sales
+                COALESCE(SUM(
+                    {_PRICE_FALLBACK_SQL}
+                    * GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)
+                ), 0) AS sales
             FROM amazon_orders o
             JOIN amazon_order_items oi
                 ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
@@ -360,14 +366,7 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
 
             unsettled_sales = Decimal(str(nsr['sales'] or 0))
             if unsettled_sales == 0:
-                cursor.execute("""
-                    SELECT our_price FROM amazon_listing_offers
-                    WHERE shop_id = %s AND sku = %s COLLATE utf8mb4_unicode_ci
-                    ORDER BY updated_at DESC LIMIT 1
-                """, (sid, sku))
-                lp = cursor.fetchone()
-                if lp and lp['our_price']:
-                    unsettled_sales = Decimal(str(lp['our_price'])) * qty
+                print(f"[Report] {report_date} SKU {sku} qty={qty}: (partial) item_price 和 listing_offers 均无价格数据，销售额为 0")
             total_sales += unsettled_sales
 
             cursor.execute("""
@@ -876,13 +875,16 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                                         entry['commission'] += it_com
 
                     # 1. 聚合销售数据
-                    cursor.execute("""
+                    cursor.execute(f"""
                         SELECT
                             oi.asin,
                             oi.seller_sku AS sku,
                             SUM(oi.quantity_shipped) AS sales_qty,
-                            SUM(oi.item_price_amount) AS sales_amount,
-                            AVG(oi.item_price_amount / NULLIF(oi.quantity_shipped, 0)) AS avg_price
+                            COALESCE(SUM(
+                                {_PRICE_FALLBACK_SQL}
+                                * oi.quantity_shipped
+                            ), 0) AS sales_amount,
+                            AVG({_PRICE_FALLBACK_SQL} / NULLIF(oi.quantity_shipped, 0)) AS avg_price
                         FROM amazon_orders o
                         JOIN amazon_order_items oi
                             ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
@@ -899,6 +901,9 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         sales_qty = int(row['sales_qty'] or 0)
                         sales_amount = Decimal(str(row['sales_amount'] or 0))
                         avg_price = Decimal(str(row['avg_price'] or 0))
+
+                        if sales_amount == 0 and sales_qty > 0:
+                            print(f"[Report] SKU利润 {period} SKU {sku} qty={sales_qty}: item_price 和 listing_offers 均无价格数据，销售额为 0")
 
                         # 统一成本入口（2026-05-26 重构）
                         unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
