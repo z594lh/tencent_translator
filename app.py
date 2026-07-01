@@ -98,7 +98,9 @@ def log_response(response):
     # 按天生成日志文件名：log/access-2025-07-03.log
     log_file = os.path.join(LOG_DIR, f"access-{date_str}.log")
 
-    log_line = f"{time_str} - {ip} - {method} {route}\n"
+    user = getattr(request, 'current_user', None)
+    username = user['username'] if user else '-'
+    log_line = f"{time_str} - {ip} - {username} - {method} {route}\n"
 
     # 写入日志文件
     with open(log_file, 'a', encoding='utf-8') as f:
