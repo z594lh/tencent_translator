@@ -36,9 +36,10 @@ from services.profit_calculator import (
     calculate_profit,
 )
 
-# 价格兜底 SQL：item_price 为 NULL 时取 listing_offers 最新 our_price
+# 价格兜底 SQL：item_price 为 NULL 时用 listing_offers.our_price * 数量 替换
+# item_price_amount 已是行级总价，非 NULL 时直接使用不乘数量
 _PRICE_FALLBACK_SQL = """COALESCE(oi.item_price_amount, (
-    SELECT our_price
+    SELECT our_price * GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)
     FROM amazon_listing_offers lo
     WHERE lo.shop_id = oi.shop_id AND lo.sku = oi.seller_sku COLLATE utf8mb4_unicode_ci
     ORDER BY lo.updated_at DESC LIMIT 1
@@ -132,10 +133,7 @@ def _generate_estimated_daily(cursor, sid, report_date, exchange_rate):
         SELECT
             oi.seller_sku AS sku,
             SUM(GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)) AS qty,
-            COALESCE(SUM(
-                {_PRICE_FALLBACK_SQL}
-                * GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)
-            ), 0) AS sales
+            COALESCE(SUM({_PRICE_FALLBACK_SQL}), 0) AS sales
         FROM amazon_orders o
         JOIN amazon_order_items oi
             ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
@@ -340,10 +338,7 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
             SELECT
                 oi.seller_sku AS sku,
                 SUM(GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)) AS qty,
-                COALESCE(SUM(
-                    {_PRICE_FALLBACK_SQL}
-                    * GREATEST(oi.quantity_shipped, oi.quantity_ordered, 1)
-                ), 0) AS sales
+                COALESCE(SUM({_PRICE_FALLBACK_SQL}), 0) AS sales
             FROM amazon_orders o
             JOIN amazon_order_items oi
                 ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
@@ -881,10 +876,21 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                             oi.seller_sku AS sku,
                             SUM(oi.quantity_shipped) AS sales_qty,
                             COALESCE(SUM(
-                                {_PRICE_FALLBACK_SQL}
-                                * oi.quantity_shipped
+                                COALESCE(oi.item_price_amount, (
+                                    SELECT our_price * oi.quantity_shipped
+                                    FROM amazon_listing_offers lo
+                                    WHERE lo.shop_id = oi.shop_id AND lo.sku = oi.seller_sku COLLATE utf8mb4_unicode_ci
+                                    ORDER BY lo.updated_at DESC LIMIT 1
+                                ))
                             ), 0) AS sales_amount,
-                            AVG({_PRICE_FALLBACK_SQL} / NULLIF(oi.quantity_shipped, 0)) AS avg_price
+                            AVG(
+                                COALESCE(oi.item_price_amount, (
+                                    SELECT our_price * oi.quantity_shipped
+                                    FROM amazon_listing_offers lo
+                                    WHERE lo.shop_id = oi.shop_id AND lo.sku = oi.seller_sku COLLATE utf8mb4_unicode_ci
+                                    ORDER BY lo.updated_at DESC LIMIT 1
+                                )) / NULLIF(oi.quantity_shipped, 0)
+                            ) AS avg_price
                         FROM amazon_orders o
                         JOIN amazon_order_items oi
                             ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
