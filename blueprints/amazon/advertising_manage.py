@@ -1898,70 +1898,7 @@ def get_daily_data():
             """, params)
             report_rows = c.fetchall()
 
-        # ========== 2. ERP 订单数据：通过 ASIN 关联 ==========
-        order_by_date = {}
-        if entity_type in ("campaign", "adgroup", "") or not entity_type:
-            # 收集 ASIN
-            with conn.cursor() as c:
-                if entity_type == "campaign" and entity_id:
-                    c.execute("""
-                        SELECT DISTINCT pa.asin
-                        FROM amazon_ads_ad_groups ag
-                        JOIN amazon_ads_product_ads pa ON pa.ad_group_id = ag.ad_group_id
-                        WHERE ag.campaign_id = %s
-                    """, (entity_id,))
-                elif entity_type == "adgroup" and entity_id:
-                    c.execute("""
-                        SELECT DISTINCT pa.asin
-                        FROM amazon_ads_product_ads pa
-                        WHERE pa.ad_group_id = %s
-                    """, (entity_id,))
-                else:
-                    # 全量：所有活动的所有 ASIN
-                    c.execute("""
-                        SELECT DISTINCT pa.asin
-                        FROM amazon_ads_ad_groups ag
-                        JOIN amazon_ads_product_ads pa ON pa.ad_group_id = ag.ad_group_id
-                    """)
-                asins = [r["asin"] for r in c.fetchall()]
-
-            if asins:
-                with conn.cursor() as c:
-                    c.execute("""
-                        SELECT
-                            DATE(o.purchase_date) AS report_date,
-                            COUNT(DISTINCT o.amazon_order_id) AS total_orders,
-                            COALESCE(SUM(oi.item_price_amount), 0) AS total_sales
-                        FROM amazon_orders o
-                        JOIN amazon_order_items oi ON oi.amazon_order_id = o.amazon_order_id
-                        WHERE o.order_status NOT IN ('Canceled', 'PendingAvailability')
-                          AND o.shop_id = %s
-                          AND DATE(o.purchase_date) BETWEEN %s AND %s
-                          AND oi.asin IN ({})
-                        GROUP BY DATE(o.purchase_date)
-                        ORDER BY DATE(o.purchase_date)
-                    """.format(",".join(["%s"] * len(asins))),
-                        [shop_id if shop_id else 1, start_date, end_date] + asins
-                    )
-                    for r in c.fetchall():
-                        order_by_date[str(r["report_date"])] = {
-                            "total_orders": int(r["total_orders"]),
-                            "total_sales": float(r["total_sales"]),
-                        }
-
-        # ========== 3. 合并 ==========
-        list_data = []
-        for r in report_rows:
-            d = dict(r)
-            d["total_orders"] = 0
-            d["total_sales"] = 0.0
-            date_key = str(d["report_date"])
-            if date_key in order_by_date:
-                d["total_orders"] = order_by_date[date_key]["total_orders"]
-                d["total_sales"] = order_by_date[date_key]["total_sales"]
-            _compute_metrics(d)
-            list_data.append(d)
-
+        list_data = [_compute_metrics(dict(r)) for r in report_rows]
         return jsonify({"status": "success", "data": {"list": list_data}})
     finally:
         conn.close()
