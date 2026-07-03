@@ -254,7 +254,7 @@ def _query_entity_with_report(entity_table, entity_join_col, entity_fields,
         if alias == entity_join_col or f.endswith(f".{entity_join_col}"):
             safe_fields.append(f)
         else:
-            safe_fields.append(f"ANY_VALUE({expr}) AS {alias}")
+            safe_fields.append(f"MIN({expr}) AS {alias}")
 
     sql = f"""
         SELECT {', '.join(safe_fields)},
@@ -421,18 +421,18 @@ def list_campaigns():
         where_sql = "WHERE " + " AND ".join(where)
 
         entity_fields = [
-            "ANY_VALUE(e.campaign_id) AS campaign_id",
-            "ANY_VALUE(e.name) AS name",
-            "ANY_VALUE(e.state) AS state",
-            "ANY_VALUE(e.targeting_type) AS targeting_type",
-            "ANY_VALUE(e.serving_status) AS serving_status",
-            "ANY_VALUE(e.daily_budget) AS daily_budget",
-            "ANY_VALUE(e.start_date) AS start_date",
-            "ANY_VALUE(e.end_date) AS end_date",
-            "ANY_VALUE(e.bidding) AS bidding",
-            "ANY_VALUE(e.last_update_datetime) AS last_update_datetime",
-            "ANY_VALUE(e.synced_at) AS synced_at",
-            "ANY_VALUE(e.re_open_day) AS re_open_day",
+            "MIN(e.campaign_id) AS campaign_id",
+            "MIN(e.name) AS name",
+            "MIN(e.state) AS state",
+            "MIN(e.targeting_type) AS targeting_type",
+            "MIN(e.serving_status) AS serving_status",
+            "MIN(e.daily_budget) AS daily_budget",
+            "MIN(e.start_date) AS start_date",
+            "MIN(e.end_date) AS end_date",
+            "MIN(e.bidding) AS bidding",
+            "MIN(e.last_update_datetime) AS last_update_datetime",
+            "MIN(e.synced_at) AS synced_at",
+            "MIN(e.re_open_day) AS re_open_day",
         ]
 
         base_from = f"""FROM amazon_ads_raw_reports r
@@ -671,12 +671,12 @@ def list_ad_groups():
         where_sql = "WHERE " + " AND ".join(where)
 
         entity_fields = [
-            "ANY_VALUE(e.ad_group_id) AS ad_group_id",
-            "ANY_VALUE(e.name) AS name",
-            "ANY_VALUE(e.state) AS state",
-            "ANY_VALUE(e.default_bid) AS default_bid",
-            "ANY_VALUE(e.serving_status) AS serving_status",
-            "ANY_VALUE(e.campaign_id) AS campaign_id",
+            "MIN(e.ad_group_id) AS ad_group_id",
+            "MIN(e.name) AS name",
+            "MIN(e.state) AS state",
+            "MIN(e.default_bid) AS default_bid",
+            "MIN(e.serving_status) AS serving_status",
+            "MIN(e.campaign_id) AS campaign_id",
         ]
 
         base_from = f"""FROM amazon_ads_raw_reports r
@@ -1060,14 +1060,14 @@ def list_product_ads():
             c.execute(f"""
                 SELECT
                     e.ad_id,
-                    ANY_VALUE(e.asin) AS asin,
-                    ANY_VALUE(e.sku) AS sku,
-                    ANY_VALUE(e.state) AS state,
-                    ANY_VALUE(e.serving_status) AS serving_status,
-                    ANY_VALUE(e.campaign_id) AS campaign_id,
-                    ANY_VALUE(e.ad_group_id) AS ad_group_id,
-                    ANY_VALUE(l.main_image_url) AS main_image_url,
-                    ANY_VALUE(l.item_name) AS item_name,
+                    MIN(e.asin) AS asin,
+                    MIN(e.sku) AS sku,
+                    MIN(e.state) AS state,
+                    MIN(e.serving_status) AS serving_status,
+                    MIN(e.campaign_id) AS campaign_id,
+                    MIN(e.ad_group_id) AS ad_group_id,
+                    MIN(l.main_image_url) AS main_image_url,
+                    MIN(l.item_name) AS item_name,
                     COALESCE(SUM(r.impressions), 0) AS impressions,
                     COALESCE(SUM(r.clicks), 0) AS clicks,
                     COALESCE(SUM(r.cost), 0) AS cost,
@@ -1205,14 +1205,14 @@ def list_keywords():
         where_sql = "WHERE " + " AND ".join(where)
 
         entity_fields = [
-            "ANY_VALUE(e.keyword_id) AS keyword_id",
-            "ANY_VALUE(e.keyword_text) AS keyword_text",
-            "ANY_VALUE(e.match_type) AS match_type",
-            "ANY_VALUE(e.state) AS state",
-            "ANY_VALUE(e.bid) AS bid",
-            "ANY_VALUE(e.serving_status) AS serving_status",
-            "ANY_VALUE(e.campaign_id) AS campaign_id",
-            "ANY_VALUE(e.ad_group_id) AS ad_group_id",
+            "MIN(e.keyword_id) AS keyword_id",
+            "MIN(e.keyword_text) AS keyword_text",
+            "MIN(e.match_type) AS match_type",
+            "MIN(e.state) AS state",
+            "MIN(e.bid) AS bid",
+            "MIN(e.serving_status) AS serving_status",
+            "MIN(e.campaign_id) AS campaign_id",
+            "MIN(e.ad_group_id) AS ad_group_id",
         ]
 
         base_from = f"""FROM amazon_ads_raw_reports r
@@ -1777,13 +1777,13 @@ def list_search_terms():
             c.execute(f"""
                 SELECT
                     customer_search_term,
-                    ANY_VALUE(keyword_text) AS keyword_text,
-                    ANY_VALUE(keyword_match_type) AS keyword_match_type,
-                    ANY_VALUE(campaign_id) AS campaign_id,
-                    ANY_VALUE(campaign_name) AS campaign_name,
-                    ANY_VALUE(ad_group_id) AS ad_group_id,
-                    ANY_VALUE(ad_group_name) AS ad_group_name,
-                    CASE ANY_VALUE(keyword_text)
+                    MIN(keyword_text) AS keyword_text,
+                    MIN(keyword_match_type) AS keyword_match_type,
+                    MIN(campaign_id) AS campaign_id,
+                    MIN(campaign_name) AS campaign_name,
+                    MIN(ad_group_id) AS ad_group_id,
+                    MIN(ad_group_name) AS ad_group_name,
+                    CASE MIN(keyword_text)
                         WHEN 'close-match' THEN '紧密匹配'
                         WHEN 'loose-match' THEN '宽泛匹配'
                         WHEN 'substitutes' THEN '同类商品'
