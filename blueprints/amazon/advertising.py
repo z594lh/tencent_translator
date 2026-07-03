@@ -590,12 +590,14 @@ def _sync_one_type(client, shop_id, report_type_key, cfg, date_str):
         return {"report_type": report_type_key, "rows": 0, "inserted": 0, "updated": 0, "error": str(e)}
 
 
-def run_ads_sync(shop_id, date_str=None):
+def run_ads_sync(shop_id, date_str=None, force_refresh=False):
     """
     同步指定店铺指定日期的全量广告报告数据 → amazon_ads_raw_reports
 
     优化策略：批量创建所有类型报告，统一每 60 秒轮询一次状态，
     哪个先完成就先下载写入，避免串行阻塞。
+
+    force_refresh=True 时忽略缓存，强制重建所有报告（覆盖旧数据）。
     """
     date_str = date_str or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     out = {"shop_id": shop_id, "date": date_str, "results": [], "total_rows": 0, "error": None}
@@ -606,37 +608,42 @@ def run_ads_sync(shop_id, date_str=None):
         return out
 
     types = list(_SYNC_REPORT_TYPES.keys())
-    print(f"[Ads Sync] shop={shop_id} date={date_str} 开始同步 {len(types)} 种报告: {types}")
+    mode = "强制重建" if force_refresh else "常规"
+    print(f"[Ads Sync] shop={shop_id} date={date_str} {mode}同步 {len(types)} 种报告: {types}")
     _report_cache_clean(shop_id=shop_id)
 
     # ========== Phase 1: 批量创建报告 + 处理已完成缓存 ==========
     pending = {}  # key -> {"cfg": cfg, "report_id": str}
 
     for key, cfg in _SYNC_REPORT_TYPES.items():
-        cached = _report_cache_get(shop_id, key, date_str)
-        if cached:
-            cached_id = cached["report_id"]
-            try:
-                status = client._get_report_status(cached_id)
-                state = (status.get("status") or "").upper()
-                if state == "COMPLETED":
-                    url = status.get("url")
-                    if url:
-                        print(f"[Ads Sync] → {key} 缓存已完成，直接下载")
-                        rows = client._download_report_content(url)
-                        r = _write_report_result(shop_id, key, cfg, date_str, cached_id, rows)
-                        out["results"].append(r)
-                        if not r["error"]:
-                            out["total_rows"] += r["rows"]
+        if force_refresh:
+            # 强制模式：清除旧缓存，直接创建新报告
+            pass  # 跳过缓存逻辑，直接走创建
+        else:
+            cached = _report_cache_get(shop_id, key, date_str)
+            if cached:
+                cached_id = cached["report_id"]
+                try:
+                    status = client._get_report_status(cached_id)
+                    state = (status.get("status") or "").upper()
+                    if state == "COMPLETED":
+                        url = status.get("url")
+                        if url:
+                            print(f"[Ads Sync] → {key} 缓存已完成，直接下载")
+                            rows = client._download_report_content(url)
+                            r = _write_report_result(shop_id, key, cfg, date_str, cached_id, rows)
+                            out["results"].append(r)
+                            if not r["error"]:
+                                out["total_rows"] += r["rows"]
+                            continue
+                    elif state in ("PENDING", "PROCESSING"):
+                        print(f"[Ads Sync] → {key} 缓存报告 {state}，加入轮询队列")
+                        pending[key] = {"cfg": cfg, "report_id": cached_id}
                         continue
-                elif state in ("PENDING", "PROCESSING"):
-                    print(f"[Ads Sync] → {key} 缓存报告 {state}，加入轮询队列")
-                    pending[key] = {"cfg": cfg, "report_id": cached_id}
-                    continue
-                else:
-                    print(f"[Ads Sync] → {key} 缓存已失效 ({state})，重新创建")
-            except Exception as e:
-                print(f"[Ads Sync] → {key} 缓存查询异常: {e}，重新创建")
+                    else:
+                        print(f"[Ads Sync] → {key} 缓存已失效 ({state})，重新创建")
+                except Exception as e:
+                    print(f"[Ads Sync] → {key} 缓存查询异常: {e}，重新创建")
 
         # 创建新报告
         body = _build_report_body(cfg, key, date_str, date_str)
@@ -710,7 +717,8 @@ def trigger_sync():
     try: shop_id = int(shop_id)
     except (ValueError,TypeError): return jsonify({"status":"error","message":"shop_id 必须是整数"}), 400
     date_str = data.get('date') or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    return jsonify({"status":"success","data":run_ads_sync(shop_id, date_str)})
+    force = data.get('force', False)
+    return jsonify({"status":"success","data":run_ads_sync(shop_id, date_str, force_refresh=force)})
 
 
 @advertising_bp.route('/amazon/ads/reports/sync-all', methods=['POST'])
@@ -720,9 +728,10 @@ def trigger_sync_all():
     from services.shop_service import get_all_active_shops
     data = request.get_json() or {}
     date_str = data.get('date') or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    force = data.get('force', False)
     results = []
     for s in get_all_active_shops():
-        results.append(run_ads_sync(s['id'], date_str))
+        results.append(run_ads_sync(s['id'], date_str, force_refresh=force))
     return jsonify({"status":"success","data":results})
 
 

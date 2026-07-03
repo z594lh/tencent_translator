@@ -6,7 +6,8 @@
     python scripts/cron/ads_sync.py                     拉取所有店铺昨天数据
     python scripts/cron/ads_sync.py --shop 1             仅拉取店铺1昨天数据
     python scripts/cron/ads_sync.py --date 2026-06-20    拉取所有店铺指定日期
-    python scripts/cron/ads_sync.py --shop 1 --date 2026-06-20  拉取店铺1指定日期
+     python scripts/cron/ads_sync.py --shop 1 --date 2026-06-20  拉取店铺1指定日期
+     python scripts/cron/ads_sync.py --shop 1 --date 2026-06-20 --force  强制重建报告
 
 定时: 建议每天早上 6:00 (UTC+8) 执行 (Ads API 报告通常 T+0 可用, 但偶有延迟)
       crontab: 0 6 * * * cd /path/to/project && python scripts/cron/ads_sync.py >> log/ads_sync.log 2>&1
@@ -25,7 +26,7 @@ from datetime import datetime, timedelta
 from scripts.cron import _now_str
 
 
-def run_ads_sync(shop_id=None, date_str=None):
+def run_ads_sync(shop_id=None, date_str=None, force_refresh=False):
     """调用 advertising 蓝图的 run_ads_sync，按店铺拉取全量广告报告"""
     path = os.path.join(PROJECT_ROOT, "blueprints", "amazon", "advertising.py")
     spec = importlib.util.spec_from_file_location("advertising", path)
@@ -54,7 +55,7 @@ def run_ads_sync(shop_id=None, date_str=None):
         name = shop.get('shop_name', f'Shop#{sid}')
         print(f"[{_now_str()}] [AdsSync] 开始同步店铺 {name} (id={sid}) date={date_str} ...")
         try:
-            result = _sync(sid, date_str)
+            result = _sync(sid, date_str, force_refresh=force_refresh)
             rows = result.get('total_rows', 0)
             total_rows += rows
             if result.get('error'):
@@ -79,5 +80,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Amazon Ads 报告数据同步')
     parser.add_argument('--shop', type=int, default=None, help='指定店铺 ID (不传则全部)')
     parser.add_argument('--date', type=str, default=None, help='指定日期 YYYY-MM-DD (默认昨天)')
+    parser.add_argument('--force', action='store_true', help='强制重建报告，忽略缓存')
     args = parser.parse_args()
-    run_ads_sync(shop_id=args.shop, date_str=args.date)
+    run_ads_sync(shop_id=args.shop, date_str=args.date, force_refresh=args.force)

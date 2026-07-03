@@ -556,8 +556,14 @@ def update_campaign(campaign_id):
     if not updates:
         return jsonify({"status": "error", "message": "无更新字段"}), 400
 
+    # v3 API PUT 不支持 ARCHIVED，软归档：对 Amazon 发 PAUSED，本地存 archived
+    api_updates = dict(updates)
+    db_state = updates.get("state")
+    if db_state and str(db_state).lower() == "archived":
+        api_updates["state"] = "PAUSED"
+
     try:
-        client.update_campaign(campaign_id, updates)
+        client.update_campaign(campaign_id, api_updates)
     except Exception as e:
         _log_operation(shop_id, campaign_id, "campaign", campaign_id,
                        f"更新失败: {updates}", status=0, error_message=str(e))
@@ -568,7 +574,7 @@ def update_campaign(campaign_id):
         with conn.cursor() as c:
             set_parts, vals = [], []
             if "state" in updates:
-                set_parts.append("state = %s"); vals.append(updates["state"])
+                set_parts.append("state = %s"); vals.append(updates["state"] if db_state else updates["state"])
             if "dailyBudget" in updates:
                 set_parts.append("daily_budget = %s"); vals.append(float(updates["dailyBudget"]))
             if "startDate" in updates:
@@ -758,8 +764,13 @@ def update_ad_group(ad_group_id):
     if not updates:
         return jsonify({"status": "error", "message": "无更新字段"}), 400
 
+    api_updates = dict(updates)
+    db_state = updates.get("state")
+    if db_state and str(db_state).lower() == "archived":
+        api_updates["state"] = "PAUSED"
+
     try:
-        client.update_ad_group(ad_group_id, updates)
+        client.update_ad_group(ad_group_id, api_updates)
     except Exception as e:
         _log_operation(shop_id, 0, "ad_group", ad_group_id,
                        f"更新失败: {updates}", status=0, error_message=str(e))
@@ -1093,9 +1104,12 @@ def update_product_ad(ad_id):
     state = body.get("state")
     if not shop_id or not state:
         return jsonify({"status": "error", "message": "缺少 shop_id 或 state"}), 400
+    api_state = state.upper() if state else state
+    if api_state == "ARCHIVED":
+        api_state = "PAUSED"
     try:
         client = get_ads_api_client(int(shop_id))
-        client.update_product_ad(ad_id, {"state": state})
+        client.update_product_ad(ad_id, {"state": api_state})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -1259,9 +1273,14 @@ def update_keyword(keyword_id):
     if not updates:
         return jsonify({"status": "error", "message": "无更新字段"}), 400
 
+    db_state = updates.get("state")
+    api_updates = dict(updates)
+    if db_state and str(db_state).lower() == "archived":
+        api_updates["state"] = "PAUSED"
+
     try:
         client = get_ads_api_client(int(shop_id))
-        client.update_keyword(keyword_id, updates)
+        client.update_keyword(keyword_id, api_updates)
     except Exception as e:
         _log_operation(shop_id, 0, "keyword", keyword_id,
                        f"更新失败: {updates}", status=0, error_message=str(e))
@@ -1272,7 +1291,7 @@ def update_keyword(keyword_id):
         with conn.cursor() as c:
             set_parts, vals = [], []
             if "state" in updates:
-                set_parts.append("state = %s"); vals.append(updates["state"])
+                set_parts.append("state = %s"); vals.append(updates["state"] if db_state else updates["state"])
             if "bid" in updates:
                 set_parts.append("bid = %s"); vals.append(float(updates["bid"]))
             if set_parts:
@@ -1374,9 +1393,14 @@ def update_target(target_id):
     if not updates:
         return jsonify({"status": "error", "message": "无更新字段"}), 400
 
+    db_state = updates.get("state")
+    api_updates = dict(updates)
+    if db_state and str(db_state).lower() == "archived":
+        api_updates["state"] = "PAUSED"
+
     try:
         client = get_ads_api_client(int(shop_id))
-        client.update_target(target_id, updates)
+        client.update_target(target_id, api_updates)
     except Exception as e:
         _log_operation(shop_id, 0, "target", target_id,
                        f"更新失败: {updates}", status=0, error_message=str(e))
@@ -1387,7 +1411,7 @@ def update_target(target_id):
         with conn.cursor() as c:
             set_parts, vals = [], []
             if "state" in updates:
-                set_parts.append("state = %s"); vals.append(updates["state"])
+                set_parts.append("state = %s"); vals.append(updates["state"] if db_state else updates["state"])
             if "bid" in updates:
                 set_parts.append("bid = %s"); vals.append(float(updates["bid"]))
             if set_parts:
@@ -1803,64 +1827,60 @@ def list_search_terms():
 def get_daily_data():
     entity_type = request.args.get("type", "").strip()
     entity_id = request.args.get("id", "").strip()
-    if not entity_type or not entity_id:
-        return jsonify({"status": "error", "message": "缺少 type 或 id"}), 400
-
     start_date, end_date = _parse_date_range()
     shop_id = _get_shop_id_optional()
 
     conn = _get_conn()
     try:
-        # targeting 特殊处理：通过 resolved_expression + campaign_id + ad_group_id 匹配
-        if entity_type == "target":
-            with conn.cursor() as c:
-                c.execute(
-                    "SELECT resolved_expression, campaign_id, ad_group_id FROM amazon_ads_targets WHERE target_id = %s",
-                    (entity_id,)
-                )
-                target = c.fetchone()
-            if not target:
-                return jsonify({"status": "error", "message": f"target {entity_id} 不存在"}), 404
-            # 映射：实体用 API 枚举 → 报告用可读名 (close-match/loose-match/complements/substitutes)
-            _REPORT_EXPR_MAP = {
-                "QUERY_HIGH_REL_MATCHES": "close-match",
-                "QUERY_BROAD_REL_MATCHES": "loose-match",
-                "ASIN_ACCESSORY_RELATED": "complements",
-                "ASIN_SUBSTITUTE_RELATED": "substitutes",
-            }
-            report_expr = _REPORT_EXPR_MAP.get(target["resolved_expression"], target["resolved_expression"])
-            where = [
-                "report_type = %s",
-                "report_date BETWEEN %s AND %s",
-                "targeting_expression = %s",
-                "campaign_id = %s",
-                "ad_group_id = %s",
-            ]
-            params = [
-                "spTargeting", start_date, end_date,
-                report_expr,
-                str(target["campaign_id"]),
-                str(target["ad_group_id"]),
-            ]
+        # ========== 1. 广告花费数据（原有逻辑） ==========
+        report_rows = []
+        if entity_type and entity_id:
+            # targeting 特殊处理
+            if entity_type == "target":
+                with conn.cursor() as c:
+                    c.execute(
+                        "SELECT resolved_expression, campaign_id, ad_group_id FROM amazon_ads_targets WHERE target_id = %s",
+                        (entity_id,)
+                    )
+                    target = c.fetchone()
+                if not target:
+                    return jsonify({"status": "error", "message": f"target {entity_id} 不存在"}), 404
+                _REPORT_EXPR_MAP = {
+                    "QUERY_HIGH_REL_MATCHES": "close-match",
+                    "QUERY_BROAD_REL_MATCHES": "loose-match",
+                    "ASIN_ACCESSORY_RELATED": "complements",
+                    "ASIN_SUBSTITUTE_RELATED": "substitutes",
+                }
+                report_expr = _REPORT_EXPR_MAP.get(target["resolved_expression"], target["resolved_expression"])
+                where = [
+                    "report_type = %s", "report_date BETWEEN %s AND %s",
+                    "targeting_expression = %s", "campaign_id = %s", "ad_group_id = %s",
+                ]
+                params = ["spTargeting", start_date, end_date, report_expr,
+                          str(target["campaign_id"]), str(target["ad_group_id"])]
+            else:
+                type_config = {
+                    "campaign": ("spCampaigns", "campaign_id"),
+                    "adgroup": ("spAdvertisedProduct", "ad_group_id"),
+                    "keyword": ("spTargeting", "keyword_id"),
+                    "searchterm": ("spSearchTerm", "customer_search_term"),
+                    "placement": ("spCampaignsPlacement", "placement"),
+                }
+                cfg = type_config.get(entity_type)
+                if not cfg:
+                    return jsonify({"status": "error", "message": f"不支持的类型: {entity_type}"}), 400
+                report_type, id_col = cfg
+                where = ["report_type = %s", "report_date BETWEEN %s AND %s", f"{id_col} = %s"]
+                params = [report_type, start_date, end_date, entity_id]
         else:
-            type_config = {
-                "campaign": ("spCampaigns", "campaign_id"),
-                "adgroup": ("spAdvertisedProduct", "ad_group_id"),
-                "keyword": ("spTargeting", "keyword_id"),
-                "searchterm": ("spSearchTerm", "customer_search_term"),
-                "placement": ("spCampaignsPlacement", "placement"),
-            }
-            cfg = type_config.get(entity_type)
-            if not cfg:
-                return jsonify({"status": "error", "message": f"不支持的类型: {entity_type}"}), 400
-            report_type, id_col = cfg
-            where = ["report_type = %s", "report_date BETWEEN %s AND %s", f"{id_col} = %s"]
-            params = [report_type, start_date, end_date, entity_id]
+            # 全量聚合：所有 campaign 的 spCampaigns 数据
+            where = ["report_type = 'spCampaigns'", "report_date BETWEEN %s AND %s"]
+            params = [start_date, end_date]
 
         if shop_id:
             where.append("shop_id = %s"); params.append(shop_id)
-
         where_sql = "WHERE " + " AND ".join(where)
+
         with conn.cursor() as c:
             c.execute(f"""
                 SELECT
@@ -1876,9 +1896,73 @@ def get_daily_data():
                 GROUP BY report_date
                 ORDER BY report_date ASC
             """, params)
-            rows = c.fetchall()
+            report_rows = c.fetchall()
 
-        list_data = [_compute_metrics(dict(r)) for r in rows]
+        # ========== 2. ERP 订单数据：通过 ASIN 关联 ==========
+        order_by_date = {}
+        if entity_type in ("campaign", "adgroup", "") or not entity_type:
+            # 收集 ASIN
+            with conn.cursor() as c:
+                if entity_type == "campaign" and entity_id:
+                    c.execute("""
+                        SELECT DISTINCT pa.asin
+                        FROM amazon_ads_ad_groups ag
+                        JOIN amazon_ads_product_ads pa ON pa.ad_group_id = ag.ad_group_id
+                        WHERE ag.campaign_id = %s
+                    """, (entity_id,))
+                elif entity_type == "adgroup" and entity_id:
+                    c.execute("""
+                        SELECT DISTINCT pa.asin
+                        FROM amazon_ads_product_ads pa
+                        WHERE pa.ad_group_id = %s
+                    """, (entity_id,))
+                else:
+                    # 全量：所有活动的所有 ASIN
+                    c.execute("""
+                        SELECT DISTINCT pa.asin
+                        FROM amazon_ads_ad_groups ag
+                        JOIN amazon_ads_product_ads pa ON pa.ad_group_id = ag.ad_group_id
+                    """)
+                asins = [r["asin"] for r in c.fetchall()]
+
+            if asins:
+                with conn.cursor() as c:
+                    # 批量 IN 查询（MySQL 限制：一次最多约 1000 个值，这里活动 ASIN 不会太多）
+                    c.execute("""
+                        SELECT
+                            DATE(o.purchase_date) AS report_date,
+                            COALESCE(SUM(oi.quantity_shipped), 0) AS total_orders,
+                            COALESCE(SUM(oi.item_price_amount), 0) AS total_sales
+                        FROM amazon_orders o
+                        JOIN amazon_order_items oi ON oi.amazon_order_id = o.amazon_order_id
+                        WHERE o.order_status != 'Canceled'
+                          AND o.shop_id = %s
+                          AND DATE(o.purchase_date) BETWEEN %s AND %s
+                          AND oi.asin IN ({})
+                        GROUP BY DATE(o.purchase_date)
+                        ORDER BY DATE(o.purchase_date)
+                    """.format(",".join(["%s"] * len(asins))),
+                        [shop_id or 1, start_date, end_date] + asins
+                    )
+                    for r in c.fetchall():
+                        order_by_date[str(r["report_date"])] = {
+                            "total_orders": int(r["total_orders"]),
+                            "total_sales": float(r["total_sales"]),
+                        }
+
+        # ========== 3. 合并 ==========
+        list_data = []
+        for r in report_rows:
+            d = dict(r)
+            d["total_orders"] = 0
+            d["total_sales"] = 0.0
+            date_key = str(d["report_date"])
+            if date_key in order_by_date:
+                d["total_orders"] = order_by_date[date_key]["total_orders"]
+                d["total_sales"] = order_by_date[date_key]["total_sales"]
+            _compute_metrics(d)
+            list_data.append(d)
+
         return jsonify({"status": "success", "data": {"list": list_data}})
     finally:
         conn.close()
@@ -2030,6 +2114,8 @@ def create_campaign_wizard():
     campaign_id = body.get("campaign_id") or None
 
     result = []
+    ad_ids = []
+    ad_group_id = None
     has_error = False
 
     if not campaign_id and data1 and data2:
@@ -2090,6 +2176,7 @@ def create_campaign_wizard():
                 result.append({"type": "ad_group", "status": "error", "error": str(e)})
 
         products = data2.get("products", [])
+        ad_ids = []
         if ad_group_id and products:
             try:
                 pa_list = []
@@ -2102,6 +2189,13 @@ def create_campaign_wizard():
                         "state": "enabled",
                     })
                 pa_resp = client.create_product_ads(pa_list)
+                pa = pa_resp.get("productAds", {})
+                if isinstance(pa, dict):
+                    for s in pa.get("success", []):
+                        ad_ids.append(int(s.get("adId", 0)))
+                else:
+                    for pa_item in pa:
+                        ad_ids.append(int(pa_item.get("adId", 0)))
                 result.append({"type": "product_ads", "count": len(pa_list), "status": "success"})
             except Exception as e:
                 has_error = True
@@ -2167,7 +2261,7 @@ def create_campaign_wizard():
                    f"创建向导完成: {json.dumps(result, ensure_ascii=False)[:500]}")
     return jsonify({
         "status": "success",
-        "data": {"campaign_id": campaign_id, "ad_group_id": ad_group_id, "results": result},
+        "data": {"campaign_id": campaign_id, "ad_group_id": ad_group_id, "ad_ids": ad_ids, "results": result},
     }), (200 if not has_error else 200)
 
 
