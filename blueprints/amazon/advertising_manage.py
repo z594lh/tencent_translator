@@ -1927,22 +1927,21 @@ def get_daily_data():
 
             if asins:
                 with conn.cursor() as c:
-                    # 批量 IN 查询（MySQL 限制：一次最多约 1000 个值，这里活动 ASIN 不会太多）
                     c.execute("""
                         SELECT
                             DATE(o.purchase_date) AS report_date,
-                            COALESCE(SUM(oi.quantity_shipped), 0) AS total_orders,
+                            COUNT(DISTINCT o.amazon_order_id) AS total_orders,
                             COALESCE(SUM(oi.item_price_amount), 0) AS total_sales
                         FROM amazon_orders o
                         JOIN amazon_order_items oi ON oi.amazon_order_id = o.amazon_order_id
-                        WHERE o.order_status != 'Canceled'
+                        WHERE o.order_status NOT IN ('Canceled', 'PendingAvailability')
                           AND o.shop_id = %s
                           AND DATE(o.purchase_date) BETWEEN %s AND %s
                           AND oi.asin IN ({})
                         GROUP BY DATE(o.purchase_date)
                         ORDER BY DATE(o.purchase_date)
                     """.format(",".join(["%s"] * len(asins))),
-                        [shop_id or 1, start_date, end_date] + asins
+                        [shop_id if shop_id else 1, start_date, end_date] + asins
                     )
                     for r in c.fetchall():
                         order_by_date[str(r["report_date"])] = {
