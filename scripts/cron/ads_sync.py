@@ -13,6 +13,7 @@
 """
 import os
 import sys
+import importlib.util
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
@@ -26,7 +27,12 @@ from scripts.cron import _now_str
 
 def run_ads_sync(shop_id=None, date_str=None):
     """调用 advertising 蓝图的 run_ads_sync，按店铺拉取全量广告报告"""
-    from blueprints.amazon.advertising import run_ads_sync as _sync
+    path = os.path.join(PROJECT_ROOT, "blueprints", "amazon", "advertising.py")
+    spec = importlib.util.spec_from_file_location("advertising", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _sync = mod.run_ads_sync
+
     from services.shop_service import get_all_active_shops
 
     if date_str is None:

@@ -69,6 +69,8 @@ _COLUMN_MAP = [
     ("sales7d", "sales_7d"),
     ("sales14d", "sales_14d"),
     ("sales30d", "sales_30d"),
+    ("placementClassification", "placement"),
+    ("topOfSearchImpressionShare", "top_of_search_impression_share"),
 ]
 
 # Amazon Ads API v3 每种报告类型支持的列不同（根据 API 返回的 Allowed values 验证）：
@@ -106,7 +108,8 @@ _SYNC_REPORT_TYPES = {
             "keywordId keyword keywordType matchType "
             "targeting "
             "impressions clicks cost "
-            "purchases7d sales7d"
+            "purchases7d sales7d "
+            "topOfSearchImpressionShare"
         ).split(),
     },
     "spSearchTerm": {
@@ -118,6 +121,19 @@ _SYNC_REPORT_TYPES = {
             "impressions clicks cost "
             "purchases7d sales7d"
         ).split(),
+    },
+    "spCampaignsPlacement": {
+        "name": "SP Campaigns Placement",
+        "groupBy": ["adGroup", "campaignPlacement"],
+        "columns": (
+            "date campaignId campaignName campaignStatus "
+            "placementClassification "
+            "impressions clicks cost "
+            "purchases7d purchases14d purchases30d "
+            "sales7d sales14d sales30d "
+            "topOfSearchImpressionShare"
+        ).split(),
+        "_reportTypeId": "spCampaigns",
     },
 }
 
@@ -274,6 +290,18 @@ def _map_row(api_row):
     for api_key, db_key in _COLUMN_MAP:
         db[db_key] = api_row.get(api_key, "")
     db["report_date"] = api_row.get("date", "")
+
+    # 标准化 targeting_expression：报告用 close-match 等可读名 → API 枚举值
+    _EXPR_NORMALIZE = {
+        "close-match": "QUERY_HIGH_REL_MATCHES",
+        "loose-match": "QUERY_BROAD_REL_MATCHES",
+        "complements": "ASIN_ACCESSORY_RELATED",
+        "substitutes": "ASIN_SUBSTITUTE_RELATED",
+    }
+    raw_expr = db.get("targeting_expression", "")
+    if raw_expr in _EXPR_NORMALIZE:
+        db["targeting_expression"] = _EXPR_NORMALIZE[raw_expr]
+
     return db
 
 
@@ -297,6 +325,7 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
             str(m.get("keyword_id", "") or ""),
             str(m.get("customer_search_term", "") or ""),
             str(m.get("targeting_expression", "") or ""),
+            str(m.get("placement", "") or ""),
         ])
         row_hash = hashlib.sha256(hash_src.encode("utf-8")).hexdigest()
 
@@ -309,11 +338,13 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
                 keyword_id, keyword_text, keyword_type, keyword_match_type,
                 targeting_id, targeting_expression, targeting_type,
                 customer_search_term,
+                placement,
                 impressions, clicks, cost,
                 purchases_7d, purchases_14d, purchases_30d,
                 sales_7d, sales_14d, sales_30d,
+                top_of_search_impression_share,
                 row_hash
-            ) VALUES (%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s)
+            ) VALUES (%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s, %s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 campaign_name = VALUES(campaign_name),
                 campaign_status = VALUES(campaign_status),
@@ -329,6 +360,7 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
                 targeting_expression = VALUES(targeting_expression),
                 targeting_type = VALUES(targeting_type),
                 customer_search_term = VALUES(customer_search_term),
+                placement = VALUES(placement),
                 impressions = VALUES(impressions),
                 clicks = VALUES(clicks),
                 cost = VALUES(cost),
@@ -338,6 +370,7 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
                 sales_7d = VALUES(sales_7d),
                 sales_14d = VALUES(sales_14d),
                 sales_30d = VALUES(sales_30d),
+                top_of_search_impression_share = VALUES(top_of_search_impression_share),
                 updated_at = NOW()
         """, (
             shop_id, m["report_date"], report_type,
@@ -348,9 +381,11 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
             str(m.get("keyword_id","") or ""), str(m.get("keyword_text","") or ""), str(m.get("keyword_type","") or ""), str(m.get("keyword_match_type","") or ""),
             str(m.get("targeting_id","") or ""), str(m.get("targeting_expression","") or ""), str(m.get("targeting_type","") or ""),
             str(m.get("customer_search_term","") or ""),
+            str(m.get("placement","") or ""),
             int(m.get("impressions",0) or 0), int(m.get("clicks",0) or 0), float(m.get("cost",0) or 0),
             int(m.get("purchases_7d",0) or 0), int(m.get("purchases_14d",0) or 0), int(m.get("purchases_30d",0) or 0),
             float(m.get("sales_7d",0) or 0), float(m.get("sales_14d",0) or 0), float(m.get("sales_30d",0) or 0),
+            _safe_decimal(m.get("top_of_search_impression_share")),
             row_hash,
         ))
         if cursor.rowcount == 1: inserted += 1
@@ -362,6 +397,44 @@ def _safe_decimal(val):
     if val is None or val == "" or val == "None": return None
     try: return float(val)
     except (ValueError,TypeError): return None
+
+
+def _aggregate_placement_rows(rows):
+    """adGroup+campaignPlacement 报告按 (campaignId, placementClassification) 聚合指标
+
+    因为 API 不返回 adGroupId 列（当 adGroup 和 campaignPlacement 同时作为 groupBy 时），
+    多个 adGroup 会产生重复的 (campaign, placement) 行，需要在入库前聚合。
+    """
+    if not rows:
+        return rows
+    from collections import defaultdict
+    metric_cols = ["impressions", "clicks", "cost",
+                   "purchases7d", "purchases14d", "purchases30d",
+                   "sales7d", "sales14d", "sales30d"]
+    dim_cols = [c for c in rows[0].keys() if c not in metric_cols]
+
+    groups = defaultdict(lambda: {"_metrics": {m: 0 for m in metric_cols}})
+    for row in rows:
+        key = (row.get("campaignId", ""), row.get("placementClassification", ""))
+        g = groups[key]
+        for m in metric_cols:
+            val = row.get(m)
+            if val is not None and val != "":
+                g["_metrics"][m] += float(val) if m in ("cost", "sales7d", "sales14d", "sales30d") else int(val)
+        # 保留第一行的维度数据
+        if len(g) == 1:  # only _metrics key
+            for dc in dim_cols:
+                g[dc] = row.get(dc, "")
+
+    aggregated = []
+    for (cid, placement), g in groups.items():
+        r = dict(g)
+        m = r.pop("_metrics")
+        r.update(m)
+        r["campaignId"] = cid
+        r["placementClassification"] = placement
+        aggregated.append(r)
+    return aggregated
 
 
 def _report_cache_get(shop_id, report_type_key, report_date):
@@ -417,31 +490,51 @@ def _report_cache_clean(shop_id=None, keep_days=7):
         conn.close()
 
 
-def _fetch_report(client, report_type_cfg, report_type_key, start_date, end_date, shop_id=None):
-    """获取报告（优先复用缓存 reportId，避免重复创建）
-
-    流程:
-      1. 查缓存 → 命中则用现有 reportId 查状态/下载
-      2. 缓存未命中或已失效 → 创建新报告 → 缓存 reportId
-      3. 下载前清理过期缓存
-    """
-    date_str = start_date  # 日报告 start=end
-
-    # 构建请求体
-    body = {
-        "name": f"Daily sync {report_type_cfg['name']}",
+def _build_report_body(cfg, report_type_key, start_date, end_date):
+    """构建报告请求体"""
+    api_report_type = cfg.get("_reportTypeId", report_type_key)
+    return {
+        "name": f"Daily sync {cfg['name']}",
         "startDate": start_date, "endDate": end_date,
         "configuration": {
             "adProduct": "SPONSORED_PRODUCTS",
-            "groupBy": report_type_cfg["groupBy"],
-            "columns": report_type_cfg["columns"],
-            "reportTypeId": report_type_key,
+            "groupBy": cfg["groupBy"],
+            "columns": cfg["columns"],
+            "reportTypeId": api_report_type,
             "timeUnit": "DAILY",
             "format": "GZIP_JSON",
         },
     }
 
-    # 1. 检查缓存
+
+def _write_report_result(shop_id, report_type_key, cfg, date_str, report_id, rows):
+    """写入已下载报告数据到数据库，返回结果字典"""
+    result = {"report_type": report_type_key, "rows": len(rows), "inserted": 0, "updated": 0, "error": None}
+    if rows:
+        if report_type_key == "spCampaignsPlacement":
+            rows = _aggregate_placement_rows(rows)
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as c:
+                ins, upd = _write_raw_reports(c, shop_id, report_type_key, rows)
+            conn.commit()
+            result["inserted"], result["updated"] = ins, upd
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+        finally:
+            conn.close()
+    if report_id:
+        _report_cache_set(shop_id, report_type_key, date_str, report_id, "COMPLETED")
+    print(f"[Ads Sync] shop={shop_id} {report_type_key}: {len(rows)} rows ({result['inserted']} new)")
+    return result
+
+
+def _fetch_report(client, report_type_cfg, report_type_key, start_date, end_date, shop_id=None):
+    """获取报告（串行模式，保留兼容）"""
+    date_str = start_date
+
+    # 检查缓存
     if shop_id:
         cached = _report_cache_get(shop_id, report_type_key, date_str)
         if cached:
@@ -459,22 +552,20 @@ def _fetch_report(client, report_type_cfg, report_type_key, start_date, end_date
                         _report_cache_set(shop_id, report_type_key, date_str, cached_id, "COMPLETED")
                         return rows
                     else:
-                        print(f"[Ads Sync] → {report_type_key} 缓存报告已完成但 URL 已过期，重新创建")
+                        print(f"[Ads Sync] → {report_type_key} 缓存已完成但 URL 过期，重新创建")
                 elif state in ("PENDING", "PROCESSING"):
                     print(f"[Ads Sync] → {report_type_key} 缓存报告仍在 {state}，轮询等待...")
-                    report_id = cached_id
-                    url = client._poll_report_completion(report_id, max_wait=600)
+                    url = client._poll_report_completion(cached_id, max_wait=600)
                     rows = client._download_report_content(url)
-                    _report_cache_set(shop_id, report_type_key, date_str, report_id, "COMPLETED")
+                    _report_cache_set(shop_id, report_type_key, date_str, cached_id, "COMPLETED")
                     return rows
-                elif state in ("FAILURE", "CANCELLED"):
-                    print(f"[Ads Sync] → {report_type_key} 缓存报告已失效 ({state})，重新创建")
                 else:
-                    print(f"[Ads Sync] → {report_type_key} 缓存报告未知状态 {state}，重新创建")
+                    print(f"[Ads Sync] → {report_type_key} 缓存已失效 ({state})，重新创建")
             except Exception as e:
-                print(f"[Ads Sync] → {report_type_key} 缓存报告查询失败: {e}，重新创建")
+                print(f"[Ads Sync] → {report_type_key} 缓存查询失败: {e}，重新创建")
 
-    # 2. 创建新报告
+    # 创建 + 轮询 + 下载
+    body = _build_report_body(report_type_cfg, report_type_key, start_date, end_date)
     print(f"[Ads Sync] → 创建 {report_type_key} 报告, date={date_str}, "
           f"groupBy={report_type_cfg['groupBy']}, columns={len(report_type_cfg['columns'])}列")
     new_id = client._create_async_report(body)
@@ -482,7 +573,6 @@ def _fetch_report(client, report_type_cfg, report_type_key, start_date, end_date
         _report_cache_set(shop_id, report_type_key, date_str, new_id, "PENDING")
         print(f"[Ads Sync] → {report_type_key} 新报告 reportId={new_id[:20]}... 已缓存")
 
-    # 3. 轮询 + 下载
     url = client._poll_report_completion(new_id, max_wait=600)
     rows = client._download_report_content(url)
     if shop_id:
@@ -491,33 +581,21 @@ def _fetch_report(client, report_type_cfg, report_type_key, start_date, end_date
 
 
 def _sync_one_type(client, shop_id, report_type_key, cfg, date_str):
-    """同步单个报告类型，返回结果字典"""
-    result = {"report_type": report_type_key, "rows": 0, "inserted": 0, "updated": 0, "error": None}
+    """同步单个报告类型（串行模式，保留兼容）"""
     try:
         rows = _fetch_report(client, cfg, report_type_key, date_str, date_str, shop_id=shop_id)
-        result["rows"] = len(rows)
-        if rows:
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as c:
-                    ins, upd = _write_raw_reports(c, shop_id, report_type_key, rows)
-                conn.commit()
-                result["inserted"], result["updated"] = ins, upd
-            finally:
-                conn.close()
-        print(f"[Ads Sync] shop={shop_id} {report_type_key}: {len(rows)} rows ({result['inserted']} new)")
+        return _write_report_result(shop_id, report_type_key, cfg, date_str, "", rows)
     except Exception as e:
-        result["error"] = str(e)
         print(f"[Ads Sync] shop={shop_id} {report_type_key} FAIL: {e}")
-    return result
+        return {"report_type": report_type_key, "rows": 0, "inserted": 0, "updated": 0, "error": str(e)}
 
 
 def run_ads_sync(shop_id, date_str=None):
     """
     同步指定店铺指定日期的全量广告报告数据 → amazon_ads_raw_reports
 
-    cron 可直接 `from blueprints.amazon.advertising import run_ads_sync` 调用。
-    返回: {"shop_id":..., "date":..., "results":[...], "total_rows":...}
+    优化策略：批量创建所有类型报告，统一每 60 秒轮询一次状态，
+    哪个先完成就先下载写入，避免串行阻塞。
     """
     date_str = date_str or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     out = {"shop_id": shop_id, "date": date_str, "results": [], "total_rows": 0, "error": None}
@@ -529,15 +607,94 @@ def run_ads_sync(shop_id, date_str=None):
 
     types = list(_SYNC_REPORT_TYPES.keys())
     print(f"[Ads Sync] shop={shop_id} date={date_str} 开始同步 {len(types)} 种报告: {types}")
-
-    # 先清理过期缓存
     _report_cache_clean(shop_id=shop_id)
 
+    # ========== Phase 1: 批量创建报告 + 处理已完成缓存 ==========
+    pending = {}  # key -> {"cfg": cfg, "report_id": str}
+
     for key, cfg in _SYNC_REPORT_TYPES.items():
-        r = _sync_one_type(client, shop_id, key, cfg, date_str)
-        if not r["error"]:
-            out["total_rows"] += r["rows"]
-        out["results"].append(r)
+        cached = _report_cache_get(shop_id, key, date_str)
+        if cached:
+            cached_id = cached["report_id"]
+            try:
+                status = client._get_report_status(cached_id)
+                state = (status.get("status") or "").upper()
+                if state == "COMPLETED":
+                    url = status.get("url")
+                    if url:
+                        print(f"[Ads Sync] → {key} 缓存已完成，直接下载")
+                        rows = client._download_report_content(url)
+                        r = _write_report_result(shop_id, key, cfg, date_str, cached_id, rows)
+                        out["results"].append(r)
+                        if not r["error"]:
+                            out["total_rows"] += r["rows"]
+                        continue
+                elif state in ("PENDING", "PROCESSING"):
+                    print(f"[Ads Sync] → {key} 缓存报告 {state}，加入轮询队列")
+                    pending[key] = {"cfg": cfg, "report_id": cached_id}
+                    continue
+                else:
+                    print(f"[Ads Sync] → {key} 缓存已失效 ({state})，重新创建")
+            except Exception as e:
+                print(f"[Ads Sync] → {key} 缓存查询异常: {e}，重新创建")
+
+        # 创建新报告
+        body = _build_report_body(cfg, key, date_str, date_str)
+        try:
+            new_id = client._create_async_report(body)
+            _report_cache_set(shop_id, key, date_str, new_id, "PENDING")
+            print(f"[Ads Sync] → {key} 新报告 reportId={new_id[:20]}... 已创建")
+            pending[key] = {"cfg": cfg, "report_id": new_id}
+        except Exception as e:
+            print(f"[Ads Sync] → {key} 创建失败: {e}")
+            out["results"].append({"report_type": key, "rows": 0, "inserted": 0, "updated": 0, "error": str(e)})
+
+    # ========== Phase 2: 批量轮询 — 每 60s 查一次，哪个完成就立即处理 ==========
+    if pending:
+        print(f"[Ads Sync] 等待 {len(pending)} 个报告完成 (每 60s 检查，最长等 10 分钟)...")
+        poll_interval = 60
+        max_wait = 600
+        deadline = time.time() + max_wait
+
+        while pending and time.time() < deadline:
+            time.sleep(poll_interval)
+            completed = []
+            for key, info in list(pending.items()):
+                try:
+                    status = client._get_report_status(info["report_id"])
+                    state = (status.get("status") or "").upper()
+                    if state == "COMPLETED":
+                        url = status.get("url")
+                        if url:
+                            print(f"[Ads Sync] → {key} 完成，下载写入中...")
+                            rows = client._download_report_content(url)
+                            r = _write_report_result(shop_id, key, info["cfg"], date_str, info["report_id"], rows)
+                            out["results"].append(r)
+                            if not r["error"]:
+                                out["total_rows"] += r["rows"]
+                            completed.append(key)
+                    elif state in ("FAILURE", "CANCELLED"):
+                        err = f"报告 {info['report_id']} 失败 (state={state})"
+                        print(f"[Ads Sync] → {key} {err}")
+                        out["results"].append({"report_type": key, "rows": 0, "inserted": 0, "updated": 0, "error": err})
+                        completed.append(key)
+                except Exception as e:
+                    print(f"[Ads Sync] → {key} 状态查询异常: {e}")
+
+            for k in completed:
+                del pending[k]
+
+            if pending and completed:
+                remaining = ", ".join(pending.keys())
+                print(f"[Ads Sync] 已完成 {len(completed)} 个，剩余 {len(pending)} 个: {remaining}")
+
+        # 超时未完成的
+        for key, info in pending.items():
+            err = f"报告在 {max_wait}s 内未完成"
+            print(f"[Ads Sync] → {key} {err}")
+            out["results"].append({"report_type": key, "rows": 0, "inserted": 0, "updated": 0, "error": err})
+
+    print(f"[Ads Sync] shop={shop_id} 完成: {len(out['results'])} 报告, {out['total_rows']} 行")
     return out
 
 

@@ -1319,6 +1319,7 @@ _ALL_SORT_COLS = [
     # 字符串列 (仅部分接口支持)
     "customer_search_term", "keyword_text", "keyword_type",
     "campaign_name", "advertised_asin", "advertised_sku",
+    "placement",
     # 前端计算指标 (内存排序)
     "ctr", "cpc", "acos_7d", "acos_14d", "acos_30d",
     "roas_7d", "roas_14d", "roas_30d",
@@ -1347,6 +1348,11 @@ _AD_ENUM_LABELS = {
     # 预算类型
     "daily": "每日预算",
     "lifetime": "周期总预算",
+    # 广告位置
+    "Top of Search on-Amazon": "搜索顶部",
+    "Detail Page on-Amazon": "商品详情页",
+    "Other on-Amazon": "搜索其他位置",
+    "Off Amazon": "站外",
 }
 
 
@@ -1363,6 +1369,11 @@ def _add_labels(row):
         val = (row.get(field) or "").strip()
         if val and val in _AD_ENUM_LABELS:
             row[field + "_label"] = _AD_ENUM_LABELS[val]
+
+    # placement 中文标签
+    placement_val = (row.get("placement") or "").strip()
+    if placement_val:
+        row["placement_label"] = _AD_ENUM_LABELS.get(placement_val, placement_val)
 
     return row
 
@@ -1399,6 +1410,7 @@ def _query_raw_reports(report_type, shop_id=None, start_date=None, end_date=None
                           "sales_7d", "sales_14d", "sales_30d",
                           "customer_search_term", "keyword_text", "keyword_type",
                           "campaign_name", "advertised_asin", "advertised_sku",
+                          "placement",
                           "report_date"}
         if sort_by not in _ALL_SORT_COLS:
             sort_by = "cost"
@@ -1463,6 +1475,12 @@ def _query_raw_reports(report_type, shop_id=None, start_date=None, end_date=None
                                "impressions, clicks, cost, purchases_7d, sales_7d, report_date")
             elif report_type == "spCampaigns":
                 select_cols = ("campaign_name, campaign_status, campaign_budget, campaign_budget_type, "
+                               "impressions, clicks, cost, "
+                               "purchases_7d, purchases_14d, purchases_30d, "
+                               "sales_7d, sales_14d, sales_30d, report_date")
+            elif report_type == "spCampaignsPlacement":
+                select_cols = ("campaign_name, campaign_status, "
+                               "placement, "
                                "impressions, clicks, cost, "
                                "purchases_7d, purchases_14d, purchases_30d, "
                                "sales_7d, sales_14d, sales_30d, report_date")

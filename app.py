@@ -1,7 +1,7 @@
 # app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, date
 import os
 
 from config import config
@@ -21,6 +21,7 @@ from blueprints.amazon.orders import amazon_orders_bp
 from blueprints.amazon.listing import amazon_listing_bp
 from blueprints.amazon.finances import amazon_finances_bp
 from blueprints.amazon.advertising import advertising_bp
+from blueprints.amazon.advertising_manage import advertising_manage_bp
 from blueprints.shops import shops_bp
 from blueprints.supplier import supplier_bp
 from blueprints.products import products_bp
@@ -57,6 +58,8 @@ try:
         def default(self, o):
             if isinstance(o, datetime):
                 return o.strftime('%Y-%m-%d %H:%M:%S')
+            if isinstance(o, date):
+                return o.strftime('%Y-%m-%d')
             return super().default(o)
     app.json = CustomJSONProvider(app)
 except ImportError:
@@ -65,6 +68,8 @@ except ImportError:
         def default(self, o):
             if isinstance(o, datetime):
                 return o.strftime('%Y-%m-%d %H:%M:%S')
+            if isinstance(o, date):
+                return o.strftime('%Y-%m-%d')
             return super().default(o)
     app.json_encoder = CustomJSONEncoder
 
@@ -143,6 +148,9 @@ app.register_blueprint(amazon_orders_bp)
 app.register_blueprint(amazon_listing_bp)
 app.register_blueprint(amazon_finances_bp)
 app.register_blueprint(advertising_bp)
+
+# 注册 CPC 广告管理路由
+app.register_blueprint(advertising_manage_bp)
 
 # 注册店铺管理路由
 app.register_blueprint(shops_bp)

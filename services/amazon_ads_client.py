@@ -31,6 +31,13 @@ ADS_API_ENDPOINTS = {
 }
 
 
+def _upper(val):
+    """Amazon Ads API 的 state 字段必须大写"""
+    if val and isinstance(val, str):
+        return val.upper()
+    return val
+
+
 class AmazonAdsApiClient:
     """Amazon 广告 API 客户端
 
@@ -317,3 +324,404 @@ class AmazonAdsApiClient:
         """创建 → 轮询 → 下载 → 返回行列表（一站式）"""
         url = self._poll_report_completion(report_id, max_wait=max_wait)
         return self._download_report_content(url)
+
+    # ==================== 广告活动 (Campaigns) v3 ====================
+
+    def update_campaign(self, campaign_id: int, updates: dict) -> dict:
+        """更新 SP 广告活动属性 (state / dailyBudget / bidding / startDate / endDate)"""
+        body = {"campaignId": str(campaign_id)}
+        if "state" in updates:
+            body["state"] = _upper(updates["state"])
+        if "dailyBudget" in updates:
+            body["budget"] = {"budgetType": "DAILY", "budget": updates["dailyBudget"]}
+        if "startDate" in updates:
+            body["startDate"] = updates["startDate"]
+        if "endDate" in updates:
+            body["endDate"] = updates["endDate"]
+        if "bidding" in updates:
+            body["dynamicBidding"] = updates["bidding"]
+        return self._request(
+            "PUT", "/sp/campaigns",
+            json_data={"campaigns": [body]},
+            headers={"Content-Type": self._V3_SP_CAMPAIGN_CT, "Accept": self._V3_SP_CAMPAIGN_CT},
+        )
+
+    _ID_FIELDS = {"campaignId", "adGroupId", "keywordId", "targetId", "adId"}
+
+    @staticmethod
+    def _stringify_ids(items):
+        for item in items:
+            for f in AmazonAdsApiClient._ID_FIELDS:
+                if f in item and not isinstance(item[f], str):
+                    item[f] = str(item[f])
+            if "state" in item and item["state"] and isinstance(item["state"], str):
+                item["state"] = item["state"].upper()
+
+    def create_campaigns(self, campaigns: list) -> dict:
+        """批量创建 SP 广告活动"""
+        self._stringify_ids(campaigns)
+        return self._request(
+            "POST", "/sp/campaigns",
+            json_data={"campaigns": campaigns},
+            headers={"Content-Type": self._V3_SP_CAMPAIGN_CT, "Accept": self._V3_SP_CAMPAIGN_CT},
+        )
+
+    # ==================== 广告组 (Ad Groups) v3 ====================
+
+    _V3_SP_ADGROUP_CT = "application/vnd.spadgroup.v3+json"
+
+    def list_ad_groups(self, campaign_id: int = None, state_filter: list = None,
+                       max_results: int = 100, next_token: str = None) -> dict:
+        """获取 SP 广告组列表"""
+        body = {"maxResults": max(1, min(max_results, 100))}
+        if campaign_id:
+            body["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if state_filter:
+            body["stateFilter"] = {"include": state_filter}
+        if next_token:
+            body["nextToken"] = next_token
+        return self._request(
+            "POST", "/sp/adGroups/list", json_data=body,
+            headers={"Content-Type": self._V3_SP_ADGROUP_CT, "Accept": self._V3_SP_ADGROUP_CT},
+        )
+
+    def update_ad_group(self, ad_group_id: int, updates: dict) -> dict:
+        """更新 SP 广告组 (state / defaultBid)"""
+        body = {"adGroupId": str(ad_group_id)}
+        if "state" in updates:
+            body["state"] = _upper(updates["state"])
+        if "defaultBid" in updates:
+            body["defaultBid"] = updates["defaultBid"]
+        return self._request(
+            "PUT", "/sp/adGroups",
+            json_data={"adGroups": [body]},
+            headers={"Content-Type": self._V3_SP_ADGROUP_CT, "Accept": self._V3_SP_ADGROUP_CT},
+        )
+
+    def create_ad_groups(self, ad_groups: list) -> dict:
+        """批量创建 SP 广告组"""
+        self._stringify_ids(ad_groups)
+        return self._request(
+            "POST", "/sp/adGroups",
+            json_data={"adGroups": ad_groups},
+            headers={"Content-Type": self._V3_SP_ADGROUP_CT, "Accept": self._V3_SP_ADGROUP_CT},
+        )
+
+    # ==================== 产品广告 (Product Ads) v3 ====================
+
+    _V3_SP_PRODUCT_AD_CT = "application/vnd.spproductad.v3+json"
+
+    def list_product_ads(self, campaign_id: int = None, ad_group_id: int = None,
+                         state_filter: list = None, max_results: int = 100,
+                         next_token: str = None) -> dict:
+        """获取 SP 产品广告列表"""
+        body = {"maxResults": max(1, min(max_results, 100))}
+        filters = {}
+        if campaign_id:
+            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if ad_group_id:
+            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
+        if filters:
+            body["filters"] = filters
+        if state_filter:
+            body["stateFilter"] = {"include": state_filter}
+        if next_token:
+            body["nextToken"] = next_token
+        return self._request(
+            "POST", "/sp/productAds/list", json_data=body,
+            headers={"Content-Type": self._V3_SP_PRODUCT_AD_CT, "Accept": self._V3_SP_PRODUCT_AD_CT},
+        )
+
+    def update_product_ad(self, ad_id: int, updates: dict) -> dict:
+        """更新 SP 产品广告状态"""
+        body = {"adId": str(ad_id)}
+        if "state" in updates:
+            body["state"] = _upper(updates["state"])
+        return self._request(
+            "PUT", "/sp/productAds",
+            json_data={"productAds": [body]},
+            headers={"Content-Type": self._V3_SP_PRODUCT_AD_CT, "Accept": self._V3_SP_PRODUCT_AD_CT},
+        )
+
+    def create_product_ads(self, product_ads: list) -> dict:
+        """批量创建 SP 产品广告"""
+        self._stringify_ids(product_ads)
+        return self._request(
+            "POST", "/sp/productAds",
+            json_data={"productAds": product_ads},
+            headers={"Content-Type": self._V3_SP_PRODUCT_AD_CT, "Accept": self._V3_SP_PRODUCT_AD_CT},
+        )
+
+    # ==================== 关键词 (Keywords) v3 ====================
+
+    _V3_SP_KEYWORD_CT = "application/vnd.spkeyword.v3+json"
+
+    def list_keywords(self, campaign_id: int = None, ad_group_id: int = None,
+                      state_filter: list = None, max_results: int = 100,
+                      next_token: str = None) -> dict:
+        """获取 SP 关键词列表"""
+        body = {"maxResults": max(1, min(max_results, 100))}
+        filters = {}
+        if campaign_id:
+            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if ad_group_id:
+            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
+        if filters:
+            body["filters"] = filters
+        if state_filter:
+            body["stateFilter"] = {"include": state_filter}
+        if next_token:
+            body["nextToken"] = next_token
+        return self._request(
+            "POST", "/sp/keywords/list", json_data=body,
+            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
+        )
+
+    def update_keyword(self, keyword_id: int, updates: dict) -> dict:
+        """更新 SP 关键词 (state / bid)"""
+        body = {"keywordId": str(keyword_id)}
+        if "state" in updates:
+            body["state"] = _upper(updates["state"])
+        if "bid" in updates:
+            body["bid"] = updates["bid"]
+        return self._request(
+            "PUT", "/sp/keywords",
+            json_data={"keywords": [body]},
+            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
+        )
+
+    def create_keywords(self, keywords: list) -> dict:
+        """批量创建 SP 关键词"""
+        self._stringify_ids(keywords)
+        return self._request(
+            "POST", "/sp/keywords",
+            json_data={"keywords": keywords},
+            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
+        )
+
+    def get_keyword_recommendations(self, payload: dict) -> dict:
+        """获取关键词推荐 & 建议竞价"""
+        return self._request(
+            "POST", "/sp/targets/keywords/recommendations",
+            json_data=payload,
+            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
+        )
+
+    # ==================== 投放 (Targets) v3 ====================
+
+    _V3_SP_TARGET_CT = "application/vnd.sptargetingClause.v3+json"
+
+    def list_targets(self, campaign_id: int = None, ad_group_id: int = None,
+                     state_filter: list = None, max_results: int = 100,
+                     next_token: str = None) -> dict:
+        """获取 SP 投放列表 (手动 + 自动)"""
+        body = {"maxResults": max(1, min(max_results, 100))}
+        filters = {}
+        if campaign_id:
+            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if ad_group_id:
+            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
+        if filters:
+            body["filters"] = filters
+        if state_filter:
+            body["stateFilter"] = {"include": state_filter}
+        if next_token:
+            body["nextToken"] = next_token
+        return self._request(
+            "POST", "/sp/targets/list", json_data=body,
+            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+        )
+
+    def update_target(self, target_id: int, updates: dict) -> dict:
+        """更新 SP 投放 (state / bid)"""
+        body = {"targetId": str(target_id)}
+        if "state" in updates:
+            body["state"] = _upper(updates["state"])
+        if "bid" in updates:
+            body["bid"] = updates["bid"]
+        return self._request(
+            "PUT", "/sp/targets",
+            json_data={"targetingClauses": [body]},
+            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+        )
+
+    def create_targets(self, targets: list) -> dict:
+        """批量创建 SP 手动投放"""
+        self._stringify_ids(targets)
+        return self._request(
+            "POST", "/sp/targets",
+            json_data={"targetingClauses": targets},
+            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+        )
+
+    def get_target_bid_recommendations(self, payload: dict) -> dict:
+        """获取投放建议竞价"""
+        return self._request(
+            "POST", "/sp/targets/bid/recommendations",
+            json_data=payload,
+            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+        )
+
+    def get_target_product_recommendations(self, payload: dict) -> dict:
+        """获取产品投放推荐 (ASIN)"""
+        return self._request(
+            "POST", "/sp/targets/products/recommendations",
+            json_data=payload,
+            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+        )
+
+    def get_categories(self, payload: dict) -> dict:
+        """获取类目树"""
+        return self._request(
+            "POST", "/sp/targets/categories",
+            json_data=payload,
+            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+        )
+
+    # ==================== 否定关键词 (Negative Keywords) v3 ====================
+
+    _V3_SP_NEG_KEYWORD_CT = "application/vnd.spnegativekeyword.v3+json"
+
+    def list_negative_keywords(self, campaign_id: int = None, ad_group_id: int = None,
+                               state_filter: list = None, max_results: int = 100,
+                               next_token: str = None) -> dict:
+        """获取 SP 否定关键词列表"""
+        body = {"maxResults": max(1, min(max_results, 100))}
+        filters = {}
+        if campaign_id:
+            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if ad_group_id is not None:
+            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
+        if filters:
+            body["filters"] = filters
+        if state_filter:
+            body["stateFilter"] = {"include": state_filter}
+        if next_token:
+            body["nextToken"] = next_token
+        return self._request(
+            "POST", "/sp/negativeKeywords/list", json_data=body,
+            headers={"Content-Type": self._V3_SP_NEG_KEYWORD_CT, "Accept": self._V3_SP_NEG_KEYWORD_CT},
+        )
+
+    def update_negative_keyword(self, keyword_id: int, updates: dict) -> dict:
+        """更新 SP 否定关键词状态"""
+        body = {"keywordId": str(keyword_id)}
+        if "state" in updates:
+            body["state"] = _upper(updates["state"])
+        return self._request(
+            "PUT", "/sp/negativeKeywords",
+            json_data={"negativeKeywords": [body]},
+            headers={"Content-Type": self._V3_SP_NEG_KEYWORD_CT, "Accept": self._V3_SP_NEG_KEYWORD_CT},
+        )
+
+    def create_negative_keywords(self, keywords: list) -> dict:
+        """批量创建 SP 否定关键词"""
+        self._stringify_ids(keywords)
+        return self._request(
+            "POST", "/sp/negativeKeywords",
+            json_data={"negativeKeywords": keywords},
+            headers={"Content-Type": self._V3_SP_NEG_KEYWORD_CT, "Accept": self._V3_SP_NEG_KEYWORD_CT},
+        )
+
+    def archive_negative_keyword(self, keyword_id: int) -> dict:
+        """归档 SP 否定关键词（直连 DELETE，不送 Content-Type）"""
+        url = f"{self.base_url}/sp/negativeKeywords/{keyword_id}"
+        h = {
+            "Authorization": f"Bearer {self._get_access_token()}",
+            "Amazon-Advertising-API-ClientId": self.client_id,
+            "Amazon-Advertising-API-Scope": str(self.profile_id),
+        }
+        resp = requests.delete(url, headers=h, proxies=self.proxies, timeout=60)
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            try:
+                err_body = resp.json()
+            except Exception:
+                err_body = resp.text
+            print(f"[Ads-API Error] {resp.status_code} {resp.url}")
+            print(f"[Ads-API Error Body] {err_body}")
+            raise
+        if resp.status_code == 204 or not resp.text:
+            return {}
+        return resp.json()
+
+    # ==================== 否定投放 (Negative Targets) v3 ====================
+
+    _V3_SP_NEG_TARGET_CT = "application/vnd.spnegativeTargetingClause.v3+json"
+
+    def list_negative_targets(self, campaign_id: int = None, ad_group_id: int = None,
+                              state_filter: list = None, max_results: int = 100,
+                              next_token: str = None) -> dict:
+        """获取 SP 否定投放列表"""
+        body = {"maxResults": max(1, min(max_results, 100))}
+        filters = {}
+        if campaign_id:
+            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if ad_group_id is not None:
+            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
+        if filters:
+            body["filters"] = filters
+        if state_filter:
+            body["stateFilter"] = {"include": state_filter}
+        if next_token:
+            body["nextToken"] = next_token
+        return self._request(
+            "POST", "/sp/negativeTargets/list", json_data=body,
+            headers={"Content-Type": self._V3_SP_NEG_TARGET_CT, "Accept": self._V3_SP_NEG_TARGET_CT},
+        )
+
+    def update_negative_target(self, target_id: int, updates: dict) -> dict:
+        """更新 SP 否定投放状态"""
+        body = {"targetId": str(target_id)}
+        if "state" in updates:
+            body["state"] = _upper(updates["state"])
+        return self._request(
+            "PUT", "/sp/negativeTargets",
+            json_data={"negativeTargetingClauses": [body]},
+            headers={"Content-Type": self._V3_SP_NEG_TARGET_CT, "Accept": self._V3_SP_NEG_TARGET_CT},
+        )
+
+    def create_negative_targets(self, targets: list) -> dict:
+        """批量创建 SP 否定投放"""
+        self._stringify_ids(targets)
+        return self._request(
+            "POST", "/sp/negativeTargets",
+            json_data={"negativeTargetingClauses": targets},
+            headers={"Content-Type": self._V3_SP_NEG_TARGET_CT, "Accept": self._V3_SP_NEG_TARGET_CT},
+        )
+
+    def archive_negative_target(self, target_id: int) -> dict:
+        """归档 SP 否定投放（直连 DELETE，不送 Content-Type）"""
+        url = f"{self.base_url}/sp/negativeTargets/{target_id}"
+        h = {
+            "Authorization": f"Bearer {self._get_access_token()}",
+            "Amazon-Advertising-API-ClientId": self.client_id,
+            "Amazon-Advertising-API-Scope": str(self.profile_id),
+        }
+        resp = requests.delete(url, headers=h, proxies=self.proxies, timeout=60)
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            try:
+                err_body = resp.json()
+            except Exception:
+                err_body = resp.text
+            print(f"[Ads-API Error] {resp.status_code} {resp.url}")
+            print(f"[Ads-API Error Body] {err_body}")
+            raise
+        if resp.status_code == 204 or not resp.text:
+            return {}
+        return resp.json()
+
+    # ==================== 广告组合 (Portfolios) ====================
+
+    def list_portfolios(self, state_filter: list = None) -> list:
+        """获取广告组合列表"""
+        resp = self._request(
+            "GET", "/v2/portfolios/extended",
+            params={"stateFilter": "enabled"},
+        )
+        if isinstance(resp, list):
+            return resp
+        return resp.get("portfolios", []) if isinstance(resp, dict) else []
