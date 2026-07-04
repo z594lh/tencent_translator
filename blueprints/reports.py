@@ -127,23 +127,10 @@ def _get_shop_id_optional():
 def list_business_reports():
     """
     分页查询经营报表列表
-
-    简介: 支持按类型（daily/weekly/monthly）、日期范围、店铺过滤。
-
-    查询参数:
-        type       (可选) 报表类型: daily / weekly / monthly
-        start_date (可选) report_date >=
-        end_date   (可选) report_date <=
-        shop_id    (可选) 店铺ID
-        page       (可选) 页码，默认 1
-        page_size  (可选) 每页条数，默认 20
-
-    返回:
-        { status, data: { list, total, page, page_size } }
-        每行含 data_status 字段: estimated=预估 / partial=部分结算 / settled=已结算
+    周报/月报实时从日报数据聚合，不再预生成。
     """
     try:
-        report_type = request.args.get('type', '').strip() or None
+        report_type = request.args.get('type', '').strip() or 'daily'
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
         shop_id = _get_shop_id_optional()
@@ -151,48 +138,106 @@ def list_business_reports():
 
         conn = _get_conn()
         try:
-            where_clauses = []
-            params = []
+            if report_type in ('weekly', 'monthly'):
+                # 实时聚合
+                if report_type == 'weekly':
+                    group_expr = "YEARWEEK(report_date, 1)"
+                    label_expr = "CONCAT(MIN(report_date), '~', MAX(report_date)) AS report_week"
+                    order_by = "ORDER BY MIN(report_date) DESC"
+                else:
+                    group_expr = "DATE_FORMAT(report_date, '%%Y-%%m')"
+                    label_expr = "DATE_FORMAT(MIN(report_date), '%%Y-%%m') AS report_month"
+                    order_by = "ORDER BY MIN(report_date) DESC"
 
-            if report_type:
-                where_clauses.append("report_type = %s")
-                params.append(report_type)
-            if shop_id is not None:
-                where_clauses.append("shop_id = %s")
-                params.append(shop_id)
-            if start_date:
-                where_clauses.append("report_date >= %s")
-                params.append(start_date)
-            if end_date:
-                where_clauses.append("report_date <= %s")
-                params.append(end_date)
+                where_clauses = ["report_type = 'daily'"]
+                params = []
+                if shop_id is not None:
+                    where_clauses.append("shop_id = %s"); params.append(shop_id)
+                if start_date:
+                    where_clauses.append("report_date >= %s"); params.append(start_date)
+                if end_date:
+                    where_clauses.append("report_date <= %s"); params.append(end_date)
+                where_sql = "WHERE " + " AND ".join(where_clauses)
 
-            where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT {group_expr}) AS total
+                        FROM report_business
+                        {where_sql}
+                    """, params)
+                    total = cursor.fetchone()['total']
 
-            with conn.cursor() as cursor:
-                cursor.execute(f"SELECT COUNT(*) AS total FROM report_business {where_sql}", params)
-                total = cursor.fetchone()['total']
+                offset = (page - 1) * page_size
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT
+                            {label_expr},
+                            SUM(order_count) AS order_count,
+                            SUM(total_sales) AS total_sales,
+                            SUM(gross_profit) AS gross_profit,
+                            SUM(product_cost) AS product_cost,
+                            SUM(fba_fees) AS fba_fees,
+                            SUM(platform_fees) AS platform_fees,
+                            SUM(headway_cost) AS headway_cost,
+                            SUM(ad_cost) AS ad_cost,
+                            SUM(refund_amount) AS refund_amount,
+                            SUM(total_cost) AS total_cost,
+                            SUM(sku_count) AS sku_count,
+                            CASE WHEN SUM(total_sales) > 0 THEN SUM(gross_profit) / SUM(total_sales) * 100 ELSE 0 END AS profit_margin
+                        FROM report_business
+                        {where_sql}
+                        GROUP BY {group_expr}
+                        {order_by}
+                        LIMIT %s OFFSET %s
+                    """, params + [page_size, offset])
+                    rows = cursor.fetchall()
 
-            offset = (page - 1) * page_size
-            with conn.cursor() as cursor:
-                sql = f"""
-                    SELECT * FROM report_business
-                    {where_sql}
-                    ORDER BY report_date DESC, id DESC
-                    LIMIT %s OFFSET %s
-                """
-                cursor.execute(sql, params + [page_size, offset])
-                rows = cursor.fetchall()
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        "list": _to_json_serializable(rows),
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size,
+                    }
+                })
+            else:
+                # daily: 直接查表
+                where_clauses = []
+                params = []
+                if report_type:
+                    where_clauses.append("report_type = %s"); params.append(report_type)
+                if shop_id is not None:
+                    where_clauses.append("shop_id = %s"); params.append(shop_id)
+                if start_date:
+                    where_clauses.append("report_date >= %s"); params.append(start_date)
+                if end_date:
+                    where_clauses.append("report_date <= %s"); params.append(end_date)
+                where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
-            return jsonify({
-                "status": "success",
-                "data": {
-                    "list": _to_json_serializable(rows),
-                    "total": total,
-                    "page": page,
-                    "page_size": page_size,
-                }
-            })
+                with conn.cursor() as cursor:
+                    cursor.execute(f"SELECT COUNT(*) AS total FROM report_business {where_sql}", params)
+                    total = cursor.fetchone()['total']
+
+                offset = (page - 1) * page_size
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT * FROM report_business
+                        {where_sql}
+                        ORDER BY report_date DESC, id DESC
+                        LIMIT %s OFFSET %s
+                    """, params + [page_size, offset])
+                    rows = cursor.fetchall()
+
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        "list": _to_json_serializable(rows),
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size,
+                    }
+                })
         finally:
             conn.close()
     except Exception as e:
@@ -204,11 +249,6 @@ def list_business_reports():
 @login_required
 @permission_required('reports:page')
 def business_summary():
-    """
-    经营报表汇总统计
-
-    简介: 对筛选范围内的日报/周报/月报做 SUM 聚合，返回总量指标。
-    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
         start_date = request.args.get('start_date', '').strip() or None
@@ -217,17 +257,14 @@ def business_summary():
 
         conn = _get_conn()
         try:
-            where_clauses = ["report_type = %s"]
-            params = [report_type]
+            where_clauses = ["report_type = 'daily'"]
+            params = []
             if shop_id is not None:
-                where_clauses.append("shop_id = %s")
-                params.append(shop_id)
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
             if start_date:
-                where_clauses.append("report_date >= %s")
-                params.append(start_date)
+                where_clauses.append("report_date >= %s"); params.append(start_date)
             if end_date:
-                where_clauses.append("report_date <= %s")
-                params.append(end_date)
+                where_clauses.append("report_date <= %s"); params.append(end_date)
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             with conn.cursor() as cursor:
@@ -235,7 +272,7 @@ def business_summary():
                     SELECT
                         COUNT(*) AS record_count,
                         SUM(total_sales) AS sum_sales,
-                        SUM(total_cost) AS sum_cost,
+                        SUM(total_cost) AS sum_total_cost,
                         SUM(gross_profit) AS sum_gross_profit,
                         AVG(gross_profit_rate) AS avg_gross_profit_rate,
                         SUM(headway_cost) AS sum_headway_cost,
@@ -243,16 +280,26 @@ def business_summary():
                         SUM(order_count) AS sum_orders,
                         SUM(ad_cost) AS sum_ad_cost,
                         SUM(refund_amount) AS sum_refund,
-                        AVG(refund_rate) AS avg_refund_rate
+                        AVG(refund_rate) AS avg_refund_rate,
+                        SUM(fba_fees) AS sum_fba_fees,
+                        SUM(platform_fees) AS sum_platform_fees,
+                        SUM(product_cost) AS sum_product_cost
                     FROM report_business
                     {where_sql}
                 """, params)
                 summary = cursor.fetchone()
 
-            return jsonify({
-                "status": "success",
-                "data": _to_json_serializable(summary),
-            })
+            d = dict(summary) if summary else {}
+            d["cost_breakdown"] = {
+                "ad_cost": float(d.get("sum_ad_cost") or 0),
+                "fba_fees": float(d.get("sum_fba_fees") or 0),
+                "platform_fees": float(d.get("sum_platform_fees") or 0),
+                "product_cost": float(d.get("sum_product_cost") or 0),
+                "headway_cost": float(d.get("sum_headway_cost") or 0),
+                "refund_amount": float(d.get("sum_refund") or 0),
+            }
+
+            return jsonify({"status": "success", "data": _to_json_serializable(d)})
         finally:
             conn.close()
     except Exception as e:
@@ -260,15 +307,55 @@ def business_summary():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@reports_bp.route('/reports/business/cost-breakdown', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def business_cost_breakdown():
+    try:
+        start_date = request.args.get('start_date', '').strip() or None
+        end_date = request.args.get('end_date', '').strip() or None
+        shop_id = _get_shop_id_optional()
+
+        conn = _get_conn()
+        try:
+            where_clauses = ["report_type = 'daily'"]
+            params = []
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
+            if start_date:
+                where_clauses.append("report_date >= %s"); params.append(start_date)
+            if end_date:
+                where_clauses.append("report_date <= %s"); params.append(end_date)
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT
+                        SUM(total_cost) AS total_cost,
+                        SUM(ad_cost) AS ad_cost,
+                        SUM(fba_fees) AS fba_fees,
+                        SUM(platform_fees) AS platform_fees,
+                        SUM(product_cost) AS product_cost,
+                        SUM(headway_cost) AS headway_cost,
+                        SUM(refund_amount) AS refund_amount
+                    FROM report_business
+                    {where_sql}
+                """, params)
+                row = cursor.fetchone()
+
+            d = dict(row) if row else {}
+            return jsonify({"status": "success", "data": _to_json_serializable(d)})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[business_cost_breakdown] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @reports_bp.route('/reports/business/trend', methods=['GET'])
 @login_required
 @permission_required('reports:page')
 def business_trend():
-    """
-    经营趋势
-
-    简介: 按时间维度返回销售额、毛利、头程占比走势，用于折线图。
-    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
         start_date = request.args.get('start_date', '').strip() or None
@@ -277,33 +364,32 @@ def business_trend():
 
         conn = _get_conn()
         try:
-            where_clauses = ["report_type = %s"]
-            params = [report_type]
+            where_clauses = ["report_type = 'daily'"]
+            params = []
             if shop_id is not None:
-                where_clauses.append("shop_id = %s")
-                params.append(shop_id)
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
             if start_date:
-                where_clauses.append("report_date >= %s")
-                params.append(start_date)
+                where_clauses.append("report_date >= %s"); params.append(start_date)
             if end_date:
-                where_clauses.append("report_date <= %s")
-                params.append(end_date)
+                where_clauses.append("report_date <= %s"); params.append(end_date)
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
-            if report_type == 'daily':
-                time_col = 'report_date'
-                order_sql = f"ORDER BY {time_col}"
-            elif report_type == 'weekly':
-                time_col = "report_week"
-                order_sql = "ORDER BY STR_TO_DATE(SUBSTRING_INDEX(report_week, '~', 1), '%%Y.%%m.%%d')"
+            if report_type == 'weekly':
+                time_col = "CONCAT(MIN(report_date), '~', MAX(report_date)) AS time_label"
+                group_expr = "YEARWEEK(report_date, 1)"
+                order_sql = "ORDER BY MIN(report_date)"
+            elif report_type == 'monthly':
+                time_col = "DATE_FORMAT(MIN(report_date), '%%Y-%%m') AS time_label"
+                group_expr = "DATE_FORMAT(report_date, '%%Y-%%m')"
+                order_sql = "ORDER BY MIN(report_date)"
             else:
-                time_col = 'report_month'
-                order_sql = f"ORDER BY {time_col}"
+                time_col = "report_date AS time_label"
+                group_expr = "report_date"
+                order_sql = "ORDER BY report_date"
 
             with conn.cursor() as cursor:
                 cursor.execute(f"""
-                    SELECT
-                        {time_col} AS time_label,
+                    SELECT {time_col},
                         SUM(total_sales) AS total_sales,
                         SUM(gross_profit) AS gross_profit,
                         AVG(gross_profit_rate) AS gross_profit_rate,
@@ -311,15 +397,12 @@ def business_trend():
                         AVG(headway_ratio) AS headway_ratio
                     FROM report_business
                     {where_sql}
-                    GROUP BY {time_col}
+                    GROUP BY {group_expr}
                     {order_sql}
                 """, params)
                 rows = cursor.fetchall()
 
-            return jsonify({
-                "status": "success",
-                "data": _to_json_serializable(rows),
-            })
+            return jsonify({"status": "success", "data": _to_json_serializable(rows)})
         finally:
             conn.close()
     except Exception as e:
@@ -1045,15 +1128,10 @@ def list_generation_logs():
 def list_advertising_reports():
     """
     分页查询广告效果报表
-
-    简介: 按类型/维度/日期范围查询广告表现数据（曝光/点击/花费/ACOS/ROAS）。
+    周报/月报实时从日报数据聚合，不再预生成。
     """
     try:
-        report_type = request.args.get('type', '').strip() or None
-        dimension_type = request.args.get('dimension', '').strip() or None
-        campaign_id = request.args.get('campaign_id', '').strip() or None
-        ad_group_id = request.args.get('ad_group_id', '').strip() or None
-        asin = request.args.get('asin', '').strip() or None
+        report_type = request.args.get('type', '').strip() or 'daily'
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
         shop_id = _get_shop_id_optional()
@@ -1061,59 +1139,98 @@ def list_advertising_reports():
 
         conn = _get_conn()
         try:
-            where_clauses = []
-            params = []
-            if report_type:
-                where_clauses.append("report_type = %s")
-                params.append(report_type)
-            if dimension_type:
-                where_clauses.append("dimension_type = %s")
-                params.append(dimension_type)
-            if shop_id is not None:
-                where_clauses.append("shop_id = %s")
-                params.append(shop_id)
-            if campaign_id:
-                where_clauses.append("campaign_id = %s")
-                params.append(campaign_id)
-            if ad_group_id:
-                where_clauses.append("ad_group_id = %s")
-                params.append(ad_group_id)
-            if asin:
-                where_clauses.append("asin = %s")
-                params.append(asin)
-            if start_date:
-                where_clauses.append("report_date >= %s")
-                params.append(start_date)
-            if end_date:
-                where_clauses.append("report_date <= %s")
-                params.append(end_date)
+            if report_type in ('weekly', 'monthly'):
+                if report_type == 'weekly':
+                    group_expr = "YEARWEEK(report_date, 1)"
+                    label_expr = "CONCAT(MIN(report_date), '~', MAX(report_date)) AS report_week"
+                    order_by = "ORDER BY MIN(report_date) DESC"
+                else:
+                    group_expr = "DATE_FORMAT(report_date, '%%Y-%%m')"
+                    label_expr = "DATE_FORMAT(MIN(report_date), '%%Y-%%m') AS report_month"
+                    order_by = "ORDER BY MIN(report_date) DESC"
 
-            where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+                where_clauses = ["report_type = 'daily'"]
+                params = []
+                if shop_id is not None:
+                    where_clauses.append("shop_id = %s"); params.append(shop_id)
+                if start_date:
+                    where_clauses.append("report_date >= %s"); params.append(start_date)
+                if end_date:
+                    where_clauses.append("report_date <= %s"); params.append(end_date)
+                where_sql = "WHERE " + " AND ".join(where_clauses)
 
-            with conn.cursor() as cursor:
-                cursor.execute(f"SELECT COUNT(*) AS total FROM report_advertising {where_sql}", params)
-                total = cursor.fetchone()['total']
+                with conn.cursor() as cursor:
+                    cursor.execute(f"SELECT COUNT(DISTINCT {group_expr}) AS total FROM report_advertising {where_sql}", params)
+                    total = cursor.fetchone()['total']
 
-            offset = (page - 1) * page_size
-            with conn.cursor() as cursor:
-                sql = f"""
-                    SELECT * FROM report_advertising
-                    {where_sql}
-                    ORDER BY report_date DESC, dimension_type, ad_spend DESC
-                    LIMIT %s OFFSET %s
-                """
-                cursor.execute(sql, params + [page_size, offset])
-                rows = cursor.fetchall()
+                offset = (page - 1) * page_size
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT
+                            {label_expr},
+                            SUM(impressions) AS impressions,
+                            SUM(clicks) AS clicks,
+                            SUM(ad_spend) AS ad_spend,
+                            SUM(orders_7d) AS orders_7d,
+                            SUM(sales_7d) AS sales_7d,
+                            CASE WHEN SUM(clicks) > 0 THEN SUM(ad_spend) / SUM(clicks) ELSE 0 END AS cpc,
+                            CASE WHEN SUM(impressions) > 0 THEN SUM(clicks) / SUM(impressions) * 100 ELSE 0 END AS ctr,
+                            CASE WHEN SUM(sales_7d) > 0 THEN SUM(ad_spend) / SUM(sales_7d) * 100 ELSE 0 END AS acos,
+                            CASE WHEN SUM(ad_spend) > 0 THEN SUM(sales_7d) / SUM(ad_spend) ELSE 0 END AS roas
+                        FROM report_advertising
+                        {where_sql}
+                        GROUP BY {group_expr}
+                        {order_by}
+                        LIMIT %s OFFSET %s
+                    """, params + [page_size, offset])
+                    rows = cursor.fetchall()
 
-            return jsonify({
-                "status": "success",
-                "data": {
-                    "list": _to_json_serializable(rows),
-                    "total": total,
-                    "page": page,
-                    "page_size": page_size,
-                }
-            })
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        "list": _to_json_serializable(rows),
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size,
+                    }
+                })
+            else:
+                # daily: 直接查表
+                where_clauses = []
+                params = []
+                if report_type:
+                    where_clauses.append("report_type = %s"); params.append(report_type)
+                if shop_id is not None:
+                    where_clauses.append("shop_id = %s"); params.append(shop_id)
+                if start_date:
+                    where_clauses.append("report_date >= %s"); params.append(start_date)
+                if end_date:
+                    where_clauses.append("report_date <= %s"); params.append(end_date)
+                where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+                with conn.cursor() as cursor:
+                    cursor.execute(f"SELECT COUNT(*) AS total FROM report_advertising {where_sql}", params)
+                    total = cursor.fetchone()['total']
+
+                offset = (page - 1) * page_size
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT * FROM report_advertising
+                        {where_sql}
+                        ORDER BY report_date DESC, dimension_type, ad_spend DESC
+                        LIMIT %s OFFSET %s
+                    """, params + [page_size, offset])
+                    rows = cursor.fetchall()
+
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        "list": _to_json_serializable(rows),
+                        "total": total,
+                        "page": page,
+                        "page_size": page_size,
+                    }
+                })
         finally:
             conn.close()
     except Exception as e:
@@ -1125,34 +1242,22 @@ def list_advertising_reports():
 @login_required
 @permission_required('reports_advertising:page')
 def advertising_summary():
-    """
-    广告效果汇总统计
-
-    简介: 对筛选范围内的广告数据做 SUM 聚合，返回总量和平均指标。
-    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
-        dimension_type = request.args.get('dimension', '').strip() or None
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
         shop_id = _get_shop_id_optional()
 
         conn = _get_conn()
         try:
-            where_clauses = ["report_type = %s"]
-            params = [report_type]
-            if dimension_type:
-                where_clauses.append("dimension_type = %s")
-                params.append(dimension_type)
+            where_clauses = ["report_type = 'daily'"]
+            params = []
             if shop_id is not None:
-                where_clauses.append("shop_id = %s")
-                params.append(shop_id)
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
             if start_date:
-                where_clauses.append("report_date >= %s")
-                params.append(start_date)
+                where_clauses.append("report_date >= %s"); params.append(start_date)
             if end_date:
-                where_clauses.append("report_date <= %s")
-                params.append(end_date)
+                where_clauses.append("report_date <= %s"); params.append(end_date)
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             with conn.cursor() as cursor:
@@ -1162,25 +1267,18 @@ def advertising_summary():
                         SUM(impressions) AS total_impressions,
                         SUM(clicks) AS total_clicks,
                         SUM(ad_spend) AS total_ad_spend,
-                        SUM(orders_7d) AS total_orders_7d,
-                        SUM(orders_30d) AS total_orders_30d,
-                        SUM(sales_7d) AS total_sales_7d,
-                        SUM(sales_30d) AS total_sales_30d,
-                        AVG(ctr) AS avg_ctr,
-                        AVG(cpc) AS avg_cpc,
-                        AVG(acos_7d) AS avg_acos_7d,
-                        AVG(acos_30d) AS avg_acos_30d,
-                        AVG(roas_7d) AS avg_roas_7d,
-                        AVG(roas_30d) AS avg_roas_30d
+                        SUM(orders_7d) AS total_orders,
+                        SUM(sales_7d) AS total_sales,
+                        CASE WHEN SUM(sales_7d) > 0 THEN SUM(ad_spend) / SUM(sales_7d) * 100 ELSE 0 END AS avg_acos,
+                        CASE WHEN SUM(ad_spend) > 0 THEN SUM(sales_7d) / SUM(ad_spend) ELSE 0 END AS avg_roas,
+                        CASE WHEN SUM(clicks) > 0 THEN SUM(ad_spend) / SUM(clicks) ELSE 0 END AS avg_cpc,
+                        CASE WHEN SUM(impressions) > 0 THEN SUM(clicks) / SUM(impressions) * 100 ELSE 0 END AS avg_ctr
                     FROM report_advertising
                     {where_sql}
                 """, params)
                 summary = cursor.fetchone()
 
-            return jsonify({
-                "status": "success",
-                "data": _to_json_serializable(summary),
-            })
+            return jsonify({"status": "success", "data": _to_json_serializable(summary)})
         finally:
             conn.close()
     except Exception as e:
@@ -1192,67 +1290,57 @@ def advertising_summary():
 @login_required
 @permission_required('reports_advertising:page')
 def advertising_trend():
-    """
-    广告效果趋势
-
-    简介: 按时间维度返回核心广告指标走势（曝光/点击/花费/ACOS/ROAS）。
-    """
     try:
         report_type = request.args.get('type', '').strip() or 'daily'
-        dimension_type = request.args.get('dimension', '').strip() or 'overall'
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
         shop_id = _get_shop_id_optional()
 
         conn = _get_conn()
         try:
-            where_clauses = ["report_type = %s", "dimension_type = %s"]
-            params = [report_type, dimension_type]
+            where_clauses = ["report_type = 'daily'"]
+            params = []
             if shop_id is not None:
-                where_clauses.append("shop_id = %s")
-                params.append(shop_id)
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
             if start_date:
-                where_clauses.append("report_date >= %s")
-                params.append(start_date)
+                where_clauses.append("report_date >= %s"); params.append(start_date)
             if end_date:
-                where_clauses.append("report_date <= %s")
-                params.append(end_date)
+                where_clauses.append("report_date <= %s"); params.append(end_date)
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
-            if report_type == 'daily':
-                time_col = 'report_date'
-                order_sql = f"ORDER BY {time_col}"
-            elif report_type == 'weekly':
-                time_col = 'report_week'
-                order_sql = "ORDER BY STR_TO_DATE(SUBSTRING_INDEX(report_week, '~', 1), '%%Y.%%m.%%d')"
+            if report_type == 'weekly':
+                time_col = "CONCAT(MIN(report_date), '~', MAX(report_date)) AS time_label"
+                group_expr = "YEARWEEK(report_date, 1)"
+                order_sql = "ORDER BY MIN(report_date)"
+            elif report_type == 'monthly':
+                time_col = "DATE_FORMAT(MIN(report_date), '%%Y-%%m') AS time_label"
+                group_expr = "DATE_FORMAT(report_date, '%%Y-%%m')"
+                order_sql = "ORDER BY MIN(report_date)"
             else:
-                time_col = 'report_month'
-                order_sql = f"ORDER BY {time_col}"
+                time_col = "report_date AS time_label"
+                group_expr = "report_date"
+                order_sql = "ORDER BY report_date"
 
             with conn.cursor() as cursor:
                 cursor.execute(f"""
-                    SELECT
-                        {time_col} AS time_label,
+                    SELECT {time_col},
                         SUM(impressions) AS impressions,
                         SUM(clicks) AS clicks,
                         SUM(ad_spend) AS ad_spend,
                         SUM(orders_7d) AS orders_7d,
                         SUM(sales_7d) AS sales_7d,
-                        AVG(ctr) AS ctr,
-                        AVG(cpc) AS cpc,
-                        AVG(acos_7d) AS acos_7d,
-                        AVG(roas_7d) AS roas_7d
+                        CASE WHEN SUM(clicks) > 0 THEN SUM(ad_spend) / SUM(clicks) ELSE 0 END AS cpc,
+                        CASE WHEN SUM(impressions) > 0 THEN SUM(clicks) / SUM(impressions) * 100 ELSE 0 END AS ctr,
+                        CASE WHEN SUM(sales_7d) > 0 THEN SUM(ad_spend) / SUM(sales_7d) * 100 ELSE 0 END AS acos,
+                        CASE WHEN SUM(ad_spend) > 0 THEN SUM(sales_7d) / SUM(ad_spend) ELSE 0 END AS roas
                     FROM report_advertising
                     {where_sql}
-                    GROUP BY {time_col}
+                    GROUP BY {group_expr}
                     {order_sql}
                 """, params)
                 rows = cursor.fetchall()
 
-            return jsonify({
-                "status": "success",
-                "data": _to_json_serializable(rows),
-            })
+            return jsonify({"status": "success", "data": _to_json_serializable(rows)})
         finally:
             conn.close()
     except Exception as e:
