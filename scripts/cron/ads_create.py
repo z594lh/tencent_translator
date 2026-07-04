@@ -46,14 +46,16 @@ def run(shop_id=None, date_str=None, force_refresh=False):
         # 1. 保底：处理过期报告（download 已即时重建，这里只是兜底）
         expired = mod._cache_get_expired(sid)
         for e in expired:
-            print(f"  [{e['report_type']}] {e['report_date']} EXPIRED (safety net), recreating...")
-            cfg = mod._SYNC_REPORT_TYPES.get(e['report_type'])
+            rt = e['report_type']
+            rd = str(e['report_date'])
+            print(f"  [{rt}] {rd} EXPIRED (safety net), recreating...")
+            cfg = mod._SYNC_REPORT_TYPES.get(rt)
             if cfg:
-                mod._cache_delete(sid, e['report_type'], e['report_date'])
-                body = mod._build_report_body(cfg, e['report_type'], e['report_date'], e['report_date'])
+                mod._cache_delete(sid, rt, rd)
+                body = mod._build_report_body(cfg, rt, rd, rd)
                 try:
                     new_id = mod._make_client(sid)._create_async_report(body)
-                    mod._report_cache_set(sid, e['report_type'], e['report_date'], new_id, "PENDING")
+                    mod._report_cache_set(sid, rt, rd, new_id, "PENDING")
                     print(f"    -> recreated {new_id[:20]}...")
                 except Exception as ex:
                     print(f"    -> FAIL: {ex}")
