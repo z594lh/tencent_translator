@@ -452,16 +452,71 @@ def _report_cache_get(shop_id, report_type_key, report_date):
 
 
 def _report_cache_set(shop_id, report_type_key, report_date, report_id, status="PENDING"):
-    """写入/更新报告 ID 缓存"""
+    """写入/更新报告 ID 缓存（新记录 insert_flag=0，UPDATE 时不动 insert_flag）"""
     conn = get_db_connection()
     try:
         with conn.cursor() as c:
             c.execute(
-                "INSERT INTO amazon_ads_report_cache (shop_id, report_type, report_date, report_id, status) "
-                "VALUES (%s,%s,%s,%s,%s) "
+                "INSERT INTO amazon_ads_report_cache (shop_id, report_type, report_date, report_id, status, insert_flag) "
+                "VALUES (%s,%s,%s,%s,%s, 0) "
                 "ON DUPLICATE KEY UPDATE report_id=VALUES(report_id), status=VALUES(status), updated_at=NOW()",
                 (shop_id, report_type_key, report_date, report_id, status))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _cache_set_insert_flag(shop_id, report_type, report_date, flag):
+    """更新 insert_flag"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("UPDATE amazon_ads_report_cache SET insert_flag=%s, updated_at=NOW() "
+                       "WHERE shop_id=%s AND report_type=%s AND report_date=%s",
+                       (flag, shop_id, report_type, report_date))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _cache_delete(shop_id, report_type, report_date):
+    """删除缓存记录"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM amazon_ads_report_cache WHERE shop_id=%s AND report_type=%s AND report_date=%s",
+                       (shop_id, report_type, report_date))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _cache_get_pending(shop_id, report_date, include_inserted=False):
+    """获取指定日期待处理的缓存列表（insert_flag=0 且 status=PENDING）"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            extra = "" if include_inserted else " AND insert_flag = 0"
+            c.execute(
+                "SELECT report_type, report_id, insert_flag FROM amazon_ads_report_cache "
+                "WHERE shop_id=%s AND report_date=%s AND status='PENDING'" + extra,
+                (shop_id, report_date))
+            return c.fetchall()
+    finally:
+        conn.close()
+
+
+def _cache_get_expired(shop_id):
+    """获取过期的 PENDING 缓存（>2h 未完成），用于 create 脚本重建"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT report_type, report_date FROM amazon_ads_report_cache "
+                "WHERE shop_id=%s AND status='PENDING' AND insert_flag=0 "
+                "AND created_at < NOW() - INTERVAL 2 HOUR",
+                (shop_id,))
+            return c.fetchall()
     finally:
         conn.close()
 
@@ -507,8 +562,11 @@ def _build_report_body(cfg, report_type_key, start_date, end_date):
     }
 
 
-def _write_report_result(shop_id, report_type_key, cfg, date_str, report_id, rows):
-    """写入已下载报告数据到数据库，返回结果字典"""
+def _write_report_result(shop_id, report_type_key, cfg, date_str, report_id, rows, force_refresh=False):
+    """写入已下载报告数据到数据库，返回结果字典
+    
+    force_refresh=True 时先 DELETE 该日期该类型的旧数据，再插入（防止字段缺失/值变更导致 ON DUPLICATE 漏更新）
+    """
     result = {"report_type": report_type_key, "rows": len(rows), "inserted": 0, "updated": 0, "error": None}
     if rows:
         if report_type_key == "spCampaignsPlacement":
@@ -516,6 +574,9 @@ def _write_report_result(shop_id, report_type_key, cfg, date_str, report_id, row
         conn = get_db_connection()
         try:
             with conn.cursor() as c:
+                if force_refresh:
+                    c.execute("DELETE FROM amazon_ads_raw_reports WHERE shop_id=%s AND report_date=%s AND report_type=%s",
+                              (shop_id, date_str, report_type_key))
                 ins, upd = _write_raw_reports(c, shop_id, report_type_key, rows)
             conn.commit()
             result["inserted"], result["updated"] = ins, upd
@@ -590,119 +651,107 @@ def _sync_one_type(client, shop_id, report_type_key, cfg, date_str):
         return {"report_type": report_type_key, "rows": 0, "inserted": 0, "updated": 0, "error": str(e)}
 
 
-def run_ads_sync(shop_id, date_str=None, force_refresh=False):
-    """
-    同步指定店铺指定日期的全量广告报告数据 → amazon_ads_raw_reports
-
-    优化策略：批量创建所有类型报告，统一每 60 秒轮询一次状态，
-    哪个先完成就先下载写入，避免串行阻塞。
-
-    force_refresh=True 时忽略缓存，强制重建所有报告（覆盖旧数据）。
-    """
+def create_ads_reports(shop_id, date_str=None, force_refresh=False):
+    """仅创建报告 + 缓存 report_id，不等完成（不含下载）"""
     date_str = date_str or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    out = {"shop_id": shop_id, "date": date_str, "results": [], "total_rows": 0, "error": None}
-    try:
-        client = _make_client(shop_id)
-    except Exception as e:
-        out["error"] = str(e)
-        return out
-
-    types = list(_SYNC_REPORT_TYPES.keys())
-    mode = "强制重建" if force_refresh else "常规"
-    print(f"[Ads Sync] shop={shop_id} date={date_str} {mode}同步 {len(types)} 种报告: {types}")
-    _report_cache_clean(shop_id=shop_id)
-
-    # ========== Phase 1: 批量创建报告 + 处理已完成缓存 ==========
-    pending = {}  # key -> {"cfg": cfg, "report_id": str}
+    client = _make_client(shop_id)
+    result = {"shop_id": shop_id, "date": date_str, "created": [], "skipped": [], "errors": []}
 
     for key, cfg in _SYNC_REPORT_TYPES.items():
-        if force_refresh:
-            # 强制模式：清除旧缓存，直接创建新报告
-            pass  # 跳过缓存逻辑，直接走创建
-        else:
-            cached = _report_cache_get(shop_id, key, date_str)
-            if cached:
-                cached_id = cached["report_id"]
-                try:
-                    status = client._get_report_status(cached_id)
-                    state = (status.get("status") or "").upper()
-                    if state == "COMPLETED":
-                        url = status.get("url")
-                        if url:
-                            print(f"[Ads Sync] → {key} 缓存已完成，直接下载")
-                            rows = client._download_report_content(url)
-                            r = _write_report_result(shop_id, key, cfg, date_str, cached_id, rows)
-                            out["results"].append(r)
-                            if not r["error"]:
-                                out["total_rows"] += r["rows"]
-                            continue
-                    elif state in ("PENDING", "PROCESSING"):
-                        print(f"[Ads Sync] → {key} 缓存报告 {state}，加入轮询队列")
-                        pending[key] = {"cfg": cfg, "report_id": cached_id}
-                        continue
-                    else:
-                        print(f"[Ads Sync] → {key} 缓存已失效 ({state})，重新创建")
-                except Exception as e:
-                    print(f"[Ads Sync] → {key} 缓存查询异常: {e}，重新创建")
+        cached = _report_cache_get(shop_id, key, date_str)
+        if cached and not force_refresh:
+            status = (cached.get("status") or "").upper()
+            if status in ("COMPLETED", "PENDING"):
+                result["skipped"].append(key)
+                continue
+            if status in ("EXPIRED", "FAILED"):
+                _cache_delete(shop_id, key, date_str)
 
-        # 创建新报告
         body = _build_report_body(cfg, key, date_str, date_str)
         try:
             new_id = client._create_async_report(body)
             _report_cache_set(shop_id, key, date_str, new_id, "PENDING")
-            print(f"[Ads Sync] → {key} 新报告 reportId={new_id[:20]}... 已创建")
-            pending[key] = {"cfg": cfg, "report_id": new_id}
+            result["created"].append(key)
+            print(f"[Ads Create] -> {key} reportId={new_id[:20]}...")
         except Exception as e:
-            print(f"[Ads Sync] → {key} 创建失败: {e}")
-            out["results"].append({"report_type": key, "rows": 0, "inserted": 0, "updated": 0, "error": str(e)})
+            result["errors"].append({"type": key, "error": str(e)})
+            print(f"[Ads Create] -> {key} FAIL: {e}")
 
-    # ========== Phase 2: 批量轮询 — 每 60s 查一次，哪个完成就立即处理 ==========
-    if pending:
-        print(f"[Ads Sync] 等待 {len(pending)} 个报告完成 (每 60s 检查，最长等 10 分钟)...")
-        poll_interval = 60
-        max_wait = 600
-        deadline = time.time() + max_wait
+    print(f"[Ads Create] {date_str}: created={len(result['created'])} skipped={len(result['skipped'])} errors={len(result['errors'])}")
+    return result
 
-        while pending and time.time() < deadline:
-            time.sleep(poll_interval)
-            completed = []
-            for key, info in list(pending.items()):
-                try:
-                    status = client._get_report_status(info["report_id"])
-                    state = (status.get("status") or "").upper()
-                    if state == "COMPLETED":
-                        url = status.get("url")
-                        if url:
-                            print(f"[Ads Sync] → {key} 完成，下载写入中...")
-                            rows = client._download_report_content(url)
-                            r = _write_report_result(shop_id, key, info["cfg"], date_str, info["report_id"], rows)
-                            out["results"].append(r)
-                            if not r["error"]:
-                                out["total_rows"] += r["rows"]
-                            completed.append(key)
-                    elif state in ("FAILURE", "CANCELLED"):
-                        err = f"报告 {info['report_id']} 失败 (state={state})"
-                        print(f"[Ads Sync] → {key} {err}")
-                        out["results"].append({"report_type": key, "rows": 0, "inserted": 0, "updated": 0, "error": err})
-                        completed.append(key)
-                except Exception as e:
-                    print(f"[Ads Sync] → {key} 状态查询异常: {e}")
 
-            for k in completed:
-                del pending[k]
+def download_ads_reports(shop_id, date_str=None, force_refresh=False):
+    """下载已完成报告 + 写入 raw_reports"""
+    date_str = date_str or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    client = _make_client(shop_id)
+    result = {"shop_id": shop_id, "date": date_str, "downloaded": [], "pending": [], "errors": [], "total_rows": 0}
 
-            if pending and completed:
-                remaining = ", ".join(pending.keys())
-                print(f"[Ads Sync] 已完成 {len(completed)} 个，剩余 {len(pending)} 个: {remaining}")
+    cached_rows = _cache_get_pending(shop_id, date_str, include_inserted=force_refresh)
+    if not cached_rows:
+        print(f"[Ads Download] {date_str}: no pending reports")
+        return result
 
-        # 超时未完成的
-        for key, info in pending.items():
-            err = f"报告在 {max_wait}s 内未完成"
-            print(f"[Ads Sync] → {key} {err}")
-            out["results"].append({"report_type": key, "rows": 0, "inserted": 0, "updated": 0, "error": err})
+    for row in cached_rows:
+        key = row['report_type']
+        report_id = row['report_id']
+        cfg = _SYNC_REPORT_TYPES.get(key)
+        if not cfg:
+            continue
 
-    print(f"[Ads Sync] shop={shop_id} 完成: {len(out['results'])} 报告, {out['total_rows']} 行")
-    return out
+        try:
+            status = client._get_report_status(report_id)
+            state = (status.get("status") or "").upper()
+
+            if state == "COMPLETED":
+                url = status.get("url")
+                if url:
+                    print(f"[Ads Download] -> {key} COMPLETED, downloading...")
+                    rows = client._download_report_content(url)
+                    r = _write_report_result(shop_id, key, cfg, date_str, report_id, rows, force_refresh=force_refresh)
+                    if not r["error"]:
+                        _cache_set_insert_flag(shop_id, key, date_str, 1)
+                        result["downloaded"].append(key)
+                        result["total_rows"] += r["rows"]
+                        _maybe_insert_rebuild_task(shop_id, date_str)
+
+            elif state in ("PENDING", "PROCESSING"):
+                result["pending"].append(key)
+
+            elif state in ("FAILURE", "CANCELLED"):
+                print(f"[Ads Download] -> {key} {state}")
+                _cache_set_insert_flag(shop_id, key, date_str, 2)
+                result["errors"].append({"type": key, "error": f"Report {state}"})
+
+        except Exception as e:
+            print(f"[Ads Download] -> {key} ERROR: {e}")
+            result["errors"].append({"type": key, "error": str(e)})
+
+    print(f"[Ads Download] {date_str}: downloaded={len(result['downloaded'])} pending={len(result['pending'])} errors={len(result['errors'])}")
+    return result
+
+
+def _maybe_insert_rebuild_task(shop_id, date_str):
+    """检查 date_str 的日报是否存在，存在则插入重建任务"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT 1 FROM report_business WHERE shop_id=%s AND report_date=%s LIMIT 1", (shop_id, date_str))
+            if c.fetchone():
+                c.execute("INSERT IGNORE INTO report_rebuild_tasks (report_date, task_type) VALUES (%s, 'business')", (date_str,))
+            c.execute("SELECT 1 FROM report_advertising WHERE shop_id=%s AND report_date=%s LIMIT 1", (shop_id, date_str))
+            if c.fetchone():
+                c.execute("INSERT IGNORE INTO report_rebuild_tasks (report_date, task_type) VALUES (%s, 'advertising')", (date_str,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def run_ads_sync(shop_id, date_str=None, force_refresh=False):
+    """全流程同步（供 API 路由使用）：创建 + 下载一次"""
+    date_str = date_str or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    create_ads_reports(shop_id, date_str, force_refresh=force_refresh)
+    return download_ads_reports(shop_id, date_str, force_refresh=force_refresh)
 
 
 # ==================== 同步触发路由 ====================
