@@ -1041,18 +1041,19 @@ def generate_inventory_turnover(shop_id=None):
                     if exchange_rate is None:
                         exchange_rate = get_exchange_rate(cursor)
 
-                    # 1. 获取当前库存
+                    # 1. 获取当前库存（product_name 优先取 products 表）
                     cursor.execute("""
                         SELECT
-                            seller_sku AS sku,
-                            asin,
-                            product_name,
-                            fulfillable_quantity AS current_stock,
-                            inbound_working_quantity,
-                            inbound_shipped_quantity,
-                            inbound_receiving_quantity
-                        FROM amazon_inventory
-                        WHERE shop_id = %s
+                            ai.seller_sku AS sku,
+                            ai.asin,
+                            COALESCE(p.product_name, ai.product_name, '') AS product_name,
+                            ai.fulfillable_quantity AS current_stock,
+                            ai.inbound_working_quantity,
+                            ai.inbound_shipped_quantity,
+                            ai.inbound_receiving_quantity
+                        FROM amazon_inventory ai
+                        LEFT JOIN products p ON p.seller_sku = ai.seller_sku AND p.status = 1
+                        WHERE ai.shop_id = %s
                     """, (sid,))
                     inv_rows = cursor.fetchall()
 
@@ -1124,7 +1125,7 @@ def generate_inventory_turnover(shop_id=None):
                             stock_status = 'out_of_stock'
                         elif turnover_days > 90 or days_without_sale >= 30:
                             stock_status = 'slow'
-                        elif turnover_days <= 7 and current_stock > 0:
+                        elif turnover_days < 40 and current_stock > 0:
                             stock_status = 'warning'
                         else:
                             stock_status = 'normal'

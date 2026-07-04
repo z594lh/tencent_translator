@@ -394,7 +394,8 @@ def business_trend():
                         SUM(gross_profit) AS gross_profit,
                         AVG(gross_profit_rate) AS gross_profit_rate,
                         SUM(headway_cost) AS headway_cost,
-                        AVG(headway_ratio) AS headway_ratio
+                        AVG(headway_ratio) AS headway_ratio,
+                        SUM(ad_cost) AS ad_cost
                     FROM report_business
                     {where_sql}
                     GROUP BY {group_expr}
@@ -814,9 +815,7 @@ def list_inventory_turnover():
                 sql = f"""
                     SELECT * FROM inventory_turnover
                     {where_sql}
-                    ORDER BY
-                        FIELD(stock_status, 'out_of_stock', 'slow', 'warning', 'normal'),
-                        turnover_days DESC
+                    ORDER BY sales_30d DESC, turnover_days ASC
                     LIMIT %s OFFSET %s
                 """
                 cursor.execute(sql, params + [page_size, offset])
@@ -835,6 +834,57 @@ def list_inventory_turnover():
             conn.close()
     except Exception as e:
         print(f"[list_inventory_turnover] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/inventory-turnover/by-status', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def inventory_turnover_by_status():
+    try:
+        status = request.args.get('status', '').strip()
+        keyword = request.args.get('keyword', '').strip() or None
+        shop_id = _get_shop_id_optional()
+        page, page_size = _parse_pagination()
+
+        if not status:
+            return jsonify({"status": "error", "message": "缺少 status 参数"}), 400
+
+        conn = _get_conn()
+        try:
+            where_clauses = ["stock_status = %s"]
+            params = [status]
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
+            if keyword:
+                where_clauses.append("(sku LIKE %s OR asin LIKE %s OR product_name LIKE %s)")
+                params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) AS total FROM inventory_turnover {where_sql}", params)
+                total = cursor.fetchone()['total']
+
+            offset = (page - 1) * page_size
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT sku, asin, product_name, current_stock, turnover_days,
+                           last_sale_date, days_without_sale
+                    FROM inventory_turnover
+                    {where_sql}
+                    ORDER BY turnover_days DESC
+                    LIMIT %s OFFSET %s
+                """, params + [page_size, offset])
+                rows = cursor.fetchall()
+
+            return jsonify({
+                "status": "success",
+                "data": {"list": _to_json_serializable(rows), "total": total}
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[inventory_turnover_by_status] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
