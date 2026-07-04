@@ -19,7 +19,7 @@ from scripts.cron import _now_str
 
 
 def run_daily():
-    from services.report_generator import generate_business_daily, generate_advertising_daily, generate_sku_profit, generate_inventory_turnover
+    from services.report_generator import generate_business_daily, generate_advertising_daily, generate_inventory_turnover
     now_str = _now_str()
     today = datetime.now().date()
 
@@ -34,10 +34,9 @@ def run_daily():
 
     yesterday = (today - timedelta(days=1)).strftime('%Y-%m-%d')
     try:
-        generate_sku_profit(yesterday, yesterday)
         generate_inventory_turnover()
     except Exception as e:
-        print(f"[{now_str}] [Cron] SKU利润/库存周转异常: {e}")
+        print(f"[{now_str}] [Cron] 库存周转异常: {e}")
 
     for i in range(1, 11):
         report_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')

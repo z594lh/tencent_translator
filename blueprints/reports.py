@@ -497,10 +497,10 @@ def list_sku_profit():
                 where_clauses.append("sku = %s")
                 params.append(sku)
             if start_date:
-                where_clauses.append("period_start >= %s")
+                where_clauses.append("report_date >= %s")
                 params.append(start_date)
             if end_date:
-                where_clauses.append("period_end <= %s")
+                where_clauses.append("report_date <= %s")
                 params.append(end_date)
 
             where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
@@ -514,7 +514,7 @@ def list_sku_profit():
                 sql = f"""
                     SELECT * FROM sku_profit
                     {where_sql}
-                    ORDER BY period_end DESC, net_profit DESC
+                    ORDER BY report_date DESC, net_profit DESC
                     LIMIT %s OFFSET %s
                 """
                 cursor.execute(sql, params + [page_size, offset])
@@ -558,10 +558,10 @@ def sku_profit_summary():
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
             if start_date:
-                where_clauses.append("period_start >= %s")
+                where_clauses.append("report_date >= %s")
                 params.append(start_date)
             if end_date:
-                where_clauses.append("period_end <= %s")
+                where_clauses.append("report_date <= %s")
                 params.append(end_date)
 
             where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
@@ -608,7 +608,7 @@ def sku_profit_top():
         end_date = request.args.get('end_date', '').strip() or None
         shop_id = _get_shop_id_optional()
 
-        allowed_sort = {'net_profit', 'profit_margin', 'sales_amount', 'gross_profit'}
+        allowed_sort = {'net_profit', 'profit_margin', 'sales_amount', 'gross_profit', 'sales_qty'}
         if sort_by not in allowed_sort:
             sort_by = 'net_profit'
         if sort_dir not in ('asc', 'desc'):
@@ -624,10 +624,10 @@ def sku_profit_top():
                 where_clauses.append("shop_id = %s")
                 params.append(shop_id)
             if start_date:
-                where_clauses.append("period_start >= %s")
+                where_clauses.append("report_date >= %s")
                 params.append(start_date)
             if end_date:
-                where_clauses.append("period_end <= %s")
+                where_clauses.append("report_date <= %s")
                 params.append(end_date)
 
             where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
@@ -638,6 +638,7 @@ def sku_profit_top():
                         asin,
                         sku,
                         product_name,
+                        SUM(sales_qty) AS sales_qty,
                         SUM(sales_amount) AS sales_amount,
                         SUM(net_profit) AS net_profit,
                         AVG(profit_margin) AS profit_margin,
@@ -661,29 +662,105 @@ def sku_profit_top():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@reports_bp.route('/reports/sku-profit/aggregate', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def sku_profit_aggregate():
+    try:
+        start_date = request.args.get('start_date', '').strip() or None
+        end_date = request.args.get('end_date', '').strip() or None
+        shop_id = _get_shop_id_optional()
+        keyword = request.args.get('keyword', '').strip() or None
+        page, page_size = _parse_pagination()
+
+        conn = _get_conn()
+        try:
+            where_clauses = []
+            params = []
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
+            if start_date:
+                where_clauses.append("report_date >= %s"); params.append(start_date)
+            if end_date:
+                where_clauses.append("report_date <= %s"); params.append(end_date)
+            if keyword:
+                where_clauses.append("(asin LIKE %s OR sku LIKE %s OR product_name LIKE %s)")
+                params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+            where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT COUNT(DISTINCT CONCAT(asin, '|', sku)) AS total
+                    FROM sku_profit
+                    {where_sql}
+                """, params)
+                total = cursor.fetchone()['total']
+
+            offset = (page - 1) * page_size
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT
+                        sku,
+                        asin,
+                        product_name,
+                        SUM(sales_qty) AS sales_qty,
+                        SUM(sales_amount) AS sales_amount,
+                        CASE WHEN SUM(sales_qty) > 0 THEN SUM(sales_amount) / SUM(sales_qty) ELSE 0 END AS avg_selling_price,
+                        SUM(product_cost) AS product_cost,
+                        SUM(fba_fees) AS fba_fees,
+                        SUM(platform_fees) AS platform_fees,
+                        SUM(ad_cost) AS ad_cost,
+                        SUM(headway_cost) AS headway_cost,
+                        SUM(refund_amount) AS refund_amount,
+                        SUM(gross_profit) AS gross_profit,
+                        SUM(net_profit) AS net_profit,
+                        CASE WHEN SUM(sales_amount) > 0 THEN SUM(net_profit) / SUM(sales_amount) ELSE 0 END AS profit_margin
+                    FROM sku_profit
+                    {where_sql}
+                    GROUP BY asin, sku, product_name
+                    ORDER BY net_profit DESC
+                    LIMIT %s OFFSET %s
+                """, params + [page_size, offset])
+                rows = cursor.fetchall()
+
+            return jsonify({
+                "status": "success",
+                "data": {"list": _to_json_serializable(rows), "total": total}
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[sku_profit_aggregate] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @reports_bp.route('/reports/sku-profit/generate', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
 def trigger_sku_profit():
     """
-    手动触发 SKU 利润表生成
-
-    请求体 (JSON):
-        period_start (必填) 开始日期，如 2026-05-01
-        period_end   (必填) 结束日期，如 2026-05-31
-        shop_id      (可选) 指定店铺
+    手动触发 SKU 利润表生成（按天生成，支持日期范围）
     """
     try:
         data = request.get_json() or {}
-        period_start = data.get('period_start', '').strip()
-        period_end = data.get('period_end', '').strip()
+        period_start = data.get('period_start', '').strip() or data.get('report_date', '').strip()
+        period_end = data.get('period_end', '').strip() or period_start
         shop_id = data.get('shop_id')
 
-        if not period_start or not period_end:
-            return jsonify({"status": "error", "message": "period_start 和 period_end 必填"}), 400
+        if not period_start:
+            return jsonify({"status": "error", "message": "period_start 或 report_date 必填"}), 400
 
-        result = generate_sku_profit(period_start, period_end, shop_id)
-        return jsonify({"status": "success", "message": "生成完成", "data": result})
+        from datetime import timedelta
+        start = datetime.strptime(period_start, '%Y-%m-%d')
+        end = datetime.strptime(period_end, '%Y-%m-%d')
+        d = start
+        total = 0
+        while d <= end:
+            result = generate_sku_profit(d.strftime('%Y-%m-%d'), shop_id)
+            total += result.get('affected_rows', 0)
+            d += timedelta(days=1)
+
+        return jsonify({"status": "success", "message": f"完成 {total} 条", "data": result})
     except Exception as e:
         print(f"[trigger_sku_profit] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500

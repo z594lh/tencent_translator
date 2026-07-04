@@ -555,6 +555,12 @@ def generate_business_daily(report_date, shop_id=None):
                     _log_generation_end(log_id, 'failed', 0, str(e)[:500])
                 raise
 
+        # 日报完成后同步生成 SKU 利润
+        try:
+            generate_sku_profit(report_date, shop_id)
+        except Exception as e:
+            print(f"[Report] SKU利润 {report_date} 失败: {e}")
+
         return {"status": "success", "affected_rows": total_affected, "shops_processed": len(shops)}
     finally:
         conn.close()
@@ -789,11 +795,11 @@ def generate_business_monthly(month_str, shop_id=None):
 
 # ==================== 2. SKU 利润表生成 ====================
 
-def generate_sku_profit(period_start, period_end, shop_id=None):
+def generate_sku_profit(report_date, shop_id=None):
     """
-    按 ASIN/SKU 汇总指定周期内的利润数据
+    按 ASIN/SKU 生成单日利润数据
 
-    简介: 从 amazon_orders + profit_calculator 计算每个 SKU 的营收/成本/利润。
+    简介: 从 amazon_orders + profit_calculator 计算每个 SKU 的单日营收/成本/利润。
 
     详细:
       - 逐 SKU 计算：销售额、销量、采购成本、FBA费、佣金、头程、广告费、退款
@@ -801,12 +807,11 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
       - 幂等: ON DUPLICATE KEY UPDATE
 
     参数:
-        period_start: 'YYYY-MM-DD'
-        period_end:   'YYYY-MM-DD'
-        shop_id:      None=所有店铺
+        report_date: 'YYYY-MM-DD'
+        shop_id:     None=所有店铺
     """
     report_type = 'sku_profit'
-    period = f"{period_start}~{period_end}"
+    period = report_date
 
     conn = get_db_connection()
     try:
@@ -833,8 +838,8 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                         FROM amazon_order_finances
                         WHERE shop_id = %s
                           AND transaction_type = 'Shipment'
-                          AND posted_date BETWEEN %s AND %s
-                    """, (sid, period_start, period_end))
+                          AND posted_date = %s
+                    """, (sid, report_date))
                     finance_rows = cursor.fetchall()
 
                     sku_fees = {}
@@ -869,85 +874,83 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                                         entry['fba'] += it_fba
                                         entry['commission'] += it_com
 
-                    # 1. 聚合销售数据
-                    cursor.execute(f"""
-                        SELECT
-                            oi.asin,
-                            oi.seller_sku AS sku,
-                            SUM(oi.quantity_shipped) AS sales_qty,
-                            COALESCE(SUM(
-                                COALESCE(oi.item_price_amount, (
-                                    SELECT our_price * oi.quantity_shipped
-                                    FROM amazon_listing_offers lo
-                                    WHERE lo.shop_id = oi.shop_id AND lo.sku = oi.seller_sku COLLATE utf8mb4_unicode_ci
-                                    ORDER BY lo.updated_at DESC LIMIT 1
-                                ))
-                            ), 0) AS sales_amount,
-                            AVG(
-                                COALESCE(oi.item_price_amount, (
-                                    SELECT our_price * oi.quantity_shipped
-                                    FROM amazon_listing_offers lo
-                                    WHERE lo.shop_id = oi.shop_id AND lo.sku = oi.seller_sku COLLATE utf8mb4_unicode_ci
-                                    ORDER BY lo.updated_at DESC LIMIT 1
-                                )) / NULLIF(oi.quantity_shipped, 0)
-                            ) AS avg_price
+                    # 1. 获取该店铺所有活跃产品（SKU 全集）
+                    cursor.execute("SELECT asin, seller_sku AS sku, product_name FROM products WHERE status=1 AND asin IS NOT NULL AND asin != ''")
+                    all_products = cursor.fetchall()
+
+                    # 2. 预聚合销售数据（按 ASIN）
+                    cursor.execute("""
+                        SELECT oi.asin,
+                               COALESCE(SUM(oi.quantity_shipped), 0) AS sales_qty,
+                               COALESCE(SUM(oi.item_price_amount), 0) AS sales_amount
                         FROM amazon_orders o
-                        JOIN amazon_order_items oi
-                            ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
-                        WHERE o.shop_id = %s
-                          AND DATE(o.purchase_date) BETWEEN %s AND %s
+                        JOIN amazon_order_items oi ON o.amazon_order_id = oi.amazon_order_id AND o.shop_id = oi.shop_id
+                        WHERE o.shop_id = %s AND DATE(o.purchase_date) = %s
                           AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
-                        GROUP BY oi.asin, oi.seller_sku
-                    """, (sid, period_start, period_end))
-                    sku_rows = cursor.fetchall()
+                        GROUP BY oi.asin
+                    """, (sid, report_date))
+                    sales_map = {}
+                    for r in cursor.fetchall():
+                        sales_map[r['asin']] = r
 
-                    for row in sku_rows:
-                        asin = row['asin'] or ''
-                        sku = row['sku'] or ''
-                        sales_qty = int(row['sales_qty'] or 0)
-                        sales_amount = Decimal(str(row['sales_amount'] or 0))
-                        avg_price = Decimal(str(row['avg_price'] or 0))
+                    # 3. 预聚合广告费（按 advertised_asin）
+                    cursor.execute("""
+                        SELECT advertised_asin AS asin, COALESCE(SUM(cost), 0) AS ad_cost
+                        FROM amazon_ads_raw_reports
+                        WHERE shop_id = %s AND report_date = %s AND report_type = 'spAdvertisedProduct'
+                        GROUP BY advertised_asin
+                    """, (sid, report_date))
+                    ad_map = {}
+                    for r in cursor.fetchall():
+                        ad_map[r['asin']] = float(r['ad_cost'] or 0)
 
-                        if sales_amount == 0 and sales_qty > 0:
-                            print(f"[Report] SKU利润 {period} SKU {sku} qty={sales_qty}: item_price 和 listing_offers 均无价格数据，销售额为 0")
+                    # 4. 遍历所有产品，写入 sku_profit（每天每个 SKU 一条）
+                    for prod in all_products:
+                        asin = prod['asin'] or ''
+                        sku = prod['sku'] or ''
+                        product_name = prod.get('product_name') or ''
+                        if not asin or not sku:
+                            continue
 
-                        # 统一成本入口（2026-05-26 重构）
+                        # 销售数据
+                        sales = sales_map.get(asin, {})
+                        sales_qty = int(sales.get('sales_qty', 0) or 0)
+                        sales_amount = Decimal(str(sales.get('sales_amount', 0) or 0))
+                        avg_price = Decimal('0')
+                        if sales_qty > 0 and sales_amount > 0:
+                            avg_price = sales_amount / sales_qty
+
+                        # 广告费
+                        ad_cost = Decimal(str(ad_map.get(asin, 0)))
+
+                        # 成本（仅对有销售的 SKU 详细计算）
                         unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
-                        product_name = unit_costs.product_name or ''
+                        if not product_name:
+                            product_name = unit_costs.product_name or ''
 
-                        # 广告费（从 amazon_ads_raw_reports 按 ASIN 汇总）
-                        cursor.execute("""
-                            SELECT COALESCE(SUM(cost), 0) AS ad_sum
-                            FROM amazon_ads_raw_reports
-                            WHERE shop_id = %s AND advertised_asin = %s
-                              AND report_date BETWEEN %s AND %s
-                              AND report_type = 'spAdvertisedProduct'
-                        """, (sid, asin, period_start, period_end))
-                        ad_row = cursor.fetchone()
-                        ad_cost = Decimal(str(ad_row['ad_sum'] or 0))
-
-                        # 退款（按 ASIN 汇总）
-                        cursor.execute("""
-                            SELECT COALESCE(SUM(refund_amount), 0) AS refund_sum
-                            FROM amazon_refund_records
-                            WHERE shop_id = %s AND asin = %s
-                              AND refund_date BETWEEN %s AND %s
-                        """, (sid, asin, period_start, period_end))
-                        refund_row = cursor.fetchone()
-                        refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
-
-                        # 真实 FBA 费 + 佣金（从预聚合字典取，没有则回退估算）
+                        # 真实 FBA 费 + 佣金
                         real_fba = Decimal(str(sku_fees.get(sku, {}).get('fba', 0)))
                         real_commission = Decimal(str(sku_fees.get(sku, {}).get('commission', 0)))
                         if real_fba > 0 or real_commission > 0:
                             fba_fees = real_fba
                             platform_fees = real_commission
-                        else:
+                        elif sales_qty > 0:
                             profit = calculate_profit(sales_amount, sales_qty, unit_costs, Decimal('0'), Decimal('0'))
                             fba_fees = profit.fba_fees
                             platform_fees = profit.commission
+                        else:
+                            fba_fees = Decimal('0')
+                            platform_fees = Decimal('0')
 
-                        # 统一利润公式
+                        # 退款
+                        cursor.execute("""
+                            SELECT COALESCE(SUM(refund_amount), 0) AS refund_sum
+                            FROM amazon_refund_records
+                            WHERE shop_id = %s AND asin = %s AND refund_date = %s
+                        """, (sid, asin, report_date))
+                        refund_amount = Decimal(str(cursor.fetchone()['refund_sum'] or 0))
+
+                        # 产品成本
                         product_cost = unit_costs.purchase_cost_usd * sales_qty
                         headway_cost = unit_costs.headway_cost_usd * sales_qty
                         total_cost = product_cost + headway_cost + fba_fees + platform_fees + ad_cost + refund_amount
@@ -958,12 +961,12 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
 
                         cursor.execute("""
                             INSERT INTO sku_profit (
-                                shop_id, asin, sku, product_name, period_start, period_end,
+                                shop_id, asin, sku, product_name, report_date,
                                 sales_qty, sales_amount, avg_selling_price,
                                 product_cost, fba_fees, ad_cost, headway_cost, platform_fees,
                                 refund_amount, other_fees,
                                 gross_profit, net_profit, profit_margin
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON DUPLICATE KEY UPDATE
                                 sales_qty = VALUES(sales_qty),
                                 sales_amount = VALUES(sales_amount),
@@ -980,7 +983,7 @@ def generate_sku_profit(period_start, period_end, shop_id=None):
                                 profit_margin = VALUES(profit_margin),
                                 updated_at = NOW()
                         """, (
-                            sid, asin, sku, product_name, period_start, period_end,
+                            sid, asin, sku, product_name, report_date,
                             sales_qty, float(sales_amount), float(avg_price),
                             float(product_cost), float(fba_fees), float(ad_cost),
                             float(headway_cost), float(platform_fees),
