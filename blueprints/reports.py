@@ -1546,7 +1546,7 @@ def advertising_daily_tree():
             group_expr = "DATE_FORMAT(report_date, '%%Y-%%m')"
             label_expr = "CONCAT(DATE_FORMAT(MIN(report_date), '%%Y-%%m'), '') AS report_date"
             order_by = "ORDER BY MIN(report_date) DESC"
-            count_expr = "COUNT(DISTINCT DATE_FORMAT(report_date, '%Y-%m'))"
+            count_expr = "COUNT(DISTINCT DATE_FORMAT(report_date, '%%Y-%%m'))"
         else:
             group_expr = "report_date"
             label_expr = "report_date"
@@ -1574,6 +1574,7 @@ def advertising_daily_tree():
             with conn.cursor() as c:
                 c.execute(f"""
                     SELECT {label_expr},
+                           {f'{group_expr} AS _group,' if report_type != 'daily' else ''}
                            SUM(impressions) impressions, SUM(clicks) clicks, SUM(ad_spend) ad_spend,
                            CASE WHEN SUM(clicks)>0 THEN SUM(ad_spend)/SUM(clicks) ELSE 0 END cpc,
                            CASE WHEN SUM(impressions)>0 THEN SUM(clicks)/SUM(impressions)*100 ELSE 0 END ctr,
@@ -1677,7 +1678,7 @@ def advertising_daily_tree():
             # 5. 组装树
             tree = []
             for date_row in dates:
-                d = str(date_row['report_date'])
+                d = str(date_row.pop('_group', date_row['report_date']))
                 date_node = dict(date_row)
                 date_node['children'] = []
                 for camp in campaign_map.get(d, []):
