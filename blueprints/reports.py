@@ -81,6 +81,33 @@ def _to_json_serializable(obj):
     return obj
 
 
+def _normalize_ad_percentages(nodes):
+    """递归将树形数据中的 ctr/acos 从小数转为百分比（×100）"""
+    for node in nodes:
+        for pct_field in ('ctr', 'acos_7d', 'acos_30d'):
+            v = node.get(pct_field)
+            if v is not None:
+                try:
+                    node[pct_field] = round(float(v) * 100, 4)
+                except (ValueError, TypeError):
+                    pass
+        children = node.get('children', [])
+        if children:
+            _normalize_ad_percentages(children)
+
+
+def _normalize_ad_percentages_flat(rows):
+    """将平铺列表中的 ctr/acos 从小数转为百分比（×100）"""
+    for row in rows:
+        for pct_field in ('ctr', 'acos_7d', 'acos_30d'):
+            v = row.get(pct_field)
+            if v is not None:
+                try:
+                    row[pct_field] = round(float(v) * 100, 4)
+                except (ValueError, TypeError):
+                    pass
+
+
 def _parse_pagination():
     """
     解析分页参数
@@ -1374,10 +1401,13 @@ def advertising_summary():
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
         shop_id = _get_shop_id_optional()
+        campaign_id = request.args.get('campaign_id', '').strip() or None
+        ad_group_id = request.args.get('ad_group_id', '').strip() or None
+        advertised_asin = request.args.get('advertised_asin', '').strip() or None
 
         conn = _get_conn()
         try:
-            where_clauses = ["report_type = 'daily'"]
+            where_clauses = ["report_type = 'daily'", "dimension_type = 'overall'"]
             params = []
             if shop_id is not None:
                 where_clauses.append("shop_id = %s"); params.append(shop_id)
@@ -1385,6 +1415,12 @@ def advertising_summary():
                 where_clauses.append("report_date >= %s"); params.append(start_date)
             if end_date:
                 where_clauses.append("report_date <= %s"); params.append(end_date)
+            if campaign_id:
+                where_clauses.append("campaign_id = %s"); params.append(campaign_id)
+            if ad_group_id:
+                where_clauses.append("ad_group_id = %s"); params.append(ad_group_id)
+            if advertised_asin:
+                where_clauses.append("asin = %s"); params.append(advertised_asin)
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             with conn.cursor() as cursor:
@@ -1394,10 +1430,10 @@ def advertising_summary():
                         SUM(impressions) AS total_impressions,
                         SUM(clicks) AS total_clicks,
                         SUM(ad_spend) AS total_ad_spend,
-                        SUM(orders_7d) AS total_orders,
-                        SUM(sales_7d) AS total_sales,
-                        CASE WHEN SUM(sales_7d) > 0 THEN SUM(ad_spend) / SUM(sales_7d) * 100 ELSE 0 END AS avg_acos,
-                        CASE WHEN SUM(ad_spend) > 0 THEN SUM(sales_7d) / SUM(ad_spend) ELSE 0 END AS avg_roas,
+                        SUM(orders_7d) AS total_orders_7d,
+                        SUM(sales_7d) AS total_sales_7d,
+                        CASE WHEN SUM(sales_7d) > 0 THEN SUM(ad_spend) / SUM(sales_7d) * 100 ELSE 0 END AS avg_acos_7d,
+                        CASE WHEN SUM(ad_spend) > 0 THEN SUM(sales_7d) / SUM(ad_spend) ELSE 0 END AS avg_roas_7d,
                         CASE WHEN SUM(clicks) > 0 THEN SUM(ad_spend) / SUM(clicks) ELSE 0 END AS avg_cpc,
                         CASE WHEN SUM(impressions) > 0 THEN SUM(clicks) / SUM(impressions) * 100 ELSE 0 END AS avg_ctr
                     FROM report_advertising
@@ -1422,6 +1458,9 @@ def advertising_trend():
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
         shop_id = _get_shop_id_optional()
+        campaign_id = request.args.get('campaign_id', '').strip() or None
+        ad_group_id = request.args.get('ad_group_id', '').strip() or None
+        advertised_asin = request.args.get('advertised_asin', '').strip() or None
 
         conn = _get_conn()
         try:
@@ -1433,6 +1472,14 @@ def advertising_trend():
                 where_clauses.append("report_date >= %s"); params.append(start_date)
             if end_date:
                 where_clauses.append("report_date <= %s"); params.append(end_date)
+            if campaign_id and not ad_group_id and not advertised_asin:
+                where_clauses.append("campaign_id = %s"); params.append(campaign_id)
+            elif ad_group_id and not advertised_asin:
+                where_clauses.append("ad_group_id = %s"); params.append(ad_group_id)
+            elif advertised_asin:
+                where_clauses.append("asin = %s"); params.append(advertised_asin)
+            else:
+                where_clauses.append("dimension_type = 'overall'")
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
             if report_type == 'weekly':
@@ -1472,6 +1519,348 @@ def advertising_trend():
             conn.close()
     except Exception as e:
         print(f"[advertising_trend] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/daily/tree', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def advertising_daily_tree():
+    """一次性返回当前页完整四层树形数据（日报/周报/月报统一入口）：
+    日期(周/月) → 活动 → 广告组 → 商品
+    """
+    try:
+        report_type = request.args.get('type', '').strip() or 'daily'
+        start_date = request.args.get('start_date', '').strip() or None
+        end_date = request.args.get('end_date', '').strip() or None
+        shop_id = _get_shop_id_optional()
+        page, page_size = _parse_pagination()
+
+        # 周/月聚合参数
+        if report_type == 'weekly':
+            group_expr = "YEARWEEK(report_date, 1)"
+            label_expr = "CONCAT(MIN(report_date), '~', MAX(report_date)) AS report_date"
+            order_by = "ORDER BY MIN(report_date) DESC"
+            count_expr = "COUNT(DISTINCT YEARWEEK(report_date, 1))"
+        elif report_type == 'monthly':
+            group_expr = "DATE_FORMAT(report_date, '%%Y-%%m')"
+            label_expr = "CONCAT(DATE_FORMAT(MIN(report_date), '%%Y-%%m'), '') AS report_date"
+            order_by = "ORDER BY MIN(report_date) DESC"
+            count_expr = "COUNT(DISTINCT DATE_FORMAT(report_date, '%Y-%m'))"
+        else:
+            group_expr = "report_date"
+            label_expr = "report_date"
+            order_by = "ORDER BY report_date DESC"
+            count_expr = "COUNT(DISTINCT report_date)"
+
+        conn = _get_conn()
+        try:
+            # 1. 第一层（分页）
+            where = ["report_type = 'daily'", "dimension_type = 'overall'"]
+            params = []
+            if shop_id is not None:
+                where.append("shop_id = %s"); params.append(shop_id)
+            if start_date:
+                where.append("report_date >= %s"); params.append(start_date)
+            if end_date:
+                where.append("report_date <= %s"); params.append(end_date)
+            where_sql = "WHERE " + " AND ".join(where)
+
+            with conn.cursor() as c:
+                c.execute(f"SELECT {count_expr} AS total FROM report_advertising {where_sql}", params)
+                total = c.fetchone()['total']
+
+            offset = (page - 1) * page_size
+            with conn.cursor() as c:
+                c.execute(f"""
+                    SELECT {label_expr},
+                           SUM(impressions) impressions, SUM(clicks) clicks, SUM(ad_spend) ad_spend,
+                           CASE WHEN SUM(clicks)>0 THEN SUM(ad_spend)/SUM(clicks) ELSE 0 END cpc,
+                           CASE WHEN SUM(impressions)>0 THEN SUM(clicks)/SUM(impressions)*100 ELSE 0 END ctr,
+                           SUM(orders_7d) orders_7d, SUM(sales_7d) sales_7d,
+                           CASE WHEN SUM(sales_7d)>0 THEN SUM(ad_spend)/SUM(sales_7d)*100 ELSE 0 END acos_7d,
+                           CASE WHEN SUM(ad_spend)>0 THEN SUM(sales_7d)/SUM(ad_spend) ELSE 0 END roas_7d,
+                           SUM(orders_30d) orders_30d, SUM(sales_30d) sales_30d,
+                           CASE WHEN SUM(sales_30d)>0 THEN SUM(ad_spend)/SUM(sales_30d)*100 ELSE 0 END acos_30d,
+                           CASE WHEN SUM(ad_spend)>0 THEN SUM(sales_30d)/SUM(ad_spend) ELSE 0 END roas_30d
+                    FROM report_advertising
+                    {where_sql}
+                    GROUP BY {group_expr}
+                    {order_by}
+                    LIMIT %s OFFSET %s
+                """, params + [page_size, offset])
+                dates = c.fetchall()
+
+            if not dates:
+                return jsonify({"status":"success","data":{"list":[],"total":0,"page":page,"page_size":page_size}})
+
+            # 公共子层查询
+            def _query_dimension(dimension_type, fields_extra="", group_cols="", join_extra=""):
+                w = [f"report_type='daily'", f"dimension_type='{dimension_type}'"]
+                p2 = []
+                if shop_id is not None:
+                    w.append("shop_id = %s"); p2.append(shop_id)
+                if start_date:
+                    w.append("report_date >= %s"); p2.append(start_date)
+                if end_date:
+                    w.append("report_date <= %s"); p2.append(end_date)
+                ws = " AND ".join(w)
+                extra = f", {fields_extra}" if fields_extra else ""
+                grp = f"_group, {group_cols}" if group_cols else "_group"
+                return f"""
+                    SELECT {group_expr} AS _group{extra},
+                           SUM(impressions) impressions, SUM(clicks) clicks, SUM(ad_spend) ad_spend,
+                           CASE WHEN SUM(clicks)>0 THEN SUM(ad_spend)/SUM(clicks) ELSE 0 END cpc,
+                           CASE WHEN SUM(impressions)>0 THEN SUM(clicks)/SUM(impressions)*100 ELSE 0 END ctr,
+                           SUM(orders_7d) orders_7d, SUM(sales_7d) sales_7d,
+                           CASE WHEN SUM(sales_7d)>0 THEN SUM(ad_spend)/SUM(sales_7d)*100 ELSE 0 END acos_7d,
+                           CASE WHEN SUM(ad_spend)>0 THEN SUM(sales_7d)/SUM(ad_spend) ELSE 0 END roas_7d,
+                           SUM(orders_30d) orders_30d, SUM(sales_30d) sales_30d,
+                           CASE WHEN SUM(sales_30d)>0 THEN SUM(ad_spend)/SUM(sales_30d)*100 ELSE 0 END acos_30d,
+                           CASE WHEN SUM(ad_spend)>0 THEN SUM(sales_30d)/SUM(ad_spend) ELSE 0 END roas_30d
+                    FROM report_advertising{join_extra}
+                    WHERE {ws}
+                    GROUP BY {grp}
+                """, p2
+
+            # 2. 活动层
+            sql_c, pc = _query_dimension('campaign', 'campaign_id, MAX(campaign_name) campaign_name', 'campaign_id')
+            campaign_map = {}
+            with conn.cursor() as c:
+                c.execute(sql_c, pc)
+                for r in c.fetchall():
+                    grp = str(r.pop('_group'))
+                    campaign_map.setdefault(grp, []).append(r)
+
+            # 3. 广告组层
+            sql_a, pa = _query_dimension('ad_group', 'campaign_id, ad_group_id, MAX(ad_group_name) ad_group_name', 'campaign_id, ad_group_id')
+            ag_map = {}
+            with conn.cursor() as c:
+                c.execute(sql_a, pa)
+                for r in c.fetchall():
+                    grp = str(r.pop('_group'))
+                    cid = r.pop('campaign_id')
+                    ag_map.setdefault((grp, cid), []).append(r)
+
+            # 4. 商品层
+            prod_map = {}
+            with conn.cursor() as c:
+                c.execute(f"""
+                    SELECT {group_expr} AS _group, r.campaign_id, r.ad_group_id,
+                           r.asin advertised_asin, MAX(r.sku) advertised_sku,
+                           COALESCE(MAX(p.product_name), '') product_name,
+                           SUM(r.impressions) impressions, SUM(r.clicks) clicks, SUM(r.ad_spend) ad_spend,
+                           CASE WHEN SUM(r.clicks)>0 THEN SUM(r.ad_spend)/SUM(r.clicks) ELSE 0 END cpc,
+                           CASE WHEN SUM(r.impressions)>0 THEN SUM(r.clicks)/SUM(r.impressions)*100 ELSE 0 END ctr,
+                           SUM(r.orders_7d) orders_7d, SUM(r.sales_7d) sales_7d,
+                           CASE WHEN SUM(r.sales_7d)>0 THEN SUM(r.ad_spend)/SUM(r.sales_7d)*100 ELSE 0 END acos_7d,
+                           CASE WHEN SUM(r.ad_spend)>0 THEN SUM(r.sales_7d)/SUM(r.ad_spend) ELSE 0 END roas_7d,
+                           SUM(r.orders_30d) orders_30d, SUM(r.sales_30d) sales_30d,
+                           CASE WHEN SUM(r.sales_30d)>0 THEN SUM(r.ad_spend)/SUM(r.sales_30d)*100 ELSE 0 END acos_30d,
+                           CASE WHEN SUM(r.ad_spend)>0 THEN SUM(r.sales_30d)/SUM(r.ad_spend) ELSE 0 END roas_30d
+                    FROM report_advertising r
+                    LEFT JOIN products p ON p.seller_sku = r.sku AND p.status = 1
+                    WHERE r.report_type='daily' AND r.dimension_type='asin'
+                      AND r.asin != ''
+                      {f"AND r.shop_id=%s" if shop_id is not None else ""}
+                      {f"AND r.report_date>=%s" if start_date else ""}
+                      {f"AND r.report_date<=%s" if end_date else ""}
+                    GROUP BY _group, r.campaign_id, r.ad_group_id, r.asin
+                    ORDER BY ad_spend DESC
+                """, tuple(p for p in [shop_id, start_date, end_date] if p is not None))
+                for r in c.fetchall():
+                    grp = str(r.pop('_group'))
+                    cid = r.pop('campaign_id')
+                    agid = r.pop('ad_group_id')
+                    prod_map.setdefault((grp, cid, agid), []).append(r)
+
+            # 5. 组装树
+            tree = []
+            for date_row in dates:
+                d = str(date_row['report_date'])
+                date_node = dict(date_row)
+                date_node['children'] = []
+                for camp in campaign_map.get(d, []):
+                    cid = camp['campaign_id']
+                    camp_node = dict(camp)
+                    camp_node['children'] = []
+                    for ag in ag_map.get((d, cid), []):
+                        agid = ag['ad_group_id']
+                        ag_node = dict(ag)
+                        ag_node['children'] = prod_map.get((d, cid, agid), [])
+                        camp_node['children'].append(ag_node)
+                    date_node['children'].append(camp_node)
+                tree.append(date_node)
+
+            return jsonify({
+                "status": "success",
+                "data": {"list": tree, "total": total, "page": page, "page_size": page_size}
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[advertising_daily_tree] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/daily', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def advertising_daily():
+    """第一层：日期汇总列表（分页）"""
+    try:
+        start_date = request.args.get('start_date', '').strip() or None
+        end_date = request.args.get('end_date', '').strip() or None
+        shop_id = _get_shop_id_optional()
+        page, page_size = _parse_pagination()
+
+        conn = _get_conn()
+        try:
+            where_clauses = ["report_type = 'daily'", "dimension_type = 'overall'"]
+            params = []
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
+            if start_date:
+                where_clauses.append("report_date >= %s"); params.append(start_date)
+            if end_date:
+                where_clauses.append("report_date <= %s"); params.append(end_date)
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) AS total FROM report_advertising {where_sql}", params)
+                total = cursor.fetchone()['total']
+
+            offset = (page - 1) * page_size
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT report_date, impressions, clicks, ad_spend,
+                           ctr, cpc, orders_7d, sales_7d, acos_7d, roas_7d,
+                           orders_30d, sales_30d, acos_30d, roas_30d
+                    FROM report_advertising
+                    {where_sql}
+                    ORDER BY report_date DESC
+                    LIMIT %s OFFSET %s
+                """, params + [page_size, offset])
+                rows = cursor.fetchall()
+
+            return jsonify({
+                "status": "success",
+                "data": {"list": _to_json_serializable(rows), "total": total, "page": page, "page_size": page_size}
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[advertising_daily] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/daily/<date>/campaigns', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def advertising_daily_campaigns(date):
+    """第二层：指定日期下的广告活动列表"""
+    try:
+        shop_id = _get_shop_id_optional()
+
+        conn = _get_conn()
+        try:
+            where_clauses = ["report_type = 'daily'", "dimension_type = 'campaign'", "report_date = %s"]
+            params = [date]
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT campaign_id, campaign_name,
+                           impressions, clicks, ad_spend, ctr, cpc,
+                           orders_7d, sales_7d, acos_7d, roas_7d,
+                           orders_30d, sales_30d, acos_30d, roas_30d
+                    FROM report_advertising
+                    {where_sql}
+                    ORDER BY ad_spend DESC
+                """, params)
+                rows = cursor.fetchall()
+
+            return jsonify({"status": "success", "data": _to_json_serializable(rows)})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[advertising_daily_campaigns] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/daily/<date>/campaigns/<campaign_id>/ad-groups', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def advertising_daily_ad_groups(date, campaign_id):
+    """第三层：指定日期 + 广告活动下的广告组列表"""
+    try:
+        shop_id = _get_shop_id_optional()
+
+        conn = _get_conn()
+        try:
+            where_clauses = ["report_type = 'daily'", "dimension_type = 'ad_group'", "report_date = %s", "campaign_id = %s"]
+            params = [date, campaign_id]
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT ad_group_id, ad_group_name,
+                           impressions, clicks, ad_spend, ctr, cpc,
+                           orders_7d, sales_7d, acos_7d, roas_7d,
+                           orders_30d, sales_30d, acos_30d, roas_30d
+                    FROM report_advertising
+                    {where_sql}
+                    ORDER BY ad_spend DESC
+                """, params)
+                rows = cursor.fetchall()
+
+            return jsonify({"status": "success", "data": _to_json_serializable(rows)})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[advertising_daily_ad_groups] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/advertising/daily/<date>/campaigns/<campaign_id>/ad-groups/<ad_group_id>/products', methods=['GET'])
+@login_required
+@permission_required('reports_advertising:page')
+def advertising_daily_products(date, campaign_id, ad_group_id):
+    """第四层：指定日期 + 广告活动 + 广告组下的广告商品列表"""
+    try:
+        shop_id = _get_shop_id_optional()
+
+        conn = _get_conn()
+        try:
+            where_clauses = ["report_type = 'daily'", "dimension_type = 'asin'", "report_date = %s", "campaign_id = %s", "ad_group_id = %s"]
+            params = [date, campaign_id, ad_group_id]
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s"); params.append(shop_id)
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT r.ad_group_id, r.ad_group_name, r.asin AS advertised_asin, r.sku AS advertised_sku,
+                           COALESCE(p.product_name, '') AS product_name,
+                           r.impressions, r.clicks, r.ad_spend, r.ctr, r.cpc,
+                           r.orders_7d, r.sales_7d, r.acos_7d, r.roas_7d,
+                           r.orders_30d, r.sales_30d, r.acos_30d, r.roas_30d
+                    FROM report_advertising r
+                    LEFT JOIN products p ON p.seller_sku = r.sku AND p.status = 1
+                    {where_sql}
+                    ORDER BY r.ad_spend DESC
+                """, params)
+                rows = cursor.fetchall()
+
+            return jsonify({"status": "success", "data": _to_json_serializable(rows)})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[advertising_daily_products] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

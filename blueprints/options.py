@@ -340,8 +340,48 @@ def option_ad_asins():
                            MAX(advertised_sku) AS sku
                     FROM amazon_ads_raw_reports
                     {where_sql}
-                    GROUP BY advertised_asin
-                    ORDER BY advertised_asin
+                     GROUP BY advertised_asin
+                     ORDER BY advertised_asin
+                 """, params)
+                return jsonify({"status": "success", "data": cursor.fetchall()})
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# 广告商品下拉 — GET /api/options/advertising/products
+# ============================================================
+
+@options_bp.route('/advertising/products', methods=['GET'])
+def option_ad_products():
+    """广告商品下拉：支持 campaign_id / ad_group_id 联动筛选"""
+    try:
+        shop_id = request.args.get('shop_id', '').strip()
+        campaign_id = request.args.get('campaign_id', '').strip()
+        ad_group_id = request.args.get('ad_group_id', '').strip()
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                where = ["advertised_asin != ''"]
+                params = []
+                if shop_id:
+                    where.append("shop_id = %s"); params.append(shop_id)
+                if campaign_id:
+                    where.append("campaign_id = %s"); params.append(campaign_id)
+                if ad_group_id:
+                    where.append("ad_group_id = %s"); params.append(ad_group_id)
+                where_sql = "WHERE " + " AND ".join(where)
+                cursor.execute(f"""
+                    SELECT DISTINCT r.advertised_asin AS asin,
+                           MAX(r.advertised_sku) AS sku,
+                           MAX(p.product_name) AS product_name
+                    FROM amazon_ads_raw_reports r
+                    LEFT JOIN products p ON p.seller_sku = r.advertised_sku AND p.status = 1
+                    {where_sql}
+                    GROUP BY r.advertised_asin
+                    ORDER BY r.advertised_asin
                 """, params)
                 return jsonify({"status": "success", "data": cursor.fetchall()})
         finally:

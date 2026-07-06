@@ -1286,9 +1286,13 @@ def _generate_advertising_from_raw(cursor, shop_id, report_type, report_date,
         )
         total_affected += cursor.rowcount
 
-    # 4. asin 维度 — 从 spAdvertisedProduct 取
+    # 4. asin 维度 — 从 spAdvertisedProduct 取（含 campaign_id + ad_group_id）
     cursor.execute("""
         SELECT
+            campaign_id,
+            MAX(campaign_name) AS campaign_name,
+            ad_group_id,
+            MAX(ad_group_name) AS ad_group_name,
             advertised_asin AS asin,
             MAX(advertised_sku) AS sku,
             COALESCE(SUM(impressions), 0) AS impressions,
@@ -1301,12 +1305,13 @@ def _generate_advertising_from_raw(cursor, shop_id, report_type, report_date,
         FROM amazon_ads_raw_reports
         WHERE shop_id = %s AND report_date BETWEEN %s AND %s
           AND report_type = 'spAdvertisedProduct' AND advertised_asin != ''
-        GROUP BY advertised_asin
+        GROUP BY campaign_id, ad_group_id, advertised_asin
     """, (shop_id, date_start, date_end))
     for row in cursor.fetchall():
         _insert_advertising_report(
             cursor, report_type, report_date, report_week, report_month,
-            shop_id, 'asin', '', '', '', '', row['asin'], row['sku'] or '',
+            shop_id, 'asin', row['campaign_id'] or '', row['campaign_name'] or '',
+            row['ad_group_id'] or '', row['ad_group_name'] or '', row['asin'], row['sku'] or '',
             int(row['impressions'] or 0), int(row['clicks'] or 0), Decimal(str(row['ad_spend'] or 0)),
             int(row['orders_7d'] or 0), int(row['orders_30d'] or 0),
             Decimal(str(row['sales_7d'] or 0)), Decimal(str(row['sales_30d'] or 0))
