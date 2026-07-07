@@ -422,7 +422,8 @@ def business_trend():
                         AVG(gross_profit_rate) AS gross_profit_rate,
                         SUM(headway_cost) AS headway_cost,
                         AVG(headway_ratio) AS headway_ratio,
-                        SUM(ad_cost) AS ad_cost
+                        SUM(ad_cost) AS ad_cost,
+                        SUM(order_count) AS order_count
                     FROM report_business
                     {where_sql}
                     GROUP BY {group_expr}
