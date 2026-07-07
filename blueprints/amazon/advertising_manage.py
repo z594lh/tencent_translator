@@ -182,25 +182,26 @@ def _query_entity_with_report(entity_table, entity_join_col, entity_fields,
     campaign_id = request.args.get("campaign_id", "").strip() or None
     ad_group_id = request.args.get("ad_group_id", "").strip() or None
 
-    where_clauses = ["r.report_type = %s"]
-    params = [report_type]
+    # ON 子句条件（报表相关）
+    on_clauses = [f"r.report_type = %s",
+                  f"r.report_date BETWEEN %s AND %s"]
+    params = [report_type, start_date, end_date]
     join_where = join_extra
 
     if shop_id:
-        where_clauses.append("r.shop_id = %s")
+        on_clauses.append("r.shop_id = %s")
         params.append(shop_id)
-        # 仅当实体表有 shop_id 列时才加 JOIN 条件
         if entity_table == "amazon_ads_campaigns":
             join_where = (join_where + " " if join_where else "") + "AND e.shop_id = r.shop_id"
 
-    where_clauses.append("r.report_date BETWEEN %s AND %s")
-    params.extend([start_date, end_date])
+    # WHERE 子句条件（实体相关）
+    where_clauses = []
 
     if campaign_id:
-        where_clauses.append("r.campaign_id = %s")
+        where_clauses.append("e.campaign_id = %s")
         params.append(campaign_id)
     if ad_group_id:
-        where_clauses.append("r.ad_group_id = %s")
+        where_clauses.append("e.ad_group_id = %s")
         params.append(ad_group_id)
 
     if where_extra:
@@ -228,7 +229,8 @@ def _query_entity_with_report(entity_table, entity_join_col, entity_fields,
         where_clauses.extend(where_params[0])
         params.extend(where_params[1])
 
-    where_sql = "WHERE " + " AND ".join(where_clauses)
+    on_sql = " AND ".join(on_clauses)
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
     allowed_sort = {"cost", "impressions", "clicks", "cpc", "ctr", "cvr", "cpa", "acos",
                     "sales_7d", "purchases_7d", "name", "state", "serving_status"}
@@ -268,8 +270,8 @@ def _query_entity_with_report(entity_table, entity_join_col, entity_fields,
                COALESCE(SUM(r.sales_14d), 0) AS sales_14d,
                COALESCE(SUM(r.sales_30d), 0) AS sales_30d,
                COALESCE(MAX(r.top_of_search_impression_share), 0) AS top_of_search_impression_share
-         FROM amazon_ads_raw_reports r
-         JOIN {entity_table} e ON {report_join_col} = e.{entity_join_col} {join_where}
+         FROM {entity_table} e
+         LEFT JOIN amazon_ads_raw_reports r ON {report_join_col} = e.{entity_join_col} {join_where} AND {on_sql}
          {extra_left_join}
          {where_sql}
          GROUP BY e.{entity_join_col}
@@ -281,8 +283,8 @@ def _query_entity_with_report(entity_table, entity_join_col, entity_fields,
             if page is not None and page_size is not None:
                 count_sql = f"""
                     SELECT COUNT(DISTINCT e.{entity_join_col}) AS total
-                    FROM amazon_ads_raw_reports r
-                    JOIN {entity_table} e ON {report_join_col} = e.{entity_join_col} {join_where}
+                    FROM {entity_table} e
+                    LEFT JOIN amazon_ads_raw_reports r ON {report_join_col} = e.{entity_join_col} {join_where} AND {on_sql}
                     {extra_left_join}
                     {where_sql}
                 """
@@ -661,21 +663,29 @@ def list_ad_groups():
 
     conn = _get_conn()
     try:
-        where = ["r.report_type = 'spAdvertisedProduct'",
-                 "r.report_date BETWEEN %s AND %s"]
+        # 报表条件放 ON 子句
+        report_on = ["r.report_type = 'spAdvertisedProduct'",
+                     "r.report_date BETWEEN %s AND %s"]
         params = [start_date, end_date]
         if shop_id:
-            where.append("r.shop_id = %s"); params.append(shop_id)
-        where.append("r.campaign_id = %s"); params.append(campaign_id)
+            report_on.append("r.shop_id = %s"); params.append(shop_id)
+
+        # 实体条件放 WHERE 子句
+        entity_where = [f"e.campaign_id = %s"]
+        params.append(campaign_id)
+        if shop_id:
+            entity_where.append("e.campaign_id IN (SELECT campaign_id FROM amazon_ads_campaigns WHERE shop_id = %s)")
+            params.append(shop_id)
         if search:
-            where.append("e.name LIKE %s"); params.append(f"%{search}%")
+            entity_where.append("e.name LIKE %s"); params.append(f"%{search}%")
         if state:
             if state == "unarchived":
-                where.append("e.state != %s"); params.append("archived")
+                entity_where.append("e.state != %s"); params.append("archived")
             else:
-                where.append("e.state = %s"); params.append(state)
+                entity_where.append("e.state = %s"); params.append(state)
 
-        where_sql = "WHERE " + " AND ".join(where)
+        on_sql = " AND ".join(report_on)
+        where_sql = "WHERE " + " AND ".join(entity_where)
 
         entity_fields = [
             "MIN(e.ad_group_id) AS ad_group_id",
@@ -686,8 +696,8 @@ def list_ad_groups():
             "MIN(e.campaign_id) AS campaign_id",
         ]
 
-        base_from = f"""FROM amazon_ads_raw_reports r
-                 JOIN amazon_ads_ad_groups e ON r.ad_group_id = e.ad_group_id
+        base_from = f"""FROM amazon_ads_ad_groups e
+                 LEFT JOIN amazon_ads_raw_reports r ON r.ad_group_id = e.ad_group_id AND {on_sql}
                  {where_sql}"""
         base_group = "GROUP BY e.ad_group_id"
 
@@ -696,7 +706,7 @@ def list_ad_groups():
                 count_sql = f"SELECT COUNT(*) AS total FROM (SELECT 1 {base_from} {base_group} {having_sql}) t"
                 c.execute(count_sql, params + having_params)
             else:
-                count_sql = f"SELECT COUNT(DISTINCT e.ad_group_id) AS total FROM amazon_ads_raw_reports r JOIN amazon_ads_ad_groups e ON r.ad_group_id = e.ad_group_id {where_sql}"
+                count_sql = f"SELECT COUNT(DISTINCT e.ad_group_id) AS total FROM amazon_ads_ad_groups e LEFT JOIN amazon_ads_raw_reports r ON r.ad_group_id = e.ad_group_id AND {on_sql} {where_sql}"
                 c.execute(count_sql, params)
             total = c.fetchone()["total"]
 
@@ -1015,30 +1025,37 @@ def list_product_ads():
 
     conn = _get_conn()
     try:
-        where = ["r.report_type = 'spAdvertisedProduct'",
-                 "r.report_date BETWEEN %s AND %s"]
+        # 报表条件放 ON 子句
+        report_on = ["r.report_type = 'spAdvertisedProduct'",
+                     "r.report_date BETWEEN %s AND %s"]
         params = [start_date, end_date]
-        join_where = "e.campaign_id = r.campaign_id AND e.asin = r.advertised_asin"
+        join_where = f"e.campaign_id = r.campaign_id AND e.asin = r.advertised_asin AND {' AND '.join(report_on)}"
 
         if shop_id:
-            where.append("r.shop_id = %s"); params.append(shop_id)
+            join_where += " AND r.shop_id = %s"; params.append(shop_id)
+
+        # 实体条件放 WHERE 子句
+        entity_where = []
+        if shop_id:
+            entity_where.append("e.campaign_id IN (SELECT campaign_id FROM amazon_ads_campaigns WHERE shop_id = %s)")
+            params.append(shop_id)
         if campaign_id:
-            where.append("r.campaign_id = %s"); params.append(campaign_id)
+            entity_where.append("e.campaign_id = %s"); params.append(campaign_id)
         if ad_group_id:
-            where.append("r.ad_group_id = %s"); params.append(ad_group_id)
+            entity_where.append("e.ad_group_id = %s"); params.append(ad_group_id)
         if search:
-            where.append("(e.asin LIKE %s OR e.sku LIKE %s)")
+            entity_where.append("(e.asin LIKE %s OR e.sku LIKE %s)")
             params.extend([f"%{search}%", f"%{search}%"])
         if state:
             if state == "unarchived":
-                where.append("e.state != %s"); params.append("archived")
+                entity_where.append("e.state != %s"); params.append("archived")
             else:
-                where.append("e.state = %s"); params.append(state)
+                entity_where.append("e.state = %s"); params.append(state)
 
-        where_sql = "WHERE " + " AND ".join(where)
+        where_sql = ("WHERE " + " AND ".join(entity_where)) if entity_where else ""
 
         base_from = f"""FROM amazon_ads_product_ads e
-                 JOIN amazon_ads_raw_reports r ON {join_where}
+                 LEFT JOIN amazon_ads_raw_reports r ON {join_where}
                  LEFT JOIN amazon_listings l ON l.asin = e.asin COLLATE utf8mb4_unicode_ci
                  {where_sql}"""
         base_group = "GROUP BY e.ad_id"
@@ -1191,25 +1208,33 @@ def list_keywords():
 
     conn = _get_conn()
     try:
-        where = ["r.report_type = 'spTargeting'",
-                 "r.report_date BETWEEN %s AND %s"]
+        # 报表条件放 ON 子句
+        report_on = ["r.report_type = 'spTargeting'",
+                     "r.report_date BETWEEN %s AND %s"]
         params = [start_date, end_date]
         if shop_id:
-            where.append("r.shop_id = %s"); params.append(shop_id)
+            report_on.append("r.shop_id = %s"); params.append(shop_id)
+
+        # 实体条件放 WHERE 子句
+        entity_where = []
+        if shop_id:
+            entity_where.append("e.campaign_id IN (SELECT campaign_id FROM amazon_ads_campaigns WHERE shop_id = %s)")
+            params.append(shop_id)
         if campaign_id:
-            where.append("r.campaign_id = %s"); params.append(campaign_id)
+            entity_where.append("e.campaign_id = %s"); params.append(campaign_id)
         if ad_group_id:
-            where.append("r.ad_group_id = %s"); params.append(ad_group_id)
+            entity_where.append("e.ad_group_id = %s"); params.append(ad_group_id)
         if search:
-            where.append("(e.keyword_text LIKE %s OR CAST(e.keyword_id AS CHAR) = %s)")
+            entity_where.append("(e.keyword_text LIKE %s OR CAST(e.keyword_id AS CHAR) = %s)")
             params.extend([f"%{search}%", search])
         if state:
             if state == "unarchived":
-                where.append("e.state != %s"); params.append("archived")
+                entity_where.append("e.state != %s"); params.append("archived")
             else:
-                where.append("e.state = %s"); params.append(state)
+                entity_where.append("e.state = %s"); params.append(state)
 
-        where_sql = "WHERE " + " AND ".join(where)
+        on_sql = " AND ".join(report_on)
+        where_sql = ("WHERE " + " AND ".join(entity_where)) if entity_where else ""
 
         entity_fields = [
             "MIN(e.keyword_id) AS keyword_id",
@@ -1222,8 +1247,8 @@ def list_keywords():
             "MIN(e.ad_group_id) AS ad_group_id",
         ]
 
-        base_from = f"""FROM amazon_ads_raw_reports r
-                 JOIN amazon_ads_keywords e ON r.keyword_id = e.keyword_id
+        base_from = f"""FROM amazon_ads_keywords e
+                 LEFT JOIN amazon_ads_raw_reports r ON r.keyword_id = e.keyword_id AND {on_sql}
                  {where_sql}"""
         base_group = "GROUP BY e.keyword_id"
 
@@ -1232,7 +1257,7 @@ def list_keywords():
                 count_sql = f"SELECT COUNT(*) AS total FROM (SELECT 1 {base_from} {base_group} {having_sql}) t"
                 c.execute(count_sql, params + having_params)
             else:
-                count_sql = f"SELECT COUNT(DISTINCT e.keyword_id) AS total FROM amazon_ads_raw_reports r JOIN amazon_ads_keywords e ON r.keyword_id = e.keyword_id {where_sql}"
+                count_sql = f"SELECT COUNT(DISTINCT e.keyword_id) AS total FROM amazon_ads_keywords e LEFT JOIN amazon_ads_raw_reports r ON r.keyword_id = e.keyword_id AND {on_sql} {where_sql}"
                 c.execute(count_sql, params)
             total = c.fetchone()["total"]
 
