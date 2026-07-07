@@ -399,26 +399,33 @@ def list_campaigns():
 
     conn = _get_conn()
     try:
-        where = ["r.report_type = 'spCampaigns'",
-                 "r.report_date BETWEEN %s AND %s"]
+        # 报表条件放 ON 子句（LEFT JOIN 时不会过滤掉无报表数据的实体）
+        report_on = ["r.report_type = 'spCampaigns'",
+                     "r.report_date BETWEEN %s AND %s"]
         params = [start_date, end_date]
 
         if shop_id:
-            where.append("r.shop_id = %s"); params.append(shop_id)
+            report_on.append("r.shop_id = %s"); params.append(shop_id)
+
+        # 实体条件放 WHERE 子句
+        entity_where = []
+        if shop_id:
+            entity_where.append("e.shop_id = %s"); params.append(shop_id)
         if search:
-            where.append("(e.name LIKE %s OR CAST(e.campaign_id AS CHAR) = %s)")
+            entity_where.append("(e.name LIKE %s OR CAST(e.campaign_id AS CHAR) = %s)")
             params.extend([f"%{search}%", search])
         if state:
             if state == "unarchived":
-                where.append("e.state != %s"); params.append("archived")
+                entity_where.append("e.state != %s"); params.append("archived")
             else:
-                where.append("e.state = %s"); params.append(state)
+                entity_where.append("e.state = %s"); params.append(state)
         if serving_status:
-            where.append("e.serving_status = %s"); params.append(serving_status)
+            entity_where.append("e.serving_status = %s"); params.append(serving_status)
         if targeting_type:
-            where.append("e.targeting_type = %s"); params.append(targeting_type)
+            entity_where.append("e.targeting_type = %s"); params.append(targeting_type)
 
-        where_sql = "WHERE " + " AND ".join(where)
+        on_sql = " AND ".join(report_on)
+        where_sql = ("WHERE " + " AND ".join(entity_where)) if entity_where else ""
 
         entity_fields = [
             "MIN(e.campaign_id) AS campaign_id",
@@ -435,8 +442,8 @@ def list_campaigns():
             "MIN(e.re_open_day) AS re_open_day",
         ]
 
-        base_from = f"""FROM amazon_ads_raw_reports r
-                 JOIN amazon_ads_campaigns e ON r.campaign_id = e.campaign_id
+        base_from = f"""FROM amazon_ads_campaigns e
+                 LEFT JOIN amazon_ads_raw_reports r ON r.campaign_id = e.campaign_id AND {on_sql}
                  {where_sql}"""
         base_group = "GROUP BY e.campaign_id"
 
@@ -455,8 +462,8 @@ def list_campaigns():
             else:
                 count_sql = f"""
                     SELECT COUNT(DISTINCT e.campaign_id) AS total
-                    FROM amazon_ads_raw_reports r
-                    JOIN amazon_ads_campaigns e ON r.campaign_id = e.campaign_id
+                    FROM amazon_ads_campaigns e
+                    LEFT JOIN amazon_ads_raw_reports r ON r.campaign_id = e.campaign_id AND {on_sql}
                     {where_sql}
                 """
                 c.execute(count_sql, params)
