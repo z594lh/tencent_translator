@@ -76,7 +76,7 @@ def _sync_purchase_order_expense(conn, order_no, total_amount, new_status):
                         conn.commit()
                     return
             create_transaction_for_source(
-                conn, '采购/货值',
+                conn, 'purchase',
                 amount, datetime.now().strftime('%Y-%m-%d'),
                 f"进货单 {order_no}", 'purchase_order', order_no, 'company'
             )

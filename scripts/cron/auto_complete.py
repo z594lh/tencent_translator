@@ -45,7 +45,7 @@ def run():
                         )
                         if not cursor.fetchone() and order['order_no']:
                             create_transaction_for_source(
-                                conn, '采购/货值',
+                                conn, 'purchase',
                                 float(order['total_amount'] or 0),
                                 datetime.now().strftime('%Y-%m-%d'),
                                 f"进货单 {order['order_no']}（自动完结）",
@@ -80,7 +80,7 @@ def run():
                             )
                             if not cursor.fetchone():
                                 create_transaction_for_source(
-                                    conn, '物流/头程',
+                                    conn, 'logistics',
                                     float(wb['total_cost_cny'] or 0),
                                     datetime.now().strftime('%Y-%m-%d'),
                                     f"运单 {wb['waybill_no']}（自动完结）",

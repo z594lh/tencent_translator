@@ -103,7 +103,7 @@ def _sync_waybill_expense(conn, waybill_no, total_cost_cny, new_status):
                         conn.commit()
                     return
             create_transaction_for_source(
-                conn, '物流/头程',
+                conn, 'logistics',
                 amount, datetime.now().strftime('%Y-%m-%d'),
                 f"运单 {waybill_no}", 'logistics_waybill', waybill_no, 'company'
             )
