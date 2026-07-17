@@ -85,11 +85,11 @@ def _sync_waybill_expense(conn, waybill_no, total_cost_cny, new_status):
     if not waybill_no:
         return
     if new_status == WAYBILL_STATUS_COMPLETED:
-        from blueprints.expenses import create_expense_for_source
+        from blueprints.transactions import create_transaction_for_source
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT id, amount FROM expenses WHERE source_type = 'logistics_waybill' AND source_no = %s LIMIT 1",
+                    "SELECT id, amount FROM transactions WHERE source_type = 'logistics_waybill' AND source_no = %s LIMIT 1",
                     (waybill_no,)
                 )
                 existing = cursor.fetchone()
@@ -97,23 +97,23 @@ def _sync_waybill_expense(conn, waybill_no, total_cost_cny, new_status):
                 if existing:
                     if float(existing['amount']) != amount:
                         cursor.execute(
-                            "UPDATE expenses SET amount = %s WHERE id = %s",
+                            "UPDATE transactions SET amount = %s WHERE id = %s",
                             (amount, existing['id'])
                         )
                         conn.commit()
                     return
-            create_expense_for_source(
+            create_transaction_for_source(
                 conn, '物流/头程',
                 amount, datetime.now().strftime('%Y-%m-%d'),
                 f"运单 {waybill_no}", 'logistics_waybill', waybill_no, 'company'
             )
         except Exception as e:
-            print(f"[Logistics] 同步支出记录异常: {e}")
+            print(f"[Logistics] 同步交易记录异常: {e}")
     else:
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "DELETE FROM expenses WHERE source_type = 'logistics_waybill' AND source_no = %s",
+                    "DELETE FROM transactions WHERE source_type = 'logistics_waybill' AND source_no = %s",
                     (waybill_no,)
                 )
                 conn.commit()

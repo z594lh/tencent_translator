@@ -127,7 +127,7 @@ def login_required(f):
 
 def permission_required(code):
     """权限校验装饰器（需配合 @login_required 使用）
-    用法: @permission_required('expenses:create')
+     用法: @permission_required('transactions:create')
     """
     def decorator(f):
         @wraps(f)

@@ -11,7 +11,7 @@ from blueprints.pages import pages_bp
 from blueprints.user_auth import auth_bp
 from blueprints.translation import translation_bp
 from blueprints.ai_image import ai_image_bp
-from blueprints.expenses import expenses_bp
+from blueprints.transactions import transactions_bp
 from blueprints.fba_tools import fba_tools_bp
 from blueprints.amazon.inventory import amazon_inventory_bp
 from blueprints.amazon.shipments import amazon_shipments_bp
@@ -133,8 +133,8 @@ app.register_blueprint(translation_bp)
 # 注册AI生图路由
 app.register_blueprint(ai_image_bp)
 
-# 注册记账路由
-app.register_blueprint(expenses_bp)
+# 注册收支记账路由
+app.register_blueprint(transactions_bp)
 
 # 注册 FBA 工具路由
 app.register_blueprint(fba_tools_bp)

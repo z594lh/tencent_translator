@@ -18,7 +18,7 @@ from services.mysql_service import get_db_connection
 def run():
     from blueprints.supplier import PURCHASE_ORDER_STATUS_INITIAL, PURCHASE_ORDER_STATUS_COMPLETED
     from blueprints.logistics import WAYBILL_STATUS_INITIAL, WAYBILL_STATUS_COMPLETED
-    from blueprints.expenses import create_expense_for_source
+    from blueprints.transactions import create_transaction_for_source
 
     conn = get_db_connection()
     try:
@@ -40,11 +40,11 @@ def run():
                             (PURCHASE_ORDER_STATUS_COMPLETED, order['id'])
                         )
                         cursor.execute(
-                            "SELECT id FROM expenses WHERE source_type = %s AND source_no = %s LIMIT 1",
+                            "SELECT id FROM transactions WHERE source_type = %s AND source_no = %s LIMIT 1",
                             ('purchase_order', order['order_no'])
                         )
                         if not cursor.fetchone() and order['order_no']:
-                            create_expense_for_source(
+                            create_transaction_for_source(
                                 conn, '采购/货值',
                                 float(order['total_amount'] or 0),
                                 datetime.now().strftime('%Y-%m-%d'),
@@ -75,11 +75,11 @@ def run():
                         )
                         if wb['waybill_no']:
                             cursor.execute(
-                                "SELECT id FROM expenses WHERE source_type = %s AND source_no = %s LIMIT 1",
+                                "SELECT id FROM transactions WHERE source_type = %s AND source_no = %s LIMIT 1",
                                 ('logistics_waybill', wb['waybill_no'])
                             )
                             if not cursor.fetchone():
-                                create_expense_for_source(
+                                create_transaction_for_source(
                                     conn, '物流/头程',
                                     float(wb['total_cost_cny'] or 0),
                                     datetime.now().strftime('%Y-%m-%d'),

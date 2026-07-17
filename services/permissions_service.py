@@ -48,7 +48,7 @@ def get_user_permissions(user_id):
 def get_user_permission_codes(user_id):
     """
     获取用户权限码列表（仅返回 code 字符串列表）
-    返回: ['expenses:view', 'expenses:create', ...]
+     返回: ['transactions:view', 'transactions:create', ...]
     """
     perms = get_user_permissions(user_id)
     return [p['code'] for p in perms]

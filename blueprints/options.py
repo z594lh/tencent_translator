@@ -351,6 +351,40 @@ def option_ad_asins():
 
 
 # ============================================================
+# ============================================================
+# 交易分类下拉 — GET /api/options/transactions/categories
+# ============================================================
+
+@options_bp.route('/transactions/categories', methods=['GET'])
+def option_transaction_categories():
+    """交易分类下拉框，支持 ?type=expense/income/adjustment 筛选"""
+    try:
+        cat_type = request.args.get('type', '').strip()
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                if cat_type:
+                    cursor.execute("""
+                        SELECT id, code, name, type, color, sort_order, is_active
+                        FROM transaction_categories
+                        WHERE is_active = 1 AND type IN (%s, 'all')
+                        ORDER BY sort_order ASC, id ASC
+                    """, (cat_type,))
+                else:
+                    cursor.execute("""
+                        SELECT id, code, name, type, color, sort_order, is_active
+                        FROM transaction_categories
+                        WHERE is_active = 1
+                        ORDER BY sort_order ASC, id ASC
+                    """)
+                return jsonify({"status": "success", "data": cursor.fetchall()})
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
 # 广告商品下拉 — GET /api/options/advertising/products
 # ============================================================
 
