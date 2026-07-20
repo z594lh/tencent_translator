@@ -1662,7 +1662,7 @@ def generate_yesterday_reports():
 
     # SKU 利润（T-1，基于 orders 数据，不依赖 finances）
     yesterday = (today - timedelta(days=1)).strftime('%Y-%m-%d')
-    results['sku_profit'] = generate_sku_profit(yesterday, yesterday)
+    results['sku_profit'] = generate_sku_profit(yesterday)
 
     # 库存周转
     results['inventory_turnover'] = generate_inventory_turnover()
