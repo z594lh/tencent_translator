@@ -893,16 +893,23 @@ def generate_sku_profit(report_date, shop_id=None):
                     for r in cursor.fetchall():
                         sales_map[r['asin']] = r
 
-                    # 3. 预聚合广告费（按 advertised_asin）
+                    # 3. 预聚合广告数据（按 advertised_asin，含花费/归因销售额/归因订单数）
                     cursor.execute("""
-                        SELECT advertised_asin AS asin, COALESCE(SUM(cost), 0) AS ad_cost
+                        SELECT advertised_asin AS asin,
+                               COALESCE(SUM(cost), 0) AS ad_cost,
+                               COALESCE(SUM(sales_7d), 0) AS ad_sales,
+                               COALESCE(SUM(purchases_7d), 0) AS ad_orders
                         FROM amazon_ads_raw_reports
                         WHERE shop_id = %s AND report_date = %s AND report_type = 'spAdvertisedProduct'
                         GROUP BY advertised_asin
                     """, (sid, report_date))
                     ad_map = {}
                     for r in cursor.fetchall():
-                        ad_map[r['asin']] = float(r['ad_cost'] or 0)
+                        ad_map[r['asin']] = {
+                            'ad_cost': float(r['ad_cost'] or 0),
+                            'ad_sales': float(r['ad_sales'] or 0),
+                            'ad_orders': int(r['ad_orders'] or 0),
+                        }
 
                     # 4. 遍历所有产品，写入 sku_profit（每天每个 SKU 一条）
                     for prod in all_products:
@@ -920,8 +927,12 @@ def generate_sku_profit(report_date, shop_id=None):
                         if sales_qty > 0 and sales_amount > 0:
                             avg_price = sales_amount / sales_qty
 
-                        # 广告费
-                        ad_cost = Decimal(str(ad_map.get(asin, 0)))
+                        # 广告数据
+                        ad_data = ad_map.get(asin, {})
+                        ad_cost = Decimal(str(ad_data.get('ad_cost', 0)))
+                        ad_sales = Decimal(str(ad_data.get('ad_sales', 0)))
+                        ad_orders = int(ad_data.get('ad_orders', 0))
+                        ad_acos = (ad_cost / ad_sales) if ad_sales > 0 else Decimal('0')
 
                         # 成本（仅对有销售的 SKU 详细计算）
                         unit_costs = get_unit_costs(cursor, sku, exchange_rate, shop_id=sid)
@@ -965,8 +976,9 @@ def generate_sku_profit(report_date, shop_id=None):
                                 sales_qty, sales_amount, avg_selling_price,
                                 product_cost, fba_fees, ad_cost, headway_cost, platform_fees,
                                 refund_amount, other_fees,
-                                gross_profit, net_profit, profit_margin
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                gross_profit, net_profit, profit_margin,
+                                ad_sales, ad_orders, ad_acos
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON DUPLICATE KEY UPDATE
                                 sales_qty = VALUES(sales_qty),
                                 sales_amount = VALUES(sales_amount),
@@ -981,6 +993,9 @@ def generate_sku_profit(report_date, shop_id=None):
                                 gross_profit = VALUES(gross_profit),
                                 net_profit = VALUES(net_profit),
                                 profit_margin = VALUES(profit_margin),
+                                ad_sales = VALUES(ad_sales),
+                                ad_orders = VALUES(ad_orders),
+                                ad_acos = VALUES(ad_acos),
                                 updated_at = NOW()
                         """, (
                             sid, asin, sku, product_name, report_date,
@@ -988,7 +1003,8 @@ def generate_sku_profit(report_date, shop_id=None):
                             float(product_cost), float(fba_fees), float(ad_cost),
                             float(headway_cost), float(platform_fees),
                             float(refund_amount), float(other_fees),
-                            float(gross_profit), float(net_profit), float(profit_margin)
+                            float(gross_profit), float(net_profit), float(profit_margin),
+                            float(ad_sales), ad_orders, float(ad_acos)
                         ))
                         total_affected += 1
 

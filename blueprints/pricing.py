@@ -401,7 +401,7 @@ def calculate_price():
     请求体:
       seller_sku           必填  SKU
        target_profit_rate   必填  目标利润率(小数)
-       ad_rate              必填  广告费率(ACoS)
+       ad_rate              必填  广告费率(TACOS = 广告费/总销售额)
        refund_rate          必填  退货率
        shop_id              可选  店铺ID，传则自动取当前售价调 Amazon API 获取实时费率
     """
@@ -475,7 +475,7 @@ def calculate_profit_rate_api():
     请求体:
       seller_sku      必填  SKU
       selling_price    必填  实际售价(USD)
-      ad_rate          可选  广告费率(ACoS)，默认 0.20
+      ad_rate          可选  广告费率(TACOS = 广告费/总销售额)，默认 0.20
       refund_rate      可选  退货率，默认 0.03
       shop_id          可选  店铺ID，传则自动调 Amazon API 获取实时费率
     """

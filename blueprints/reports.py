@@ -603,7 +603,11 @@ def sku_profit_summary():
                         SUM(net_profit) AS total_net_profit,
                         AVG(profit_margin) AS avg_profit_margin,
                         SUM(ad_cost) AS total_ad_cost,
-                        SUM(headway_cost) AS total_headway_cost
+                        SUM(headway_cost) AS total_headway_cost,
+                        SUM(ad_sales) AS total_ad_sales,
+                        SUM(ad_orders) AS total_ad_orders,
+                        CASE WHEN SUM(ad_sales) > 0 THEN SUM(ad_cost) / SUM(ad_sales) ELSE 0 END AS avg_ad_acos,
+                        CASE WHEN SUM(sales_amount) > 0 THEN SUM(ad_cost) / SUM(sales_amount) ELSE 0 END AS tacos
                     FROM sku_profit
                     {where_sql}
                 """, params)
@@ -671,7 +675,12 @@ def sku_profit_top():
                         SUM(sales_amount) AS sales_amount,
                         SUM(net_profit) AS net_profit,
                         AVG(profit_margin) AS profit_margin,
-                        SUM(gross_profit) AS gross_profit
+                        SUM(gross_profit) AS gross_profit,
+                        SUM(ad_cost) AS ad_cost,
+                        SUM(ad_sales) AS ad_sales,
+                        SUM(ad_orders) AS ad_orders,
+                        CASE WHEN SUM(ad_sales) > 0 THEN SUM(ad_cost) / SUM(ad_sales) ELSE 0 END AS ad_acos,
+                        CASE WHEN SUM(sales_amount) > 0 THEN SUM(ad_cost) / SUM(sales_amount) ELSE 0 END AS tacos
                     FROM sku_profit
                     {where_sql}
                     GROUP BY asin, sku, product_name
@@ -743,7 +752,11 @@ def sku_profit_aggregate():
                         SUM(refund_amount) AS refund_amount,
                         SUM(gross_profit) AS gross_profit,
                         SUM(net_profit) AS net_profit,
-                        CASE WHEN SUM(sales_amount) > 0 THEN SUM(net_profit) / SUM(sales_amount) ELSE 0 END AS profit_margin
+                        CASE WHEN SUM(sales_amount) > 0 THEN SUM(net_profit) / SUM(sales_amount) ELSE 0 END AS profit_margin,
+                        SUM(ad_sales) AS ad_sales,
+                        SUM(ad_orders) AS ad_orders,
+                        CASE WHEN SUM(ad_sales) > 0 THEN SUM(ad_cost) / SUM(ad_sales) ELSE 0 END AS ad_acos,
+                        CASE WHEN SUM(sales_amount) > 0 THEN SUM(ad_cost) / SUM(sales_amount) ELSE 0 END AS tacos
                     FROM sku_profit
                     {where_sql}
                     GROUP BY asin, sku, product_name
