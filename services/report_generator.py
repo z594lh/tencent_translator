@@ -270,20 +270,46 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
         return None
 
     # 1. 按 purchase_date 汇总 Shipment 收入 + 费用（仅已结算部分）
+    #    使用子查询去重：同一订单在 finances 中可能同时存在
+    #    DEFERRED / DEFERRED_RELEASED / RELEASED 多条记录，
+    #    按 RELEASED > DEFERRED_RELEASED > DEFERRED 优先级取唯一一条
     cursor.execute("""
         SELECT
             COUNT(DISTINCT o.amazon_order_id) AS settled_order_count,
-            COALESCE(SUM(f.product_charges), 0) AS total_product_charges,
-            COALESCE(SUM(f.total_amount), 0) AS total_net_sales,
-            COALESCE(SUM(f.fba_fees), 0) AS total_fba_fees,
-            COALESCE(SUM(f.commission), 0) AS total_commission
+            COALESCE(SUM(dedup.product_charges), 0) AS total_product_charges,
+            COALESCE(SUM(dedup.total_amount), 0) AS total_net_sales,
+            COALESCE(SUM(dedup.fba_fees), 0) AS total_fba_fees,
+            COALESCE(SUM(dedup.commission), 0) AS total_commission
         FROM amazon_orders o
-        JOIN amazon_order_finances f
-            ON o.amazon_order_id = f.amazon_order_id COLLATE utf8mb4_unicode_ci
-            AND o.shop_id = f.shop_id
+        JOIN (
+            SELECT amazon_order_id, shop_id,
+                   COALESCE(
+                       MAX(CASE WHEN transaction_status = 'RELEASED' THEN product_charges END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED_RELEASED' THEN product_charges END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED' THEN product_charges END)
+                   ) AS product_charges,
+                   COALESCE(
+                       MAX(CASE WHEN transaction_status = 'RELEASED' THEN total_amount END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED_RELEASED' THEN total_amount END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED' THEN total_amount END)
+                   ) AS total_amount,
+                   COALESCE(
+                       MAX(CASE WHEN transaction_status = 'RELEASED' THEN fba_fees END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED_RELEASED' THEN fba_fees END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED' THEN fba_fees END)
+                   ) AS fba_fees,
+                   COALESCE(
+                       MAX(CASE WHEN transaction_status = 'RELEASED' THEN commission END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED_RELEASED' THEN commission END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED' THEN commission END)
+                   ) AS commission
+            FROM amazon_order_finances
+            WHERE transaction_type = 'Shipment'
+            GROUP BY amazon_order_id, shop_id
+        ) dedup ON o.amazon_order_id = dedup.amazon_order_id COLLATE utf8mb4_unicode_ci
+                AND o.shop_id = dedup.shop_id
         WHERE o.shop_id = %s
           AND DATE(o.purchase_date) = %s
-          AND f.transaction_type = 'Shipment'
           AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
     """, (sid, report_date))
     ship_row = cursor.fetchone()
@@ -306,12 +332,24 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
         total_commission = Decimal('0')
 
     # 2. 获取该日期已结算订单的 items，解析 SKU 级别数据
+    #    同样用子查询去重，避免同一订单多状态导致 SKU 数量翻倍
     cursor.execute("""
-        SELECT f.items_json FROM amazon_order_finances f
+        SELECT dedup.items_json
+        FROM (
+            SELECT amazon_order_id, shop_id,
+                   COALESCE(
+                       MAX(CASE WHEN transaction_status = 'RELEASED' THEN items_json END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED_RELEASED' THEN items_json END),
+                       MAX(CASE WHEN transaction_status = 'DEFERRED' THEN items_json END)
+                   ) AS items_json
+            FROM amazon_order_finances
+            WHERE transaction_type = 'Shipment'
+            GROUP BY amazon_order_id, shop_id
+        ) dedup
         JOIN amazon_orders o
-            ON o.amazon_order_id = f.amazon_order_id COLLATE utf8mb4_unicode_ci AND o.shop_id = f.shop_id
+            ON o.amazon_order_id = dedup.amazon_order_id COLLATE utf8mb4_unicode_ci
+            AND o.shop_id = dedup.shop_id
         WHERE o.shop_id = %s AND DATE(o.purchase_date) = %s
-          AND f.transaction_type = 'Shipment'
           AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
     """, (sid, report_date))
     txn_rows = cursor.fetchall()
