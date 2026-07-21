@@ -393,7 +393,7 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
             print(f"[Report] SKU {sku} 成本计算异常: {e}")
             continue
 
-    # 5. 退款（按订单 purchase_date 汇总 Refund）
+    # 5. 退款（按订单 purchase_date 汇总 Refund，仅取 RELEASED 实际到账金额）
     cursor.execute("""
         SELECT COALESCE(SUM(ABS(f.total_amount)), 0) AS refund_sum
         FROM amazon_order_finances f
@@ -402,6 +402,7 @@ def _generate_settled_daily(cursor, sid, report_date, exchange_rate):
         WHERE o.shop_id = %s
           AND DATE(o.purchase_date) = %s
           AND f.transaction_type = 'Refund'
+          AND f.transaction_status = 'RELEASED'
     """, (sid, report_date))
     refund_row = cursor.fetchone()
     refund_amount = Decimal(str(refund_row['refund_sum'] or 0))
