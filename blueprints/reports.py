@@ -5,10 +5,10 @@
 
 前端接口:
   经营报表:
-    GET    /api/reports/business                   分页查询经营报表（日/周/月）
+    GET    /api/reports/business                   分页查询经营报表（日/周/月，实时聚合日报）
     GET    /api/reports/business/summary            经营报表汇总统计
     GET    /api/reports/business/trend              经营趋势（销售额/毛利走势）
-    POST   /api/reports/business/generate           手动触发生成
+    POST   /api/reports/business/generate           手动生成经营日报
   SKU 利润表:
     GET    /api/reports/sku-profit                  分页查询 SKU 利润列表
     GET    /api/reports/sku-profit/summary          SKU 利润汇总统计
@@ -19,16 +19,20 @@
     GET    /api/reports/inventory-turnover/stats     库存周转统计
     POST   /api/reports/inventory-turnover/generate  手动触发生成
     POST   /api/reports/inventory-turnover/batch-update-status  批量更新库存状态
+  SKU 销售数据:
+    GET    /api/reports/sku-sales                    分页查询 SKU 销售数据列表
+    POST   /api/reports/sku-sales/generate           手动触发全量生成
+    POST   /api/reports/sku-sales/generate/<sku>     手动触发单个 SKU 生成
   数据导入:
     POST   /api/reports/ad-spend/import              导入广告费明细
     POST   /api/reports/refund/import                导入退款明细
   生成日志:
     GET    /api/reports/generation-logs              查询报表生成日志
   广告效果报表:
-    GET    /api/reports/advertising                  分页查询广告效果报表
+    GET    /api/reports/advertising                  分页查询广告效果报表（日/周/月，实时聚合日报）
     GET    /api/reports/advertising/summary          广告效果汇总统计
     GET    /api/reports/advertising/trend            广告效果趋势
-    POST   /api/reports/advertising/generate         手动触发生成
+    POST   /api/reports/advertising/generate         手动生成广告日报
   一键生成:
     POST   /api/reports/generate-yesterday           一键生成昨日全部报表
 
@@ -42,14 +46,11 @@ from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
 from services.report_generator import (
     generate_business_daily,
-    generate_business_weekly,
-    generate_business_monthly,
     generate_sku_profit,
+    generate_sku_sales,
     generate_inventory_turnover,
     generate_yesterday_reports,
     generate_advertising_daily,
-    generate_advertising_weekly,
-    generate_advertising_monthly,
 )
 
 reports_bp = Blueprint('reports', __name__, url_prefix='/api')
@@ -444,42 +445,21 @@ def business_trend():
 @permission_required('reports:generate')
 def trigger_business_report():
     """
-    手动触发经营报表生成
-
-    简介: 支持按日/周/月维度手动生成，生成结果直接写入 report_business 表。
+    手动触发经营日报生成
 
     请求体 (JSON):
-        report_type  (必填) daily / weekly / monthly
-        period       (daily/monthly 必填) 日期，如 2026-05-18 或 2026-05
-        period_start (weekly 必填) 周开始日期，如 2026-05-11
-        period_end   (weekly 必填) 周结束日期，如 2026-05-17
-        shop_id      (可选) 指定店铺，不传则所有店铺
+        period   (必填) 日期，如 2026-05-18
+        shop_id  (可选) 指定店铺，不传则所有店铺
     """
     try:
         data = request.get_json() or {}
-        report_type = data.get('report_type', '').strip()
+        period = data.get('period', '').strip()
         shop_id = data.get('shop_id')
 
-        if report_type not in ('daily', 'weekly', 'monthly'):
-            return jsonify({"status": "error", "message": "report_type 必须是 daily/weekly/monthly"}), 400
+        if not period:
+            return jsonify({"status": "error", "message": "period 参数必填（如 2026-05-18）"}), 400
 
-        if report_type == 'daily':
-            period = data.get('period', '').strip()
-            if not period:
-                return jsonify({"status": "error", "message": "daily 类型需要 period 参数（如 2026-05-18）"}), 400
-            result = generate_business_daily(period, shop_id)
-        elif report_type == 'weekly':
-            period_start = data.get('period_start', '').strip()
-            period_end = data.get('period_end', '').strip()
-            if not period_start or not period_end:
-                return jsonify({"status": "error", "message": "weekly 类型需要 period_start 和 period_end"}), 400
-            result = generate_business_weekly(period_start, period_end, shop_id)
-        else:
-            period = data.get('period', '').strip()
-            if not period:
-                return jsonify({"status": "error", "message": "monthly 类型需要 period 参数（如 2026-05）"}), 400
-            result = generate_business_monthly(period, shop_id)
-
+        result = generate_business_daily(period, shop_id)
         return jsonify({"status": "success", "message": "生成完成", "data": result})
     except Exception as e:
         print(f"[trigger_business_report] error: {e}")
@@ -1058,6 +1038,181 @@ def batch_update_inventory_status():
             conn.close()
     except Exception as e:
         print(f"[batch_update_inventory_status] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# 3.5 SKU 销售数据
+# ============================================================
+
+@reports_bp.route('/reports/sku-sales', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def list_sku_sales():
+    """
+    分页查询 SKU 销售数据列表
+
+    查询参数:
+        keyword     (可选) 模糊搜索 ASIN/SKU/品名
+        sku         (可选) 精确 SKU
+        shop_id     (可选) 店铺ID
+        sort_by     (可选) 排序字段，默认 sales_30d
+        sort_dir    (可选) asc/desc，默认 desc
+        page        (可选) 页码，默认 1
+        page_size   (可选) 每页条数，默认 20，最大 100
+    """
+    try:
+        keyword = request.args.get('keyword', '').strip() or None
+        sku = request.args.get('sku', '').strip() or None
+        shop_id = _get_shop_id_optional()
+        sort_by = request.args.get('sort_by', 'sales_30d').strip()
+        sort_dir = request.args.get('sort_dir', 'desc').strip().lower()
+        page, page_size = _parse_pagination()
+
+        allowed_sorts = {
+            'stock',
+            'total_revenue_1d', 'total_revenue_3d', 'total_revenue_7d', 'total_revenue_14d', 'total_revenue_30d',
+            'sales_1d', 'sales_3d', 'sales_7d', 'sales_14d', 'sales_30d',
+            'sales_ad_1d', 'sales_ad_3d', 'sales_ad_7d', 'sales_ad_14d', 'sales_ad_30d',
+            'sales_natural_1d', 'sales_natural_3d', 'sales_natural_7d', 'sales_natural_14d', 'sales_natural_30d',
+            'ad_revenue_1d', 'ad_revenue_3d', 'ad_revenue_7d', 'ad_revenue_14d', 'ad_revenue_30d',
+            'natural_revenue_1d', 'natural_revenue_3d', 'natural_revenue_7d', 'natural_revenue_14d', 'natural_revenue_30d',
+            'ad_cost_1d', 'ad_cost_3d', 'ad_cost_7d', 'ad_cost_14d', 'ad_cost_30d',
+            'cpc', 'cvr', 'acos', 'tacos',
+            'sell_price', 'promo_price',
+            'profit_1d', 'profit_rate_1d', 'profit_3d', 'profit_rate_3d',
+            'profit_7d', 'profit_rate_7d', 'profit_14d', 'profit_rate_14d',
+            'profit_30d', 'profit_rate_30d',
+            'report_date',
+        }
+        if sort_by not in allowed_sorts:
+            sort_by = 'sales_30d'
+        if sort_dir not in ('asc', 'desc'):
+            sort_dir = 'desc'
+
+        conn = _get_conn()
+        try:
+            where_clauses = ["report_date = (SELECT MAX(report_date) FROM report_sku_sales AS sub WHERE sub.shop_id = report_sku_sales.shop_id AND sub.sku = report_sku_sales.sku)"]
+            params = []
+
+            if shop_id is not None:
+                where_clauses.append("shop_id = %s")
+                params.append(shop_id)
+            if keyword:
+                where_clauses.append("(asin LIKE %s OR sku LIKE %s OR product_name LIKE %s)")
+                params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+            if sku:
+                where_clauses.append("sku = %s")
+                params.append(sku)
+
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) AS total FROM report_sku_sales {where_sql}", params)
+                total = cursor.fetchone()['total']
+
+            offset = (page - 1) * page_size
+            with conn.cursor() as cursor:
+                sql = f"""
+                    SELECT * FROM report_sku_sales
+                    {where_sql}
+                    ORDER BY {sort_by} {sort_dir}
+                    LIMIT %s OFFSET %s
+                """
+                cursor.execute(sql, params + [page_size, offset])
+                rows = cursor.fetchall()
+
+            for row in rows:
+                for k in ('report_date', 'created_at', 'updated_at'):
+                    if k in row and row[k] is not None:
+                        row[k] = str(row[k])
+                decimal_cols = (
+                    'total_revenue_1d', 'total_revenue_3d', 'total_revenue_7d', 'total_revenue_14d', 'total_revenue_30d',
+                    'ad_revenue_1d', 'ad_revenue_3d', 'ad_revenue_7d', 'ad_revenue_14d', 'ad_revenue_30d',
+                    'natural_revenue_1d', 'natural_revenue_3d', 'natural_revenue_7d', 'natural_revenue_14d', 'natural_revenue_30d',
+                    'ad_cost_1d', 'ad_cost_3d', 'ad_cost_7d', 'ad_cost_14d', 'ad_cost_30d',
+                    'cpc', 'cvr', 'acos', 'tacos',
+                    'sell_price', 'promo_price',
+                    'profit_1d', 'profit_rate_1d', 'profit_3d', 'profit_rate_3d',
+                    'profit_7d', 'profit_rate_7d', 'profit_14d', 'profit_rate_14d',
+                    'profit_30d', 'profit_rate_30d',
+                )
+                for k in decimal_cols:
+                    if k in row and row[k] is not None:
+                        row[k] = float(row[k])
+
+            return jsonify({
+                "status": "success",
+                "data": {
+                    "list": rows,
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                }
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[list_sku_sales] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/sku-sales/generate', methods=['POST'])
+@login_required
+@permission_required('reports:generate')
+def trigger_sku_sales():
+    """
+    手动触发 SKU 销售数据全量生成
+
+    请求体 (JSON):
+        report_date  (可选) 报告生成日期（PDT时间），默认 PDT 昨天，格式 YYYY-MM-DD
+        shop_id      (可选) 指定店铺
+    """
+    try:
+        data = request.get_json() or {}
+        report_date = data.get('report_date', '').strip() or None
+        shop_id = data.get('shop_id')
+
+        if not report_date:
+            from datetime import timezone
+            pdt_today = datetime.now(timezone(timedelta(hours=-7))).date()
+            report_date = (pdt_today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+        result = generate_sku_sales(report_date, shop_id)
+        return jsonify({"status": "success", "message": f"生成完成，{result['affected_rows']} 条", "data": result})
+    except Exception as e:
+        print(f"[trigger_sku_sales] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/sku-sales/generate/<sku>', methods=['POST'])
+@login_required
+@permission_required('reports:generate')
+def trigger_sku_sales_single(sku):
+    """
+    手动触发单个 SKU 的销售数据生成
+
+    请求体 (JSON):
+        report_date  (可选) 报告生成日期（PDT时间），默认 PDT 昨天
+        shop_id      (必填) 店铺ID
+    """
+    try:
+        data = request.get_json() or {}
+        report_date = data.get('report_date', '').strip() or None
+        shop_id = data.get('shop_id')
+
+        if not shop_id:
+            return jsonify({"status": "error", "message": "shop_id 必填"}), 400
+        if not report_date:
+            from datetime import timezone
+            pdt_today = datetime.now(timezone(timedelta(hours=-7))).date()
+            report_date = (pdt_today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+        # 限制生成范围到指定 SKU
+        result = generate_sku_sales(report_date, shop_id, sku_filter=sku)
+        return jsonify({"status": "success", "message": "生成完成", "data": result})
+    except Exception as e:
+        print(f"[trigger_sku_sales_single] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -1884,40 +2039,21 @@ def advertising_daily_products(date, campaign_id, ad_group_id):
 @permission_required('reports_advertising:generate')
 def trigger_advertising_report():
     """
-    手动触发广告效果报表生成
+    手动触发广告效果日报生成
 
     请求体 (JSON):
-        report_type   (必填) daily / weekly / monthly
-        period        (daily/monthly 必填) 日期
-        period_start  (weekly 必填) 周开始日期
-        period_end    (weekly 必填) 周结束日期
-        shop_id       (可选) 指定店铺
+        period   (必填) 日期，如 2026-05-18
+        shop_id  (可选) 指定店铺
     """
     try:
         data = request.get_json() or {}
-        report_type = data.get('report_type', '').strip()
+        period = data.get('period', '').strip()
         shop_id = data.get('shop_id')
 
-        if report_type not in ('daily', 'weekly', 'monthly'):
-            return jsonify({"status": "error", "message": "report_type 必须是 daily/weekly/monthly"}), 400
+        if not period:
+            return jsonify({"status": "error", "message": "period 参数必填"}), 400
 
-        if report_type == 'daily':
-            period = data.get('period', '').strip()
-            if not period:
-                return jsonify({"status": "error", "message": "daily 类型需要 period 参数"}), 400
-            result = generate_advertising_daily(period, shop_id)
-        elif report_type == 'weekly':
-            period_start = data.get('period_start', '').strip()
-            period_end = data.get('period_end', '').strip()
-            if not period_start or not period_end:
-                return jsonify({"status": "error", "message": "weekly 类型需要 period_start 和 period_end"}), 400
-            result = generate_advertising_weekly(period_start, period_end, shop_id)
-        else:
-            period = data.get('period', '').strip()
-            if not period:
-                return jsonify({"status": "error", "message": "monthly 类型需要 period 参数"}), 400
-            result = generate_advertising_monthly(period, shop_id)
-
+        result = generate_advertising_daily(period, shop_id)
         return jsonify({"status": "success", "message": "生成完成", "data": result})
     except Exception as e:
         print(f"[trigger_advertising_report] error: {e}")
