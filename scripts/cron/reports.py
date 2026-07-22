@@ -22,7 +22,7 @@ from scripts.cron import _now_str
 
 
 def run_daily(start=None, end=None):
-    from services.report_generator import generate_business_daily, generate_inventory_turnover
+    from services.report_generator import generate_business_daily, generate_sku_sales, generate_inventory_turnover
     now_str = _now_str()
     today = datetime.now().date()
 
@@ -45,6 +45,12 @@ def run_daily(start=None, end=None):
             print(f"[{now_str}] [Cron] 经营日报 {report_date} 异常: {e}")
 
     yesterday = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+    try:
+        generate_sku_sales(yesterday)
+        print(f"[{now_str}] [Cron] SKU销售汇总 {yesterday} 完成")
+    except Exception as e:
+        print(f"[{now_str}] [Cron] SKU销售汇总异常: {e}")
+
     try:
         generate_inventory_turnover()
     except Exception as e:
