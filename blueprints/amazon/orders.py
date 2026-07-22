@@ -52,17 +52,19 @@ def amazon_orders():
     查询参数（可选）:
         order_status       - 按订单状态筛选
         amazon_order_id    - 按订单号精确筛选
-        buyer_name         - 按买家姓名模糊筛选
-        purchase_date_from - 下单开始日期
-        purchase_date_to   - 下单结束日期
-        page               - 页码，默认 1
-        page_size          - 每页数量，默认 20
+         buyer_name         - 按买家姓名模糊筛选
+         sku                - 按商品SKU筛选
+         purchase_date_from - 下单开始日期
+         purchase_date_to   - 下单结束日期
+         page               - 页码，默认 1
+         page_size          - 每页数量，默认 20
     """
     try:
         shop_id = _require_shop_id()
         order_status = request.args.get('order_status', '').strip() or None
         amazon_order_id = request.args.get('amazon_order_id', '').strip() or None
         buyer_name = request.args.get('buyer_name', '').strip() or None
+        sku = request.args.get('sku', '').strip() or None
         purchase_date_from = request.args.get('purchase_date_from', '').strip() or None
         purchase_date_to = request.args.get('purchase_date_to', '').strip() or None
         page = int(request.args.get('page', 1))
@@ -78,6 +80,7 @@ def amazon_orders():
             order_status=order_status,
             amazon_order_id=amazon_order_id,
             buyer_name=buyer_name,
+            sku=sku,
             purchase_date_from=purchase_date_from,
             purchase_date_to=purchase_date_to,
             page=page,
@@ -355,13 +358,14 @@ def _sync_order_items(shop_id, order_id):
 
 
 def _get_orders(shop_id, order_status=None, amazon_order_id=None, buyer_name=None,
-                purchase_date_from=None, purchase_date_to=None, page=1, page_size=20):
+                sku=None, purchase_date_from=None, purchase_date_to=None, page=1, page_size=20):
     """从数据库查询订单列表（支持分页）"""
     return get_orders_from_db(
         shop_id=shop_id,
         order_status=order_status,
         amazon_order_id=amazon_order_id,
         buyer_name=buyer_name,
+        sku=sku,
         purchase_date_from=purchase_date_from,
         purchase_date_to=purchase_date_to,
         page=page,
@@ -910,7 +914,7 @@ def sync_order_items_to_db(shop_id, order_id, marketplace_id, items):
 
 
 def get_orders_from_db(shop_id, order_status=None, amazon_order_id=None,
-                       buyer_name=None, purchase_date_from=None, purchase_date_to=None,
+                       buyer_name=None, sku=None, purchase_date_from=None, purchase_date_to=None,
                        page=1, page_size=20):
     """
     从数据库分页查询订单列表，每个订单附带商品汇总：
@@ -933,6 +937,9 @@ def get_orders_from_db(shop_id, order_status=None, amazon_order_id=None,
             if buyer_name:
                 conditions.append("o.buyer_name LIKE %s")
                 params.append(f"%{buyer_name}%")
+            if sku:
+                conditions.append("EXISTS (SELECT 1 FROM amazon_order_items i WHERE i.shop_id = o.shop_id AND i.amazon_order_id = o.amazon_order_id AND i.seller_sku = %s)")
+                params.append(sku)
             if purchase_date_from:
                 conditions.append("o.purchase_date >= %s")
                 params.append(purchase_date_from)
