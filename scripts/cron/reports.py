@@ -46,8 +46,8 @@ def run_daily(start=None, end=None):
 
     yesterday = (today - timedelta(days=1)).strftime('%Y-%m-%d')
     try:
-        generate_sku_sales(yesterday)
-        print(f"[{now_str}] [Cron] SKU销售汇总 {yesterday} 完成")
+        generate_sku_sales(today.strftime('%Y-%m-%d'))
+        print(f"[{now_str}] [Cron] SKU销售汇总 {today} 完成")
     except Exception as e:
         print(f"[{now_str}] [Cron] SKU销售汇总异常: {e}")
 

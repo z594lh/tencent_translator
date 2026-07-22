@@ -1175,8 +1175,7 @@ def trigger_sku_sales():
 
         if not report_date:
             from datetime import timezone
-            pdt_today = datetime.now(timezone(timedelta(hours=-7))).date()
-            report_date = (pdt_today - timedelta(days=1)).strftime('%Y-%m-%d')
+            report_date = datetime.now(timezone(timedelta(hours=-7))).date().strftime('%Y-%m-%d')
 
         result = generate_sku_sales(report_date, shop_id)
         return jsonify({"status": "success", "message": f"生成完成，{result['affected_rows']} 条", "data": result})
@@ -1205,8 +1204,7 @@ def trigger_sku_sales_single(sku):
             return jsonify({"status": "error", "message": "shop_id 必填"}), 400
         if not report_date:
             from datetime import timezone
-            pdt_today = datetime.now(timezone(timedelta(hours=-7))).date()
-            report_date = (pdt_today - timedelta(days=1)).strftime('%Y-%m-%d')
+            report_date = datetime.now(timezone(timedelta(hours=-7))).date().strftime('%Y-%m-%d')
 
         # 限制生成范围到指定 SKU
         result = generate_sku_sales(report_date, shop_id, sku_filter=sku)
