@@ -965,16 +965,6 @@ def generate_sku_sales(report_date, shop_id=None, sku_filter=None):
     """
     report_type = 'sku_sales'
     period = report_date
-    today = datetime.strptime(report_date, '%Y-%m-%d').date()
-
-    windows = {
-        '1d':  (today, today),
-        '3d':  (today - timedelta(days=2), today),
-        '7d':  (today - timedelta(days=6), today),
-        '14d': (today - timedelta(days=13), today),
-        '30d': (today - timedelta(days=29), today),
-    }
-    window_keys = ['1d', '3d', '7d', '14d', '30d']
 
     conn = get_db_connection()
     try:
@@ -994,6 +984,22 @@ def generate_sku_sales(report_date, shop_id=None, sku_filter=None):
                 with conn.cursor() as cursor:
                     if exchange_rate is None:
                         exchange_rate = get_exchange_rate(cursor)
+
+                    # 数据窗口终点: report_business 最新已生成日期（确保数据完整）
+                    cursor.execute(
+                        "SELECT MAX(report_date) AS latest FROM report_business WHERE report_type='daily' AND shop_id=%s AND total_sales > 0",
+                        (sid,))
+                    row = cursor.fetchone()
+                    data_end = row['latest'] if row and row['latest'] else datetime.strptime(report_date, '%Y-%m-%d').date()
+
+                    windows = {
+                        '1d':  (data_end, data_end),
+                        '3d':  (data_end - timedelta(days=2), data_end),
+                        '7d':  (data_end - timedelta(days=6), data_end),
+                        '14d': (data_end - timedelta(days=13), data_end),
+                        '30d': (data_end - timedelta(days=29), data_end),
+                    }
+                    window_keys = ['1d', '3d', '7d', '14d', '30d']
 
                     # ---- 1. 活跃 SKU 列表 ----
                     if sku_filter:
@@ -1040,7 +1046,7 @@ def generate_sku_sales(report_date, shop_id=None, sku_filter=None):
                           AND o.order_status NOT IN ('Canceled', 'PendingAvailability')
                         GROUP BY oi.seller_sku
                     """, (
-                        str(today),
+                        str(data_end),
                         str(windows['3d'][0]), str(windows['3d'][1]),
                         str(windows['7d'][0]), str(windows['7d'][1]),
                         str(windows['14d'][0]), str(windows['14d'][1]),
@@ -1079,23 +1085,23 @@ def generate_sku_sales(report_date, shop_id=None, sku_filter=None):
                           AND report_date BETWEEN %s AND %s
                         GROUP BY advertised_sku
                     """, (
-                        str(today),
+                        str(data_end),
                         str(windows['3d'][0]), str(windows['3d'][1]),
                         str(windows['7d'][0]), str(windows['7d'][1]),
                         str(windows['14d'][0]), str(windows['14d'][1]),
                         str(windows['30d'][0]), str(windows['30d'][1]),
-                        str(today),
+                        str(data_end),
                         str(windows['3d'][0]), str(windows['3d'][1]),
                         str(windows['7d'][0]), str(windows['7d'][1]),
                         str(windows['14d'][0]), str(windows['14d'][1]),
                         str(windows['30d'][0]), str(windows['30d'][1]),
-                        str(today),
+                        str(data_end),
                         str(windows['3d'][0]), str(windows['3d'][1]),
                         str(windows['7d'][0]), str(windows['7d'][1]),
                         str(windows['14d'][0]), str(windows['14d'][1]),
                         str(windows['30d'][0]), str(windows['30d'][1]),
                         str(windows['7d'][0]), str(windows['7d'][1]),
-                        sid, str(windows['30d'][0]), str(today),
+                        sid, str(windows['30d'][0]), str(data_end),
                     ))
                     ad_map = {}
                     for r in cursor.fetchall():
@@ -1127,7 +1133,7 @@ def generate_sku_sales(report_date, shop_id=None, sku_filter=None):
                         WHERE shop_id = %s AND report_date BETWEEN %s AND %s
                         GROUP BY sku
                     """, (
-                        str(today), str(today),
+                        str(data_end), str(data_end),
                         str(windows['3d'][0]), str(windows['3d'][1]),
                         str(windows['3d'][0]), str(windows['3d'][1]),
                         str(windows['7d'][0]), str(windows['7d'][1]),
@@ -1136,7 +1142,7 @@ def generate_sku_sales(report_date, shop_id=None, sku_filter=None):
                         str(windows['14d'][0]), str(windows['14d'][1]),
                         str(windows['30d'][0]), str(windows['30d'][1]),
                         str(windows['30d'][0]), str(windows['30d'][1]),
-                        sid, str(windows['30d'][0]), str(today),
+                        sid, str(windows['30d'][0]), str(data_end),
                     ))
                     profit_map = {}
                     for r in cursor.fetchall():
@@ -1192,7 +1198,7 @@ def generate_sku_sales(report_date, shop_id=None, sku_filter=None):
                         def pval(w, k): return d(p[k + w])
 
                         vals = (
-                            sid, sku, asin, pname, str(today), inventory_map.get(sku, 0),
+                            sid, sku, asin, pname, str(data_end), inventory_map.get(sku, 0),
                             float(d(p['a1'])), float(d(p['a3'])), float(d(p['a7'])), float(d(p['a14'])), float(d(p['a30'])),
                             s['s1'], s['s3'], s['s7'], s['s14'], s['s30'],
                             int(a['pur1'] or 0), int(a['pur3'] or 0), int(a['pur7'] or 0), int(a['pur14'] or 0), int(a['pur30'] or 0),
