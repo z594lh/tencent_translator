@@ -17,9 +17,12 @@ CPC 广告管理 — Flask Blueprint + 实体同步服务
 """
 import json
 import time
+import io
+import csv
 from decimal import Decimal
 from datetime import datetime, timedelta
 
+import openpyxl
 from flask import Blueprint, request, jsonify, g
 
 from services.mysql_service import get_db_connection
@@ -1341,12 +1344,47 @@ def update_keyword(keyword_id):
 def keyword_bid_recommendations():
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
+    campaign_id = body.get("campaign_id")
+    ad_group_id = body.get("ad_group_id")
+    keywords = body.get("keywords", [])
     if not shop_id:
         return jsonify({"status": "error", "message": "缺少 shop_id"}), 400
+    if not campaign_id or not ad_group_id:
+        return jsonify({"status": "error", "message": "缺少 campaign_id 或 ad_group_id"}), 400
     try:
         client = get_ads_api_client(int(shop_id))
-        resp = client.get_keyword_recommendations(body.get("payload", {}))
-        return jsonify({"status": "success", "data": resp})
+        payload = {
+            "campaignId": campaign_id,
+            "adGroupId": ad_group_id,
+            "recommendationType": "TARGETING_EXPRESSION",
+            "targetingExpressions": [
+                {
+                    "expressionType": "KEYWORD",
+                    "keywordText": kw.get("keywordText"),
+                    "matchType": kw.get("matchType"),
+                }
+                for kw in keywords
+            ],
+        }
+        resp = client._request(
+            "POST", "/sp/targets/bid/recommendations",
+            json_data=payload,
+        )
+        recommendations = resp.get("bidRecommendations", [])
+        result = []
+        for rec in recommendations:
+            expr = rec.get("targetingExpression") or {}
+            item = {
+                "keywordText": expr.get("keywordText"),
+                "matchType": expr.get("matchType"),
+                "suggestedBid": rec.get("suggestedBid"),
+                "suggestedBidRange": {
+                    "low": rec.get("rangeStart"),
+                    "high": rec.get("rangeEnd"),
+                },
+            }
+            result.append(item)
+        return jsonify({"status": "success", "data": result})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -1355,15 +1393,135 @@ def keyword_bid_recommendations():
 def create_keywords():
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
+    campaign_id = body.get("campaign_id")
+    ad_group_id = body.get("ad_group_id")
     keywords = body.get("keywords", [])
     if not shop_id or not keywords:
         return jsonify({"status": "error", "message": "缺少 shop_id 或 keywords"}), 400
+
+    transformed = []
+    null_bid_texts = []
+    for kw in keywords:
+        item = {
+            "campaignId": campaign_id,
+            "adGroupId": ad_group_id,
+            "keywordText": kw.get("keywordText"),
+            "matchType": kw.get("matchType"),
+            "state": kw.get("state", "enabled"),
+        }
+        bid = kw.get("bid")
+        if bid is not None:
+            item["bid"] = float(bid)
+        else:
+            null_bid_texts.append(kw.get("keywordText", ""))
+        transformed.append(item)
+
+    if null_bid_texts:
+        return jsonify({
+            "status": "error",
+            "message": f"以下关键词缺少 bid: {', '.join(null_bid_texts)}。请先调用 /keywords/bid-recommendations 获取建议竞价",
+        }), 400
+
     try:
         client = get_ads_api_client(int(shop_id))
-        resp = client.create_keywords(keywords)
+        resp = client.create_keywords(transformed)
+        _sync_created_keywords(resp, int(shop_id))
         return jsonify({"status": "success", "data": resp})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@advertising_manage_bp.route('/keywords/upload', methods=['POST'])
+def upload_keywords():
+    shop_id = request.form.get("shop_id")
+    campaign_id = request.form.get("campaign_id")
+    ad_group_id = request.form.get("ad_group_id")
+    if not shop_id or not campaign_id or not ad_group_id:
+        return jsonify({"status": "error", "message": "缺少 shop_id / campaign_id / ad_group_id"}), 400
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"status": "error", "message": "缺少上传文件"}), 400
+
+    filename = (file.filename or "").lower()
+    try:
+        if filename.endswith(".csv"):
+            content = file.read().decode("utf-8-sig")
+            reader = csv.reader(io.StringIO(content))
+            rows = [row for row in reader]
+        else:
+            wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
+            ws = wb.active
+            rows = [[str(c.value or "").strip() for c in row] for row in ws.iter_rows()]
+
+        if not rows or len(rows) < 2:
+            return jsonify({"status": "error", "message": "文件无数据"}), 400
+
+        headers = [h.strip().lower() for h in rows[0]]
+        kw_col = next((i for i, h in enumerate(headers) if h in ("keywordtext", "keyword", "关键词")), 0)
+        mt_col = next((i for i, h in enumerate(headers) if h in ("matchtype", "match_type", "匹配类型")), 1)
+        bid_col = next((i for i, h in enumerate(headers) if h in ("bid", "竞价")), 2)
+
+        VALID_MATCH_TYPES = {"BROAD", "PHRASE", "EXACT"}
+        keywords = []
+        errors = []
+        for idx, row in enumerate(rows[1:], start=2):
+            kw_text = (row[kw_col] if kw_col < len(row) else "").strip()
+            mt_raw = (row[mt_col] if mt_col < len(row) else "").strip()
+            bid_raw = (row[bid_col] if bid_col < len(row) else "").strip()
+            mt = mt_raw.upper()
+
+            if not kw_text:
+                continue
+            if mt not in VALID_MATCH_TYPES:
+                errors.append(f"第{idx}行: matchType 无效 ({mt_raw})，应为 BROAD/PHRASE/EXACT")
+                continue
+
+            item = {"keywordText": kw_text, "matchType": mt}
+            if bid_raw:
+                try:
+                    item["bid"] = float(bid_raw)
+                except ValueError:
+                    errors.append(f"第{idx}行: bid 格式错误 ({bid_raw})")
+                    continue
+            keywords.append(item)
+
+        if errors:
+            return jsonify({"status": "error", "message": "; ".join(errors)}), 400
+        if not keywords:
+            return jsonify({"status": "error", "message": "未解析到有效的关键词数据"}), 400
+
+        transformed = []
+        null_bid_texts = []
+        for kw in keywords:
+            item = {
+                "campaignId": int(campaign_id),
+                "adGroupId": int(ad_group_id),
+                "keywordText": kw["keywordText"],
+                "matchType": kw["matchType"],
+                "state": "enabled",
+            }
+            if "bid" in kw:
+                item["bid"] = kw["bid"]
+            else:
+                null_bid_texts.append(kw["keywordText"])
+            transformed.append(item)
+
+        if null_bid_texts:
+            return jsonify({
+                "status": "error",
+                "message": f"以下关键词缺少 bid，请在文件中填写: {', '.join(null_bid_texts)}",
+            }), 400
+
+        try:
+            client = get_ads_api_client(int(shop_id))
+            resp = client.create_keywords(transformed)
+            _sync_created_keywords(resp, int(shop_id))
+            return jsonify({"status": "success", "data": resp})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"文件解析失败: {str(e)}"}), 400
 
 
 # =================================================================
@@ -1371,7 +1529,7 @@ def create_keywords():
 # =================================================================
 
 @advertising_manage_bp.route('/targets', methods=['GET'])
-def list_targets():
+def list_targets(only_auto=False):
     entity_fields = """
         e.target_id, e.resolved_expression, e.state, e.bid,
         e.serving_status, e.campaign_id, e.ad_group_id,
@@ -1386,6 +1544,12 @@ def list_targets():
         "WHEN 'substitutes' THEN 'ASIN_SUBSTITUTE_RELATED' "
         "ELSE r.targeting_expression END"
     )
+    where_extra = ""
+    if only_auto:
+        where_extra = (
+            "e.campaign_id IN (SELECT campaign_id FROM amazon_ads_campaigns "
+            "WHERE targeting_type = 'AUTO')"
+        )
     try:
         rows, total = _query_entity_with_report(
             entity_table="amazon_ads_targets",
@@ -1396,6 +1560,7 @@ def list_targets():
             metrics="",
             join_extra="AND r.campaign_id = e.campaign_id AND r.ad_group_id = e.ad_group_id",
             extra_left_join="LEFT JOIN amazon_ads_ad_groups ag ON ag.ad_group_id = e.ad_group_id",
+            where_extra=where_extra,
         )
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -1409,7 +1574,7 @@ def list_targets():
 
 @advertising_manage_bp.route('/targets/auto', methods=['GET'])
 def list_auto_targets():
-    return list_targets()
+    return list_targets(only_auto=True)
 
 
 @advertising_manage_bp.route('/targets/<int:target_id>', methods=['PUT'])
@@ -2389,6 +2554,45 @@ def _sync_keywords(cursor, client, shop_id):
             _safe_date(item.get("lastUpdateDateTime")),
         ))
     return len(keywords)
+
+
+def _sync_created_keywords(resp, shop_id):
+    """将批量创建的关键词响应写入本地 DB"""
+    keywords = resp.get("keywords", {})
+    success_items = keywords.get("success", []) or resp.get("success", [])
+    if not success_items:
+        return
+    conn = _get_conn()
+    try:
+        with conn.cursor() as c:
+            for item in success_items:
+                c.execute("""
+                    INSERT INTO amazon_ads_keywords
+                        (campaign_id, ad_group_id, keyword_id, keyword_text,
+                         match_type, state, bid, serving_status,
+                         last_update_datetime, synced_at)
+                    VALUES (%s,%s,%s,%s, %s,%s,%s,%s, %s, NOW())
+                    ON DUPLICATE KEY UPDATE
+                        keyword_text=VALUES(keyword_text),
+                        match_type=VALUES(match_type),
+                        state=VALUES(state), bid=VALUES(bid),
+                        serving_status=VALUES(serving_status),
+                        last_update_datetime=VALUES(last_update_datetime),
+                        synced_at=NOW()
+                """, (
+                    int(item.get("campaignId", 0)),
+                    int(item.get("adGroupId", 0)),
+                    int(item["keywordId"]),
+                    _safe_str(item.get("keywordText")),
+                    _safe_str(item.get("matchType")),
+                    _safe_str(item.get("state")),
+                    _safe_decimal(item.get("bid")),
+                    _safe_str(item.get("servingStatus")),
+                    _safe_date(item.get("lastUpdateDateTime")),
+                ))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _sync_targets(cursor, client, shop_id):

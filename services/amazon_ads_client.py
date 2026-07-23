@@ -455,6 +455,7 @@ class AmazonAdsApiClient:
     # ==================== 关键词 (Keywords) v3 ====================
 
     _V3_SP_KEYWORD_CT = "application/vnd.spkeyword.v3+json"
+    _V3_SP_RECOMMENDATION_CT = "application/vnd.sptargetrecommendation.v3+json"
 
     def list_keywords(self, campaign_id: int = None, ad_group_id: int = None,
                       state_filter: list = None, max_results: int = 100,
@@ -504,7 +505,6 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/targets/keywords/recommendations",
             json_data=payload,
-            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
         )
 
     # ==================== 投放 (Targets) v3 ====================
@@ -559,7 +559,6 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/targets/bid/recommendations",
             json_data=payload,
-            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
         )
 
     def get_target_product_recommendations(self, payload: dict) -> dict:
@@ -567,7 +566,6 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/targets/products/recommendations",
             json_data=payload,
-            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
         )
 
     def get_categories(self, payload: dict) -> dict:
