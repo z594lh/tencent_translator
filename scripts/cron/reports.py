@@ -19,6 +19,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
 import argparse
 from datetime import datetime, timedelta
 from scripts.cron import _now_str
+import services.notification_handlers  # noqa: F401 注册事件处理器
 
 
 def run_daily(start=None, end=None):

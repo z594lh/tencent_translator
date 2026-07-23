@@ -36,6 +36,7 @@ from services.profit_calculator import (
     get_unit_costs,
     calculate_profit,
 )
+from services.notification_dispatcher import fire
 
 # 价格兜底 SQL：item_price 为 NULL 时用 listing_offers.our_price * 数量 替换
 # item_price_amount 已是行级总价，非 NULL 时直接使用不乘数量
@@ -1245,10 +1246,12 @@ def generate_inventory_turnover(shop_id=None):
     """
     生成库存周转数据
 
-    简介: 基于当前 FBA 库存 + 近 30 天销售速度，计算每个 SKU 的周转天数、状态和建议补货量。
+    简介: 基于当前 FBA 库存 + 近 7 天销售速度，计算每个 SKU 的周转天数、状态和建议补货量。
+    周转天数不足45天时通过企业微信发送预警通知。
 
     详细:
       - 数据源: amazon_inventory（库存）+ amazon_orders（销售速度）
+      - 周转天数 = 当前库存 / (近7天销量 / 7)
       - 状态: normal / slow 滞销 / out_of_stock 缺货 / warning 预警
       - 幂等: ON DUPLICATE KEY UPDATE
     """
@@ -1324,6 +1327,8 @@ def generate_inventory_turnover(shop_id=None):
                     """, (sid,))
                     sales_7d_map = {r['sku']: r['sales_7d'] for r in cursor.fetchall()}
 
+                    alert_warnings = []
+
                     for inv in inv_rows:
                         sku = inv['sku']
                         asin = inv['asin'] or ''
@@ -1338,7 +1343,7 @@ def generate_inventory_turnover(shop_id=None):
 
                         sales_30d = int(sales_map.get(sku, {}).get('sales_30d') or 0)
                         sales_7d = int(sales_7d_map.get(sku, 0) or 0)
-                        avg_daily_sales = Decimal(str(sales_30d)) / Decimal('30') if sales_30d > 0 else Decimal('0')
+                        avg_daily_sales = Decimal(str(sales_7d)) / Decimal('7') if sales_7d > 0 else Decimal('0')
 
                         last_sale_date = sales_map.get(sku, {}).get('last_sale_date')
                         if last_sale_date:
@@ -1352,6 +1357,15 @@ def generate_inventory_turnover(shop_id=None):
                             turnover_days = int((Decimal(str(current_stock)) / avg_daily_sales).to_integral_value(rounding=ROUND_HALF_UP))
                         else:
                             turnover_days = 9999
+
+                        if turnover_days < 45 and current_stock > 0:
+                            alert_warnings.append({
+                                'sku': sku,
+                                'product_name': product_name or sku,
+                                'turnover_days': turnover_days,
+                                'sales_7d': sales_7d,
+                                'current_stock': current_stock
+                            })
 
                         # 状态判断
                         if current_stock == 0 and days_without_sale >= 30:
@@ -1405,6 +1419,12 @@ def generate_inventory_turnover(shop_id=None):
                             float(unit_cost), float(inventory_value)
                         ))
                         total_affected += 1
+
+                if alert_warnings:
+                    fire('inventory_turnover_warning',
+                         shop_id=sid,
+                         period=period,
+                         warnings=alert_warnings)
 
                 conn.commit()
                 if log_id:
