@@ -629,6 +629,8 @@ def create_listing():
             return jsonify({"status": "error", "message": "缺少必填字段: attributes（必须为对象）"}), 400
 
         client = get_sp_api_client(shop_id=shop_id)
+        seller_id = client.seller_id or ''
+        marketplace_id = client.marketplace_id
         result = client.put_listings_item(
             sku=sku,
             product_type=product_type,
@@ -637,10 +639,20 @@ def create_listing():
             condition_type=condition_type
         )
 
+        fetched = client.get_listings_item(sku=sku, included_data=["summaries", "attributes", "issues"])
+        if fetched and isinstance(fetched, dict) and fetched.get('sku'):
+            synced_count, sync_error, _ = sync_listings_to_db(
+                shop_id, marketplace_id, seller_id, [fetched]
+            )
+            if sync_error:
+                print(f"[Amazon Listing] 上架后同步本地DB失败: {sync_error}")
+
+        detail = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
+
         return jsonify({
             "status": "success",
             "message": "Listing 上架成功",
-            "data": result
+            "data": detail
         })
 
     except ValueError as e:
@@ -673,6 +685,8 @@ def update_listing(sku):
             return jsonify({"status": "error", "message": "缺少必填字段: attributes（必须为对象）"}), 400
 
         client = get_sp_api_client(shop_id=shop_id)
+        seller_id = client.seller_id or ''
+        marketplace_id = client.marketplace_id
         result = client.put_listings_item(
             sku=sku,
             product_type=product_type,
@@ -681,10 +695,20 @@ def update_listing(sku):
             condition_type=condition_type
         )
 
+        fetched = client.get_listings_item(sku=sku, included_data=["summaries", "attributes", "issues"])
+        if fetched and isinstance(fetched, dict) and fetched.get('sku'):
+            synced_count, sync_error, _ = sync_listings_to_db(
+                shop_id, marketplace_id, seller_id, [fetched]
+            )
+            if sync_error:
+                print(f"[Amazon Listing] 更新后同步本地DB失败: {sync_error}")
+
+        detail = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
+
         return jsonify({
             "status": "success",
             "message": "Listing 更新成功",
-            "data": result
+            "data": detail
         })
 
     except ValueError as e:
@@ -713,16 +737,28 @@ def patch_listing(sku):
             return jsonify({"status": "error", "message": "缺少必填字段: patches（必须为数组）"}), 400
 
         client = get_sp_api_client(shop_id=shop_id)
+        seller_id = client.seller_id or ''
+        marketplace_id = client.marketplace_id
         result = client.patch_listings_item(
             sku=sku,
             patches=patches,
             product_type=product_type
         )
 
+        fetched = client.get_listings_item(sku=sku, included_data=["summaries", "attributes", "issues"])
+        if fetched and isinstance(fetched, dict) and fetched.get('sku'):
+            synced_count, sync_error, _ = sync_listings_to_db(
+                shop_id, marketplace_id, seller_id, [fetched]
+            )
+            if sync_error:
+                print(f"[Amazon Listing] 部分更新后同步本地DB失败: {sync_error}")
+
+        detail = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
+
         return jsonify({
             "status": "success",
             "message": "Listing 部分更新成功",
-            "data": result
+            "data": detail
         })
 
     except ValueError as e:
@@ -1414,6 +1450,7 @@ def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
 
     brand = _extract_first_lang_value(attributes.get('brand'))
     item_name = _extract_first_lang_value(attributes.get('item_name'))
+    title_differentiation = _extract_first_lang_value(attributes.get('title_differentiation'))
     product_description = _extract_first_lang_value(attributes.get('product_description'))
     manufacturer = _extract_first_lang_value(attributes.get('manufacturer'))
     country_of_origin = _extract_first_plain_value(attributes.get('country_of_origin'))
@@ -1450,6 +1487,7 @@ def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
         'status': status_str,
         'fn_sku': summary.get('fnSku'),
         'item_name': item_name or summary.get('itemName'),
+        'title_differentiation': title_differentiation,
         'brand': brand,
         'created_date': _iso_to_datetime(summary.get('createdDate')),
         'last_updated_date': _iso_to_datetime(summary.get('lastUpdatedDate')),
@@ -1753,7 +1791,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                 sql_main = """
                     INSERT INTO amazon_listings (
                         shop_id, marketplace_id, seller_id, sku, asin, product_type, condition_type,
-                        status, fn_sku, item_name, brand, created_date, last_updated_date,
+                        status, fn_sku, item_name, title_differentiation, brand, created_date, last_updated_date,
                         main_image_url, main_image_height, main_image_width,
                         list_price, list_price_currency, number_of_items,
                         parent_sku, parentage_level, child_relationship_type, variation_theme,
@@ -1761,7 +1799,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                         attributes_json, issues_json, sync_time, is_deleted
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s,
@@ -1775,6 +1813,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                         status = VALUES(status),
                         fn_sku = VALUES(fn_sku),
                         item_name = VALUES(item_name),
+                        title_differentiation = VALUES(title_differentiation),
                         brand = VALUES(brand),
                         created_date = VALUES(created_date),
                         last_updated_date = VALUES(last_updated_date),
@@ -1800,6 +1839,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                     main_row['shop_id'], main_row['marketplace_id'], main_row['seller_id'], main_row['sku'],
                     main_row['asin'], main_row['product_type'], main_row['condition_type'],
                     main_row['status'], main_row['fn_sku'], main_row['item_name'],
+                    main_row['title_differentiation'],
                     main_row['brand'], main_row['created_date'], main_row['last_updated_date'],
                     main_row['main_image_url'], main_row['main_image_height'], main_row['main_image_width'],
                     main_row['list_price'], main_row['list_price_currency'], main_row['number_of_items'],
@@ -1912,7 +1952,7 @@ def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, statu
             sql = f"""
                 SELECT
                     l.id, l.shop_id, l.marketplace_id, l.seller_id, l.sku, l.asin, l.product_type,
-                    l.condition_type, l.status, l.fn_sku, l.item_name, l.brand,
+                    l.condition_type, l.status, l.fn_sku, l.item_name, l.title_differentiation, l.brand,
                     l.created_date, l.last_updated_date,
                     l.main_image_url, l.main_image_height, l.main_image_width,
                     o.our_price,
