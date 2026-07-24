@@ -379,6 +379,7 @@ def list_product_board():
         min_margin = request.args.get('min_margin', '').strip() or None
         is_listed = request.args.get('is_listed', '').strip() or None
         is_new_product = request.args.get('is_new_product', '').strip() or None
+        all_batch = request.args.get('all_batch', '').strip().lower() in ('true', '1')
         sort_by = request.args.get('sort_by', 'sales_30d')
         sort_dir = request.args.get('sort_dir', 'desc')
         page = int(request.args.get('page', 1))
@@ -397,8 +398,17 @@ def list_product_board():
         conn = _get_conn()
         try:
             with conn.cursor() as cursor:
+                cursor.execute("SELECT MAX(DATE(created_at)) as latest_date FROM product_board")
+                latest_row = cursor.fetchone()
+                latest_date = latest_row['latest_date'] if latest_row else None
+                latest_date_str = str(latest_date) if latest_date else None
+
                 conditions = [LATEST_PER_ASIN]
                 params = []
+
+                if not all_batch and latest_date:
+                    conditions.append("DATE(created_at) = %s")
+                    params.append(latest_date_str)
 
                 if keyword:
                     conditions.append("(asin LIKE %s OR product_name_cn LIKE %s)")
@@ -442,15 +452,31 @@ def list_product_board():
                 total = cursor.fetchone()['total']
 
                 offset = (page - 1) * page_size
-                cursor.execute(f"""
-                    SELECT *, ({new_product_expr}) AS is_new_product FROM product_board
-                    WHERE {where_clause}
-                    ORDER BY {sort_by} {sort_dir}
-                    LIMIT %s OFFSET %s
-                """, tuple(params + [page_size, offset]))
+                if latest_date_str:
+                    cursor.execute(f"""
+                        SELECT *, ({new_product_expr}) AS is_new_product,
+                        (DATE(created_at) = %s) AS is_latest_batch
+                        FROM product_board
+                        WHERE {where_clause}
+                        ORDER BY {sort_by} {sort_dir}
+                        LIMIT %s OFFSET %s
+                    """, tuple(params + [latest_date_str, page_size, offset]))
+                else:
+                    cursor.execute(f"""
+                        SELECT *, ({new_product_expr}) AS is_new_product
+                        FROM product_board
+                        WHERE {where_clause}
+                        ORDER BY {sort_by} {sort_dir}
+                        LIMIT %s OFFSET %s
+                    """, tuple(params + [page_size, offset]))
+
                 rows = cursor.fetchall()
                 for row in rows:
                     row['is_new_product'] = bool(row['is_new_product'])
+                    if 'is_latest_batch' in row:
+                        row['is_latest_batch'] = bool(row['is_latest_batch'])
+                    else:
+                        row['is_latest_batch'] = True
 
                 return jsonify({
                     "status": "success",
@@ -458,7 +484,8 @@ def list_product_board():
                         "list": rows,
                         "total": total,
                         "page": page,
-                        "page_size": page_size
+                        "page_size": page_size,
+                        "latest_batch_date": latest_date_str
                     }
                 })
         finally:
