@@ -780,40 +780,6 @@ def generate_sku_profit(report_date, shop_id=None):
                     daily_total_sales = Decimal(str(sum(sku_sales_from_finance.values())))
                     daily_total_sales += Decimal(str(sum(u['sales'] for u in unsettled_sales_map.values())))
 
-                    # 日报广告费
-                    cursor.execute("""
-                        SELECT COALESCE(SUM(cost), 0) AS ad_sum
-                        FROM amazon_ads_raw_reports
-                        WHERE shop_id = %s AND report_date = %s AND report_type = 'spAdvertisedProduct'
-                    """, (sid, report_date))
-                    daily_ad = Decimal(str(cursor.fetchone()['ad_sum'] or 0))
-
-                    # 计算每日产品总成本+头程 — 覆盖所有有销量的 SKU（含 items_json 中的 SKU）
-                    daily_pc = Decimal('0')
-                    daily_hw = Decimal('0')
-                    # settled SKUs from Finances
-                    for sku_t, qty_t in sku_settled_qty.items():
-                        try:
-                            uc = get_unit_costs(cursor, sku_t, exchange_rate, shop_id=sid)
-                            daily_pc += uc.purchase_cost_usd * qty_t
-                            daily_hw += uc.headway_cost_usd * qty_t
-                        except Exception:
-                            continue
-                    # unsettled SKUs from order_items
-                    for prod_tmp in all_products:
-                        sku_t = prod_tmp.get('sku', '')
-                        asin_t = prod_tmp.get('asin', '')
-                        if not sku_t or not asin_t:
-                            continue
-                        uq = unsettled_sales_map.get(asin_t, {'qty': 0})
-                        if uq.get('qty', 0) > 0:
-                            try:
-                                uc = get_unit_costs(cursor, sku_t, exchange_rate, shop_id=sid)
-                                daily_pc += uc.purchase_cost_usd * uq['qty']
-                                daily_hw += uc.headway_cost_usd * uq['qty']
-                            except Exception:
-                                continue
-
                     # 4. 遍历所有产品，写入 sku_profit（每天每个 SKU 一条）
                     for prod in all_products:
                         asin = prod['asin'] or ''
@@ -831,9 +797,13 @@ def generate_sku_profit(report_date, shop_id=None):
 
                         fin_sales = sku_sales_from_finance.get(sku, 0)
                         sales_amount = Decimal(str(fin_sales)) + unsettled_sales_amount
+
+                        # 总销量用 SKU 维度（与 fba_fees/platform_fees/sales_amount 口径一致）
+                        total_qty = sku_settled_qty.get(sku, 0) + unsettled_qty
+
                         avg_price = Decimal('0')
-                        if sales_qty > 0 and sales_amount > 0:
-                            avg_price = sales_amount / sales_qty
+                        if total_qty > 0 and sales_amount > 0:
+                            avg_price = sales_amount / total_qty
 
                         # 广告数据
                         ad_data = ad_map.get(asin, {})
@@ -869,8 +839,8 @@ def generate_sku_profit(report_date, shop_id=None):
                         elif fin_fba > 0 or fin_comm > 0:
                             fba_fees = fin_fba
                             platform_fees = fin_comm
-                        elif sales_qty > 0:
-                            profit_all = calculate_profit(sales_amount, sales_qty, unit_costs, Decimal('0'), Decimal('0'))
+                        elif total_qty > 0:
+                            profit_all = calculate_profit(sales_amount, total_qty, unit_costs, Decimal('0'), Decimal('0'))
                             fba_fees = profit_all.fba_fees
                             platform_fees = profit_all.commission
                         else:
@@ -883,13 +853,9 @@ def generate_sku_profit(report_date, shop_id=None):
                         else:
                             refund_amount = Decimal('0')
 
-                        # 产品成本 + 头程 — 每日总额按销售额比例分配，保证 ∑=每日总计
-                        if daily_total_sales > 0:
-                            product_cost = (daily_pc * sales_amount / daily_total_sales).quantize(Decimal('0.01'))
-                            headway_cost = (daily_hw * sales_amount / daily_total_sales).quantize(Decimal('0.01'))
-                        else:
-                            product_cost = Decimal('0')
-                            headway_cost = Decimal('0')
+                        # 产品成本 + 头程 — 使用精确单件成本 × 销量（SKU维度）
+                        product_cost = (unit_costs.purchase_cost_usd * total_qty).quantize(Decimal('0.01'))
+                        headway_cost = (unit_costs.headway_cost_usd * total_qty).quantize(Decimal('0.01'))
                         total_cost = product_cost + headway_cost + fba_fees + platform_fees + ad_cost + refund_amount
                         gross_profit = sales_amount - total_cost
                         net_profit = gross_profit
@@ -925,7 +891,7 @@ def generate_sku_profit(report_date, shop_id=None):
                                 updated_at = NOW()
                         """, (
                             sid, asin, sku, product_name, report_date,
-                            sales_qty, float(sales_amount), float(avg_price),
+                            total_qty, float(sales_amount), float(avg_price),
                             float(product_cost), float(fba_fees), float(ad_cost),
                             float(headway_cost), float(platform_fees),
                             float(refund_amount), float(other_fees),
