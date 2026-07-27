@@ -477,6 +477,7 @@ def list_campaigns():
             c.execute(f"""
                 SELECT
                     {', '.join(entity_fields)},
+                    {', '.join(f"{expr} AS {name}" for name, expr in _COMPUTED_FIELDS.items())},
                     COALESCE(SUM(r.impressions), 0) AS impressions,
                     COALESCE(SUM(r.clicks), 0) AS clicks,
                     COALESCE(SUM(r.cost), 0) AS cost,
