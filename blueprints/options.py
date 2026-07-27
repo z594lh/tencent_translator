@@ -15,6 +15,7 @@
   GET  /api/options/advertising/campaigns     广告活动下拉（?shop_id=）
   GET  /api/options/advertising/ad-groups     广告组下拉（?shop_id=&campaign_id=）
   GET  /api/options/advertising/asins         推广ASIN下拉（?shop_id=&campaign_id=）
+  GET  /api/options/amazon/listings/<sku>/variants  同父体变体列表（?shop_id=）
 
 注意：响应统一为 {status, data: [...]}，无分页，字段名与原端点一致。
 """
@@ -351,6 +352,65 @@ def option_ad_asins():
 
 
 # ============================================================
+# ============================================================
+# Amazon Listing 同父体变体 — GET /api/options/amazon/listings/<sku>/variants
+# ============================================================
+
+@options_bp.route('/amazon/listings/<sku>/variants', methods=['GET'])
+def option_amazon_listing_variants(sku):
+    """
+    获取与指定 SKU 同父体下的其他子体（排除自身）
+    查询参数（必填）:
+        shop_id  - 店铺ID
+    """
+    try:
+        shop_id = request.args.get('shop_id', '').strip()
+        if not shop_id:
+            return jsonify({"status": "error", "message": "请提供 shop_id"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT parent_sku, parentage_level
+                    FROM amazon_listings
+                    WHERE shop_id = %s AND sku = %s AND is_deleted = 0
+                """, (shop_id, sku))
+                row = cursor.fetchone()
+
+                if not row:
+                    return jsonify({"status": "error", "message": f"Listing {sku} 不存在"}), 404
+
+                parent_sku = (row.get('parent_sku') or '').strip()
+                if not parent_sku:
+                    return jsonify({
+                        "status": "success",
+                        "data": {"parent_sku": "", "variants": []}
+                    })
+
+                cursor.execute("""
+                    SELECT l.sku, l.item_name, l.asin, l.parent_sku, l.marketplace_id, l.status, l.parentage_level,
+                           COALESCE(p.product_name, '') AS product_name
+                    FROM amazon_listings l
+                    LEFT JOIN products p ON p.seller_sku COLLATE utf8mb4_unicode_ci = l.sku AND p.status = 1
+                    WHERE l.shop_id = %s AND l.parent_sku = %s AND l.sku != %s AND l.is_deleted = 0
+                    ORDER BY l.sku ASC
+                """, (shop_id, parent_sku, sku))
+                variants = cursor.fetchall()
+
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        "parent_sku": parent_sku,
+                        "variants": variants
+                    }
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 # ============================================================
 # 交易分类下拉 — GET /api/options/transactions/categories
 # ============================================================

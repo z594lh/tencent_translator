@@ -768,6 +768,129 @@ def patch_listing(sku):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@amazon_listing_bp.route('/amazon/listings/<sku>/sync-to-variants', methods=['POST'])
+@login_required
+@permission_required('amazon_listings:edit')
+def sync_fields_to_variants(sku):
+    """
+    将源 SKU 的指定字段同步到同父体下的其他变体
+    请求体（必填）:
+        shop_id     - 店铺ID
+        target_skus - 目标变体 SKU 列表
+        fields      - 要同步的字段编码列表
+    """
+    try:
+        data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
+        target_skus = data.get('target_skus', [])
+        fields = data.get('fields', [])
+
+        if not target_skus or not isinstance(target_skus, list):
+            return jsonify({"status": "error", "message": "缺少必填字段: target_skus（必须为数组）"}), 400
+        if not fields or not isinstance(fields, list):
+            return jsonify({"status": "error", "message": "缺少必填字段: fields（必须为数组）"}), 400
+
+        valid_fields = {
+            'item_name', 'title_differentiation', 'product_description',
+            'bullet_point_1', 'bullet_point_2', 'bullet_point_3',
+            'bullet_point_4', 'bullet_point_5', 'generic_keyword'
+        }
+        invalid = [f for f in fields if f not in valid_fields]
+        if invalid:
+            return jsonify({"status": "error", "message": f"无效的字段: {invalid}"}), 400
+
+        source = _get_listing_detail_from_db(shop_id, sku)
+        if not source:
+            return jsonify({"status": "error", "message": f"源 Listing {sku} 不存在"}), 404
+
+        source_parent = (source.get('parent_sku') or '').strip()
+        if not source_parent:
+            return jsonify({"status": "error", "message": "当前 SKU 没有 parent_sku，无法同步"}), 400
+
+        source_attrs = {}
+        raw = source.get('attributes_json', '{}')
+        if raw and raw != '{}':
+            try:
+                source_attrs = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        client = get_sp_api_client(shop_id=shop_id)
+        seller_id = client.seller_id or ''
+        marketplace_id = client.marketplace_id
+
+        updated_count = 0
+        failed_count = 0
+        failures = []
+
+        for target_sku in target_skus:
+            try:
+                tgt_name = str(target_sku).strip()
+                if not tgt_name:
+                    failed_count += 1
+                    failures.append({"sku": "", "error": "目标 SKU 为空"})
+                    continue
+
+                target = _get_listing_detail_from_db(shop_id, tgt_name)
+                if not target:
+                    failed_count += 1
+                    failures.append({"sku": tgt_name, "error": "目标 Listing 不存在"})
+                    continue
+
+                target_parent = (target.get('parent_sku') or '').strip()
+                if target_parent != source_parent:
+                    failed_count += 1
+                    failures.append({"sku": tgt_name, "error": "目标 SKU 与源 SKU 不在同一父体下"})
+                    continue
+
+                target_attrs = {}
+                raw_t = target.get('attributes_json', '{}')
+                if raw_t and raw_t != '{}':
+                    try:
+                        target_attrs = json.loads(raw_t) if isinstance(raw_t, str) else raw_t
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                patches = _build_sync_patches(source_attrs, target_attrs, fields)
+                if not patches:
+                    failed_count += 1
+                    failures.append({"sku": tgt_name, "error": "没有有效的字段值可以同步"})
+                    continue
+
+                product_type = target.get('product_type', '')
+
+                client.patch_listings_item(sku=tgt_name, patches=patches, product_type=product_type)
+
+                fetched = client.get_listings_item(sku=tgt_name, included_data=["summaries", "attributes", "issues"])
+                if fetched and isinstance(fetched, dict) and fetched.get('sku'):
+                    sync_listings_to_db(shop_id, marketplace_id, seller_id, [fetched])
+
+                updated_count += 1
+            except Exception as e:
+                print(f"[Sync to Variants] 同步变体 {target_sku} 异常: {str(e)}")
+                failed_count += 1
+                failures.append({"sku": str(target_sku), "error": str(e)})
+
+        return jsonify({
+            "status": "success",
+            "message": f"已同步 {updated_count} 个变体" if failed_count == 0 else "部分同步成功",
+            "data": {
+                "source_sku": sku,
+                "target_skus": target_skus,
+                "fields": fields,
+                "updated_count": updated_count,
+                "failed_count": failed_count,
+                "failures": failures
+            }
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Amazon Listing] 同步字段到变体异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @amazon_listing_bp.route('/amazon/listings/<sku>', methods=['DELETE'])
 @login_required
 @permission_required('amazon_listings:delete')
@@ -1340,7 +1463,72 @@ def _extract_value_schema(defn, defs):
 # 数据库同步与查询函数
 # ========================
 
+def _build_sync_patches(source_attrs, target_attrs, fields):
+    """根据源属性、目标属性和要同步的字段，构建 JSON Patch 操作列表"""
+    patches = []
+    bullet_indices = []
+    other_fields = []
+
+    for f in fields:
+        f = str(f).strip()
+        if f.startswith('bullet_point_'):
+            try:
+                idx = int(f.split('_')[-1]) - 1
+                bullet_indices.append(idx)
+            except (ValueError, IndexError):
+                pass
+        else:
+            other_fields.append(f)
+
+    for field_name in other_fields:
+        src_val = source_attrs.get(field_name)
+        if src_val:
+            patches.append({
+                "op": "replace",
+                "path": f"/attributes/{field_name}",
+                "value": deep_copy_attrs(src_val)
+            })
+
+    if bullet_indices:
+        src_bullets = source_attrs.get('bullet_point', [])
+        if not isinstance(src_bullets, list):
+            src_bullets = []
+        tgt_bullets = target_attrs.get('bullet_point', [])
+        if not isinstance(tgt_bullets, list):
+            tgt_bullets = []
+
+        new_bullets = list(tgt_bullets)
+        for idx in bullet_indices:
+            if idx < 0 or idx >= len(src_bullets):
+                continue
+            bullet = deep_copy_attrs(src_bullets[idx])
+            if idx < len(new_bullets):
+                new_bullets[idx] = bullet
+            else:
+                while len(new_bullets) < idx:
+                    new_bullets.append({})
+                new_bullets.append(bullet)
+
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/bullet_point",
+            "value": new_bullets
+        })
+
+    return patches
+
+
+def deep_copy_attrs(val):
+    """深拷贝属性值（避免引用泄漏）"""
+    if isinstance(val, dict):
+        return {k: deep_copy_attrs(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [deep_copy_attrs(v) for v in val]
+    return val
+
+
 # （后半部分：_parse_listing_item、_sync_listings、sync_listings_to_db、_get_listings_from_db、_get_listing_detail_from_db）
+
 
 
 def _extract_first_lang_value(attr_list):
