@@ -422,24 +422,30 @@ def _get_box_ids_by_shipment_id(shop_id, shipment_id):
 
 
 def _execute_task(task_id, shop_id, inbound_plan_id, crop_config, logistics_provider_id=0):
-    """由工作线程执行单个箱唛整理任务"""
+    """由工作线程执行单个箱唛整理任务（支持多个入库计划ID，逗号分隔）"""
     try:
         _update_task(task_id, status='running', progress=0)
 
-        # 1. 查询货件列表
-        shipments = _get_shipments_by_plan_id(shop_id, inbound_plan_id)
-        if not shipments:
+        plan_ids = [p.strip() for p in inbound_plan_id.split(',') if p.strip()]
+
+        # 1. 查询所有入库计划下的所有货件
+        all_shipments = []
+        for plan_id in plan_ids:
+            shipments = _get_shipments_by_plan_id(shop_id, plan_id)
+            all_shipments.extend(shipments)
+
+        if not all_shipments:
             _update_task(task_id, status='failed', message='未找到货件记录')
             return
 
-        total = len(shipments)
+        total = len(all_shipments)
         task_dir = os.path.join(FBA_LABEL_TASK_DIR, task_id)
         os.makedirs(task_dir, exist_ok=True)
 
         success_count = 0
         fail_messages = []
 
-        for idx, shipment in enumerate(shipments):
+        for idx, shipment in enumerate(all_shipments):
             shipment_id = shipment['shipment_confirmation_id']
             progress = int((idx / total) * 90)
             _update_task(task_id, progress=progress)
@@ -487,7 +493,7 @@ def _execute_task(task_id, shop_id, inbound_plan_id, crop_config, logistics_prov
                 cropped_bytes.seek(0)
                 doc.close()
 
-                # 6. 拆分保存（单页直接保存，多页逐页拆分）
+                # 6. 拆分保存（shipment_id 全局唯一，无需额外嵌套）
                 cropped_doc = fitz.open(stream=cropped_bytes, filetype="pdf")
                 shipment_dir = os.path.join(task_dir, shipment_id)
                 os.makedirs(shipment_dir, exist_ok=True)
@@ -553,8 +559,8 @@ def _execute_task(task_id, shop_id, inbound_plan_id, crop_config, logistics_prov
         cargo_agent_path = task_info.get('cargo_agent_path') if task_info else None
         if cargo_agent_path and os.path.exists(cargo_agent_path):
             try:
-                shipment_ids = [s['shipment_confirmation_id'] for s in shipments]
-                _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids, logistics_provider_id)
+                all_shipment_ids = [s['shipment_confirmation_id'] for s in all_shipments]
+                _process_cargo_agent_zip(cargo_agent_path, task_dir, all_shipment_ids, logistics_provider_id)
             except Exception as e:
                 print(f"[Organize Task] 货代箱唛处理失败: {e}")
                 import traceback
@@ -588,7 +594,7 @@ def _execute_task(task_id, shop_id, inbound_plan_id, crop_config, logistics_prov
 
 
 def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids, logistics_provider_id=1):
-    """解压货代箱唛ZIP，按配置规则归类并拆分PDF到对应文件夹"""
+    """解压货代箱唛ZIP，以货件编号为准匹配并拆分PDF到对应文件夹"""
     config = CARGO_AGENT_CONFIGS.get(logistics_provider_id)
     if not config:
         raise ValueError(f"未找到货代ID {logistics_provider_id} 的配置")
@@ -599,51 +605,48 @@ def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids, logistics
     with zipfile.ZipFile(cargo_agent_path, 'r') as zf:
         zf.extractall(temp_dir)
 
-    matched_count = 0
-    unmatched = []
+    # 第一遍：扫描ZIP中所有PDF，按FBA号建立索引
+    fba_file_map = {}   # {fba_id: [(filename, root, agent_code), ...]}
+    unknown_files = []
     for root, dirs, files in os.walk(temp_dir):
         for filename in files:
             if not filename.lower().endswith('.pdf'):
                 continue
 
-            # 按配置提取货代运单号（没有就算了）
             agent_code = ''
             if config.get('agent_code_pattern'):
                 agent_code_match = re.match(config['agent_code_pattern'], filename)
                 agent_code = agent_code_match.group(1) if agent_code_match else ''
 
-            # 按配置提取FBA号
             fba_id = None
             if config.get('fba_pattern'):
                 fba_match = re.search(config['fba_pattern'], filename, re.IGNORECASE)
                 if fba_match:
                     fba_id = fba_match.group(0).upper()
-            if not fba_id:
-                unmatched.append(filename)
-                continue
 
-            # 找到对应货件文件夹
-            matched_shipment = None
-            for shipment_id in shipment_ids:
-                if fba_id == shipment_id.upper():
-                    matched_shipment = shipment_id
-                    break
-
-            if not matched_shipment:
-                unmatched.append(f'{filename} (FBA: {fba_id})')
-                continue
-
-            # 构建文件名前缀
-            if agent_code:
-                name_prefix = f"货代-{fba_id}-{agent_code}"
+            if fba_id:
+                fba_file_map.setdefault(fba_id, []).append((filename, root, agent_code))
             else:
-                name_prefix = f"货代-{fba_id}"
+                unknown_files.append(filename)
 
-            # 打开PDF处理（货代PDF无需裁剪）
+    # 第二遍：以当前任务的货件列表为准，逐个匹配
+    matched_count = 0
+    errors = []
+    for shipment_id in shipment_ids:
+        matched_files = fba_file_map.get(shipment_id.upper(), [])
+        if not matched_files:
+            continue
+
+        for filename, root, agent_code in matched_files:
+            if agent_code:
+                name_prefix = f"货代-{shipment_id.upper()}-{agent_code}"
+            else:
+                name_prefix = f"货代-{shipment_id.upper()}"
+
             pdf_path = os.path.join(root, filename)
             try:
                 doc = fitz.open(pdf_path)
-                dest_dir = os.path.join(task_dir, matched_shipment)
+                dest_dir = os.path.join(task_dir, shipment_id)
                 os.makedirs(dest_dir, exist_ok=True)
 
                 if len(doc) == 1:
@@ -663,12 +666,19 @@ def _process_cargo_agent_zip(cargo_agent_path, task_dir, shipment_ids, logistics
                 print(f"[Cargo Agent] 拆分PDF失败 {filename}: {e}")
                 import traceback
                 traceback.print_exc()
-                unmatched.append(f'{filename}: {str(e)}')
+                errors.append(f'{filename}: {str(e)}')
 
     shutil.rmtree(temp_dir, ignore_errors=True)
-    if unmatched:
-        raise ValueError(f"以下货代箱唛无法匹配到对应货件: {', '.join(unmatched)}")
-    print(f"[Cargo Agent] 归类完成: {matched_count} 个文件匹配")
+
+    log_parts = [f"归类完成: {matched_count} 个文件匹配"]
+    if unknown_files:
+        log_parts.append(f"{len(unknown_files)} 个文件无法提取FBA号")
+    if errors:
+        log_parts.append(f"{len(errors)} 个文件处理失败")
+    print(f"[Cargo Agent] {', '.join(log_parts)}")
+
+    if unknown_files:
+        print(f"[Cargo Agent] 无法提取FBA号的文件: {', '.join(unknown_files)}")
 
 
 @fba_tools_bp.route('/fba/organize-plan-labels', methods=['POST'])
@@ -679,13 +689,15 @@ def organize_plan_labels():
     提交箱唛自动化整理任务
     请求: multipart/form-data
       - shop_id: 店铺ID
-      - inbound_plan_id: 入库计划ID
+      - inbound_plan_id: 入库计划ID，支持逗号分隔多个值，例如 plan1,plan2,plan3
+      - merge_tasks: 是否合并为一个任务（默认 "true"）。true 时多个计划合并到一个任务导出一个ZIP；false 时拆分为多个独立任务
       - crop_config: 裁剪配置JSON字符串（可选）
       - cargo_agent_zip: 货代箱唛ZIP文件（可选）
     """
     try:
         shop_id = request.form.get('shop_id', '').strip()
-        inbound_plan_id = request.form.get('inbound_plan_id', '').strip()
+        inbound_plan_id_raw = request.form.get('inbound_plan_id', '').strip()
+        merge_tasks = request.form.get('merge_tasks', 'true').strip().lower() in ('true', '1', 'yes')
 
         if not shop_id:
             return jsonify({"status": "error", "message": "shop_id 不能为空"}), 400
@@ -694,8 +706,14 @@ def organize_plan_labels():
         except ValueError:
             return jsonify({"status": "error", "message": "shop_id 格式错误"}), 400
 
-        if not inbound_plan_id:
+        if not inbound_plan_id_raw:
             return jsonify({"status": "error", "message": "inbound_plan_id 不能为空"}), 400
+
+        plan_ids = [p.strip() for p in inbound_plan_id_raw.split(',') if p.strip()]
+        if not plan_ids:
+            return jsonify({"status": "error", "message": "inbound_plan_id 不能为空"}), 400
+
+        print(f"[Organize Labels] shop_id={shop_id}, inbound_plan_id_raw={inbound_plan_id_raw!r}, len={len(inbound_plan_id_raw)}, plan_ids={plan_ids}, merge_tasks={merge_tasks}")
 
         # 裁剪配置校验
         crop_config_raw = request.form.get('crop_config', '{}')
@@ -714,21 +732,18 @@ def organize_plan_labels():
                 len(crop_config['y_ratio']) != 2):
             return jsonify({"status": "error", "message": "crop_config 格式错误"}), 400
 
-        # 处理货代箱唛ZIP上传
+        # 处理货代箱唛ZIP上传（先保存到一个临时路径，拆分模式时各任务各自复制）
         cargo_agent_path = None
         cargo_agent_file = request.files.get('cargo_agent_zip')
         if cargo_agent_file and cargo_agent_file.filename:
-            task_id = str(uuid.uuid4())
-            agent_dir = os.path.join(CARGO_AGENT_DIR, task_id)
+            upload_id = str(uuid.uuid4())
+            agent_dir = os.path.join(CARGO_AGENT_DIR, upload_id)
             os.makedirs(agent_dir, exist_ok=True)
             cargo_agent_path = os.path.join(agent_dir, 'cargo_agent.zip')
             cargo_agent_file.save(cargo_agent_path)
-        else:
-            task_id = str(uuid.uuid4())
 
         # 货代ID（决定用哪套解析规则）
         if cargo_agent_file and cargo_agent_file.filename:
-            # 上传了货代ZIP，必须指定货代ID
             logistics_provider_id = request.form.get('logistics_provider_id', '').strip()
             if not logistics_provider_id:
                 return jsonify({"status": "error", "message": "上传货代箱唛时必须指定 logistics_provider_id"}), 400
@@ -739,20 +754,45 @@ def organize_plan_labels():
             if logistics_provider_id not in CARGO_AGENT_CONFIGS:
                 return jsonify({"status": "error", "message": f"不支持的货代ID: {logistics_provider_id}"}), 400
         else:
-            # 没上传货代ZIP，默认为0
             logistics_provider_id = 0
 
         # 清理过期任务
         _cleanup_old_tasks()
 
-        # 创建任务（只写数据库，工作线程会自动轮询执行）
-        _create_task(task_id, shop_id, inbound_plan_id, crop_config, cargo_agent_path, logistics_provider_id)
+        if merge_tasks:
+            # 合并模式：一个任务，入库计划ID逗号分隔存入
+            task_id = str(uuid.uuid4())
+            _create_task(task_id, shop_id, inbound_plan_id_raw, crop_config, cargo_agent_path, logistics_provider_id)
+            return jsonify({
+                "status": "success",
+                "message": "任务已提交",
+                "data": {"task_id": task_id}
+            })
+        else:
+            # 拆分模式：每个入库计划ID独立一个任务，货代ZIP各自复制一份
+            task_ids = []
+            for plan_id in plan_ids:
+                task_id = str(uuid.uuid4())
+                task_cargo_path = None
+                if cargo_agent_path:
+                    task_agent_dir = os.path.join(CARGO_AGENT_DIR, task_id)
+                    os.makedirs(task_agent_dir, exist_ok=True)
+                    task_cargo_path = os.path.join(task_agent_dir, 'cargo_agent.zip')
+                    shutil.copy2(cargo_agent_path, task_cargo_path)
+                _create_task(task_id, shop_id, plan_id, crop_config, task_cargo_path, logistics_provider_id)
+                task_ids.append(task_id)
 
-        return jsonify({
-            "status": "success",
-            "message": "任务已提交",
-            "data": {"task_id": task_id}
-        })
+            # 清理临时上传文件
+            if cargo_agent_path:
+                shared_dir = os.path.dirname(cargo_agent_path)
+                if os.path.exists(shared_dir):
+                    shutil.rmtree(shared_dir, ignore_errors=True)
+
+            return jsonify({
+                "status": "success",
+                "message": f"已提交 {len(task_ids)} 个任务",
+                "data": {"task_ids": task_ids}
+            })
 
     except Exception as e:
         print(f"[Organize Labels] 提交任务异常: {e}")
@@ -812,7 +852,7 @@ def download_organize_task(task_id):
             result_path,
             mimetype='application/zip',
             as_attachment=True,
-            download_name=f"{task['inbound_plan_id']}_labels.zip"
+            download_name=f"labels_{task_id[:8]}.zip"
         )
 
     except Exception as e:
