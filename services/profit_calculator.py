@@ -289,24 +289,53 @@ def get_fees_from_api(seller_sku: str, shop_id: int) -> dict:
 def get_unit_costs_with_api(cursor, seller_sku: str, exchange_rate: Decimal,
                             shop_id: Optional[int] = None) -> UnitCostBreakdown:
     """
-    优先 API 获取佣金比例+FBA费用，失败则 fallback 到 amazon_product_fees 缓存表。
+    获取佣金比例+FBA费用，优先使用 finances 实际数据，其次 DB 缓存，最后 API。
     与 get_unit_costs 返回相同结构，额外记录数据来源。
+
+    优先级:
+      1. amazon_product_fees.real_fba_fee / real_commission_rate（finances 实际扣费，最准）
+      2. amazon_product_fees.fba_fee / commission_rate（API 缓存）
+      3. Amazon Product Fees API（实时查询）
     """
-    result = get_unit_costs(cursor, seller_sku, exchange_rate)
+    result = get_unit_costs(cursor, seller_sku, exchange_rate, shop_id=shop_id)
 
     if shop_id is None:
         result.sources["fee_method"] = "amazon_product_fees (no shop_id)"
         return result
 
+    cursor.execute("""
+        SELECT real_fba_fee, real_commission_rate, fba_fee, commission_rate
+        FROM amazon_product_fees WHERE sku = %s AND shop_id = %s
+        ORDER BY updated_at DESC LIMIT 1
+    """, (seller_sku, shop_id))
+    fee_row = cursor.fetchone()
+
+    has_real_fba = fee_row and fee_row.get('real_fba_fee') is not None
+    has_real_comm = fee_row and fee_row.get('real_commission_rate') is not None
+    has_cached_fba = fee_row and fee_row.get('fba_fee') is not None
+    has_cached_comm = fee_row and fee_row.get('commission_rate') is not None
+
+    fba_need_api = not has_real_fba and not has_cached_fba
+    comm_need_api = not has_real_comm and not has_cached_comm
+
+    if not fba_need_api and not comm_need_api:
+        if has_real_fba and has_real_comm:
+            result.sources["fee_method"] = "amazon_product_fees (finances real values)"
+        else:
+            result.sources["fee_method"] = "amazon_product_fees (db cache)"
+        return result
+
     api_result = get_fees_from_api(seller_sku=seller_sku, shop_id=shop_id)
 
     if api_result["success"]:
-        result.commission_rate = api_result["commission_rate"]
-        result.fba_fee_usd = api_result["fba_fee_usd"]
-        result.fba_tier = "API实时费率"
-        result.sources["commission"] = api_result["source"]
-        result.sources["fba"] = api_result["source"]
-        result.sources["fee_method"] = "api"
+        if fba_need_api:
+            result.fba_fee_usd = api_result["fba_fee_usd"]
+            result.fba_tier = "API实时费率"
+            result.sources["fba"] = api_result["source"]
+        if comm_need_api:
+            result.commission_rate = api_result["commission_rate"]
+            result.sources["commission"] = api_result["source"]
+        result.sources["fee_method"] = "api (partial override)"
     else:
         result.sources["fee_method"] = f"amazon_product_fees (fallback: {api_result['source']})"
 
