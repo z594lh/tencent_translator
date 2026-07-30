@@ -304,6 +304,37 @@ def sync_amazon_inbound_shipment_detail(shipment_id):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>', methods=['POST'])
+@login_required
+@permission_required('amazon_inbound_plans:sync')
+def sync_amazon_inbound_plan_full(plan_id):
+    """
+    手动触发单个入库计划全量同步（货件列表 + 箱子 + 货件详情）
+    请求体：{ shop_id }
+    """
+    try:
+        data = request.get_json() or {}
+        shop_id = _require_shop_id_from_body(data)
+
+        result = _sync_inbound_plan_full(shop_id=shop_id, plan_id=plan_id)
+
+        return jsonify({
+            "status": "success",
+            "message": (
+                f"同步完成，货件 {result['shipments_synced']} 条"
+                f"，箱子 {result['boxes_synced']} 条"
+                f"，详情 {result['details_synced']} 条"
+            ),
+            "data": result
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Amazon Sync] 单入库计划全量同步异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 # =============================================================================
 # 3. 各种同步方法（供路由和 cron 复用）
 # =============================================================================
@@ -549,6 +580,34 @@ def _sync_inbound_shipment_detail(shop_id, plan_id, shipment_id):
             "total_fetched": 0,
             "error": str(e)
         }
+
+
+def _sync_inbound_plan_full(shop_id, plan_id):
+    """全量同步单个入库计划：货件列表 + 箱子 + 货件详情"""
+    shipment_result = _sync_inbound_plan_shipments(shop_id=shop_id, plan_id=plan_id)
+    time.sleep(0.3)
+
+    box_result = _sync_inbound_plan_boxes(shop_id=shop_id, plan_id=plan_id)
+    time.sleep(0.3)
+
+    details_synced = 0
+    detail_errors = []
+    for shipment_id in shipment_result.get('shipment_ids', []):
+        detail_result = _sync_inbound_shipment_detail(shop_id=shop_id, plan_id=plan_id, shipment_id=shipment_id)
+        details_synced += detail_result.get('synced_count', 0)
+        if detail_result.get('error'):
+            detail_errors.append({"shipment_id": shipment_id, "error": detail_result['error']})
+        time.sleep(0.3)
+
+    return {
+        "plan_id": plan_id,
+        "shipments_synced": shipment_result.get('synced_count', 0),
+        "boxes_synced": box_result.get('synced_count', 0),
+        "details_synced": details_synced,
+        "shipment_error": shipment_result.get('error'),
+        "box_error": box_result.get('error'),
+        "detail_errors": detail_errors
+    }
 
 
 def _sync_active_inbound_shipments_full(shop_id):
