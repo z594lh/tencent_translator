@@ -1,4 +1,8 @@
 import os
+import re
+import time
+import uuid
+from datetime import datetime
 from io import BytesIO
 
 import barcode
@@ -19,7 +23,57 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "static", "fbatag")
 if os.path.exists(FONT_PATH):
     pdfmetrics.registerFont(TTFont('SimHei', FONT_PATH))
 else:
-    print(f"[FBA Label] 警告：未找到字体文件 {FONT_PATH}，中文将无法显示！")
+    print(f"[FBA Label] warning: font not found {FONT_PATH}, Chinese text may fail")
+
+
+def _safe_filename_part(value: str, max_len: int = 30) -> str:
+    """过滤文件名中的危险字符，防止路径穿越和文件名非法"""
+    value = value.strip()[:max_len]
+    return re.sub(r'[^A-Za-z0-9_-]', '_', value)
+
+
+def _cleanup_old_labels(directory: str, keep_days: int = 7):
+    """清理指定目录下超过 keep_days 天的旧标签 PDF"""
+    if not os.path.isdir(directory):
+        return
+    now = time.time()
+    deadline = now - keep_days * 86400
+    try:
+        for fname in os.listdir(directory):
+            if not fname.startswith("Label-") or not fname.endswith(".pdf"):
+                continue
+            fpath = os.path.join(directory, fname)
+            try:
+                if os.path.getmtime(fpath) < deadline:
+                    os.remove(fpath)
+                    print(f"[FBA Label] cleanup old label: {fname}")
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"[FBA Label] cleanup old labels failed: {e}")
+
+
+def _truncate_text(text: str, font_name: str, font_size: float, max_width: float, c: canvas.Canvas) -> str:
+    """按最大宽度截断文本，超出加省略号"""
+    if not text:
+        return text
+    text_width = c.stringWidth(text, font_name, font_size)
+    if text_width <= max_width:
+        return text
+    ellipsis = "..."
+    ellipsis_width = c.stringWidth(ellipsis, font_name, font_size)
+    avail = max_width - ellipsis_width
+    if avail <= 0:
+        return text[:10]
+    # 从后往前截断
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if c.stringWidth(text[:mid], font_name, font_size) <= avail:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + ellipsis
 
 
 def _make_code128_image(fnsku: str, target_width_mm: float, module_height_mm: float = 16.0, dpi: int = 600):
@@ -46,10 +100,15 @@ def _make_code128_image(fnsku: str, target_width_mm: float, module_height_mm: fl
         img.load()
         return img, img.width / dpi * 25.4, img.height / dpi * 25.4
 
+    if not fnsku or not re.fullmatch(r'[A-Za-z0-9]+', fnsku):
+        raise ValueError("FNSKU 不能为空且只能包含字母和数字")
+
     # 第 1 遍：参考条宽 0.3mm，量出实际模块数
     ref_mw, ref_qz = 0.3, 3.0
     _, ref_w_mm, _ = _build(ref_mw, ref_qz)
     module_count = (ref_w_mm - 2 * ref_qz) / ref_mw
+    if module_count <= 0:
+        raise ValueError("FNSKU 条码模块数计算异常")
 
     # 第 2 遍：按目标宽度反推条宽（两侧安静区按 10 个模块预留，Code128 规范要求）
     module_width = target_width_mm / (module_count + 20)
@@ -68,113 +127,141 @@ def generate_amazon_label_v4(
     height_mm: float = 40,
     output_dir: str = "static/fbatag"
 ):
+    if not fnsku or not re.fullmatch(r'[A-Za-z0-9]+', fnsku):
+        raise ValueError("fnsku 不能为空且只能包含字母和数字")
+    if not sku:
+        raise ValueError("sku 不能为空")
+
+    # 尺寸下限：40x30mm，防止条码被裁切导致扫不出来
+    try:
+        width_mm = float(width_mm)
+        height_mm = float(height_mm)
+    except (TypeError, ValueError):
+        raise ValueError("width_mm / height_mm 格式错误")
+    if width_mm < 40 or height_mm < 30:
+        raise ValueError("标签尺寸不能小于 40x30mm")
+
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    from datetime import datetime
+    # 清理 7 天前的旧标签，避免 static/fbatag 无限膨胀
+    _cleanup_old_labels(output_dir, keep_days=7)
+
+    # 文件名加短 UUID 防止 1 秒内并发冲突
     ts = datetime.now().strftime('%Y%m%d%H%M%S')
-    file_name = f"Label-{sku}-{fnsku}-{ts}.pdf"
+    uid = uuid.uuid4().hex[:8]
+    file_name = f"Label-{_safe_filename_part(sku)}-{_safe_filename_part(fnsku)}-{ts}-{uid}.pdf"
     output_path = os.path.join(output_dir, file_name)
 
-    # --- 1. 画布设置 ---
-    width = width_mm * mm
-    height = height_mm * mm
-    c = canvas.Canvas(output_path, pagesize=(width, height))
+    c = None
+    try:
+        # --- 1. 画布设置 ---
+        width = width_mm * mm
+        height = height_mm * mm
+        c = canvas.Canvas(output_path, pagesize=(width, height))
 
-    # --- 2. 条码参数（关键！）---
-    margin = 3 * mm
-    available_width = width - (margin * 2)
+        # 预留 3mm 左右边距
+        margin = 3 * mm
+        available_width = width - (margin * 2)
+        text_max_width = available_width - 1 * mm  # 文本左右再留 0.5mm 呼吸空间
 
-    # 用位图条码替代矢量条码，宽度自动撑满可用区域；热敏打印按像素渲染，扫不出来概率大幅降低
-    bc_img, bc_w_mm, bc_h_mm = _make_code128_image(fnsku, target_width_mm=available_width / mm)
-    natural_w = bc_w_mm * mm
-    natural_h = bc_h_mm * mm
+        # --- 2. 条码参数（关键！）---
+        bc_img, bc_w_mm, bc_h_mm = _make_code128_image(fnsku, target_width_mm=available_width / mm)
+        natural_w = bc_w_mm * mm
+        natural_h = bc_h_mm * mm
 
-    # 兜底：条宽触及下限导致条码仍超出可用宽度时，按比例缩小（位图缩放比矢量小数条宽稳定）
-    if natural_w > available_width:
-        scale = available_width / natural_w
-        draw_w = available_width
-        draw_h = natural_h * scale
-        if scale < 0.999:  # 像素取整导致的 0.0x mm 溢出不算缩小，不打印误导日志
-            print(f"[FBA Label] FNSKU 过长，条码自动缩小至 {scale:.1%} 以适配标签")
-    else:
-        draw_w = natural_w
-        draw_h = natural_h
+        # 兜底：条宽触及下限导致条码仍超出可用宽度时，按比例缩小
+        if natural_w > available_width:
+            scale = available_width / natural_w
+            draw_w = available_width
+            draw_h = natural_h * scale
+            if scale < 0.999:
+                print(f"[FBA Label] fnsku too long, barcode scaled to {scale:.1%}")
+        else:
+            draw_w = natural_w
+            draw_h = natural_h
 
-    # --- 3. 绘制条码（带留白背景）---
-    bc_x = (width - draw_w) / 2  # 居中
-    bc_y = height - 19 * mm
+        # --- 3. 绘制条码（带留白背景）---
+        bc_x = (width - draw_w) / 2  # 居中
+        bc_y = height - 19 * mm
 
-    # 画白色背景块（强制留白，视觉上也有边距）
-    quiet_zone = 3 * mm  # 两侧留白
-    c.setFillColorRGB(1, 1, 1)
-    c.rect(
-        bc_x - quiet_zone,
-        bc_y - 1 * mm,
-        draw_w + (quiet_zone * 2),
-        draw_h + 2 * mm,
-        fill=1, stroke=0
-    )
-    c.setFillColorRGB(0, 0, 0)
+        quiet_zone = 3 * mm
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(
+            bc_x - quiet_zone,
+            bc_y - 1 * mm,
+            draw_w + (quiet_zone * 2),
+            draw_h + 2 * mm,
+            fill=1, stroke=0
+        )
+        c.setFillColorRGB(0, 0, 0)
+        c.drawImage(bc_img, bc_x, bc_y, width=draw_w, height=draw_h)
 
-    # 绘制条码位图
-    c.drawImage(bc_img, bc_x, bc_y, width=draw_w, height=draw_h)
+        # --- 4. 动态布局：条码和底部固定，中间均分间距 ---
+        bottom_baseline = 2 * mm
+        top_of_bottom_row = 6 * mm
+        barcode_bottom = bc_y
 
-    # --- 4. 动态布局：条码和底部固定，中间均分间距 ---
-    bottom_baseline = 2 * mm                       # 底部 SKU/MIC 基线（固定）
-    top_of_bottom_row = 6 * mm                     # 底部行占 6mm
-    barcode_bottom = bc_y                          # 条码底部（固定）
+        is_tight = height_mm <= 30
+        pn_font_size = 6 if is_tight else 8
+        ei_font_size = 6 if is_tight else 7
 
-    # 30mm 及以下缩小产品名字号
-    is_tight = height_mm <= 30
-    pn_font_size = 6 if is_tight else 8
+        # 截断文本，防止超长产品名或附加信息超出标签右边界
+        display_name = _truncate_text(product_name, "SimHei", pn_font_size, text_max_width, c)
+        display_extra = _truncate_text(extra_info, "SimHei", ei_font_size, text_max_width, c)
 
-    # 中间文本行（从上到下：FNSKU → 产品名 → 附加信息 够空间才加）
-    mid_lines = [
-        ("Helvetica-Bold", 10, fnsku, True),          # FNSKU 居中
-        ("SimHei", pn_font_size, product_name, False), # 产品名 左对齐
-    ]
-    if extra_info and (barcode_bottom - top_of_bottom_row) > 14 * mm:
-        mid_lines.append(("SimHei", 6 if is_tight else 7, extra_info, False))
+        # 中间文本行（FNSKU 居中，产品名 / 附加信息左对齐）
+        mid_lines = [("SimHei", pn_font_size, display_name)]
+        if display_extra and (barcode_bottom - top_of_bottom_row) > 14 * mm:
+            mid_lines.append(("SimHei", ei_font_size, display_extra))
 
-    # FNSKU 基线：升部 2.5mm + 间距 1mm = 条码底向下 3.5mm
-    # 保证 FNSKU 文字和条码之间有可见间距
-    fnsku_baseline = barcode_bottom - 3.5 * mm
+        fnsku_baseline = barcode_bottom - 3.5 * mm
+        below_fnsku = fnsku_baseline - 1 * mm - top_of_bottom_row
+        n_other = len(mid_lines)
+        line_h = 2.5 * mm if is_tight else 3.2 * mm
+        other_block_h = n_other * line_h
+        other_gap = (below_fnsku - other_block_h) / (n_other + 1)
+        if other_gap < 0.5 * mm:
+            other_gap = 0.5 * mm
 
-    # FNSKU 以下可用空间
-    below_fnsku = fnsku_baseline - 1 * mm - top_of_bottom_row  # 减去 FNSKU 降部 1mm
-    other_lines = mid_lines[1:]                                 # FNSKU 之外的行
-    n_other = len(other_lines)
-    line_h = 2.5 * mm if is_tight else 3.2 * mm
-    other_block_h = n_other * line_h
-    other_gap = (below_fnsku - other_block_h) / (n_other + 1)
-    if other_gap < 0.5 * mm:
-        other_gap = 0.5 * mm
+        # 渲染 FNSKU（居中）
+        c.setFont("Helvetica-Bold", 10)
+        c.drawCentredString(width / 2, fnsku_baseline, fnsku)
 
-    # 渲染 FNSKU（居中）
-    c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(width / 2, fnsku_baseline, fnsku)
+        # 渲染产品名 / 附加信息（左对齐）
+        y = fnsku_baseline - 1 * mm - other_gap
+        for font_name, font_size, text in mid_lines:
+            y -= line_h
+            baseline = y + 0.8 * mm
+            c.setFont(font_name, font_size)
+            c.drawString(3 * mm, baseline, text)
+            y -= other_gap
 
-    # 渲染其余行（从左到右从上往下）
-    y = fnsku_baseline - 1 * mm - other_gap            # FNSKU 降部下方起始
-    for font_name, font_size, text, centered in other_lines:
-        y -= line_h
-        baseline = y + 0.8 * mm
-        c.setFont(font_name, font_size)
-        c.drawString(3 * mm, baseline, text)
-        y -= other_gap
+        # --- 5. 绘制底部信息（SKU + Made In China）---
+        bottom_font_size = 6 if is_tight else 8
+        c.setFont("SimHei", bottom_font_size)
+        mic_text = "Made In China"
+        mic_width = c.stringWidth(mic_text, "SimHei", bottom_font_size)
+        sku_text = f"SKU:{sku}"
+        # SKU 从 3mm 处左对齐绘制，预留右侧 MIC 空间（加 1mm 间隙），避免重叠
+        sku_max_width = width - 6 * mm - mic_width - 1 * mm
+        sku_display = _truncate_text(sku_text, "SimHei", bottom_font_size, sku_max_width, c)
+        c.drawString(3 * mm, bottom_baseline, sku_display)
+        c.drawString(width - 3 * mm - mic_width, bottom_baseline, mic_text)
 
-    # --- 5. 绘制底部信息（SKU + Made In China，固定贴底）---
-    bottom_font_size = 6 if is_tight else 8
-    c.setFont("SimHei", bottom_font_size)
-    c.drawString(3 * mm, bottom_baseline, f"SKU:{sku}")
-    mic_text = "Made In China"
-    mic_width = c.stringWidth(mic_text, "SimHei", bottom_font_size)
-    c.drawString(width - 3 * mm - mic_width, bottom_baseline, mic_text)
+        c.save()
+        print(f"[FBA Label] label generated: {output_path}")
+        return output_path
 
-    c.save()
-    print(f"[FBA Label] 标签生成成功: {output_path}")
-    return output_path
+    except Exception as e:
+        # 生成失败时删除半成品 PDF，避免留下空文件
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        raise
+
 
 # ==================== 测试运行 ====================
 if __name__ == "__main__":
