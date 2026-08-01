@@ -1,7 +1,12 @@
 import os
+from io import BytesIO
+
+import barcode
+from barcode.writer import ImageWriter
+from PIL import Image
 from reportlab.pdfgen import canvas
-from reportlab.graphics.barcode import code128
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
@@ -14,7 +19,45 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "static", "fbatag")
 if os.path.exists(FONT_PATH):
     pdfmetrics.registerFont(TTFont('SimHei', FONT_PATH))
 else:
-    print(f"❌ 警告：未找到字体文件 {FONT_PATH}，中文将无法显示！")
+    print(f"[FBA Label] 警告：未找到字体文件 {FONT_PATH}，中文将无法显示！")
+
+
+def _make_code128_image(fnsku: str, target_width_mm: float, module_height_mm: float = 16.0, dpi: int = 600):
+    """生成 Code128 条码位图，宽度自动撑满 target_width_mm，返回 (ImageReader, width_mm, height_mm)
+
+    两遍生成：
+      1. 先用参考条宽生成一次，测出条码实际模块数（python-barcode 会自动用 Code-C 压缩数字段，模块数不能硬算）；
+      2. 按目标宽度反推条宽重新生成，让条码像原矢量版一样撑满标签，屏幕/打印都好扫。
+
+    600 DPI 保证条边界量化误差 < 0.03mm，远小于条宽本身，热敏打印稳定。
+    """
+    def _build(module_width_mm: float, quiet_zone_mm: float):
+        bc = barcode.get('code128', fnsku, writer=ImageWriter())
+        buf = BytesIO()
+        bc.write(buf, {
+            'module_width': module_width_mm,
+            'module_height': module_height_mm,
+            'quiet_zone': quiet_zone_mm,
+            'write_text': False,  # 不在图片里写字，FNSKU 单独画在 PDF 上
+            'dpi': dpi,
+        })
+        buf.seek(0)
+        img = Image.open(buf)
+        img.load()
+        return img, img.width / dpi * 25.4, img.height / dpi * 25.4
+
+    # 第 1 遍：参考条宽 0.3mm，量出实际模块数
+    ref_mw, ref_qz = 0.3, 3.0
+    _, ref_w_mm, _ = _build(ref_mw, ref_qz)
+    module_count = (ref_w_mm - 2 * ref_qz) / ref_mw
+
+    # 第 2 遍：按目标宽度反推条宽（两侧安静区按 10 个模块预留，Code128 规范要求）
+    module_width = target_width_mm / (module_count + 20)
+    module_width = max(module_width, 0.18)  # 下限，防止超长 FNSKU 条宽过小
+    img, w_mm, h_mm = _build(module_width, 10 * module_width)
+
+    return ImageReader(img), w_mm, h_mm
+
 
 def generate_amazon_label_v4(
     fnsku: str,
@@ -39,52 +82,43 @@ def generate_amazon_label_v4(
     c = canvas.Canvas(output_path, pagesize=(width, height))
 
     # --- 2. 条码参数（关键！）---
-    # 50mm 标签，左右各留 3mm 边距，条码可用宽度 44mm
     margin = 3 * mm
     available_width = width - (margin * 2)
-    
-    # 先尝试 0.5mm，如果太宽就自动缩小
-    bar_width = 0.5 * mm
-    
-    barcode = code128.Code128(
-        fnsku, 
-        barHeight=16 * mm, 
-        barWidth=bar_width,
-        quiet=False,        # 我们自己控制留白
-        humanReadable=False
-    )
-    
-    # 如果条码超出可用宽度，按比例缩小
-    if barcode.width > available_width:
-        scale = available_width / barcode.width
-        bar_width = bar_width * scale
-        barcode = code128.Code128(
-            fnsku, 
-            barHeight=16 * mm, 
-            barWidth=bar_width,
-            quiet=False,
-            humanReadable=False
-        )
-        print(f"⚠️ 条码自动缩小至 {bar_width/mm:.2f}mm 以适配标签")
-    
+
+    # 用位图条码替代矢量条码，宽度自动撑满可用区域；热敏打印按像素渲染，扫不出来概率大幅降低
+    bc_img, bc_w_mm, bc_h_mm = _make_code128_image(fnsku, target_width_mm=available_width / mm)
+    natural_w = bc_w_mm * mm
+    natural_h = bc_h_mm * mm
+
+    # 兜底：条宽触及下限导致条码仍超出可用宽度时，按比例缩小（位图缩放比矢量小数条宽稳定）
+    if natural_w > available_width:
+        scale = available_width / natural_w
+        draw_w = available_width
+        draw_h = natural_h * scale
+        if scale < 0.999:  # 像素取整导致的 0.0x mm 溢出不算缩小，不打印误导日志
+            print(f"[FBA Label] FNSKU 过长，条码自动缩小至 {scale:.1%} 以适配标签")
+    else:
+        draw_w = natural_w
+        draw_h = natural_h
+
     # --- 3. 绘制条码（带留白背景）---
-    bc_x = (width - barcode.width) / 2  # 居中
+    bc_x = (width - draw_w) / 2  # 居中
     bc_y = height - 19 * mm
-    
+
     # 画白色背景块（强制留白，视觉上也有边距）
     quiet_zone = 3 * mm  # 两侧留白
     c.setFillColorRGB(1, 1, 1)
     c.rect(
         bc_x - quiet_zone,
         bc_y - 1 * mm,
-        barcode.width + (quiet_zone * 2),
-        16 * mm + 2 * mm,
+        draw_w + (quiet_zone * 2),
+        draw_h + 2 * mm,
         fill=1, stroke=0
     )
     c.setFillColorRGB(0, 0, 0)
-    
-    # 绘制条码
-    barcode.drawOn(c, bc_x, bc_y)
+
+    # 绘制条码位图
+    c.drawImage(bc_img, bc_x, bc_y, width=draw_w, height=draw_h)
 
     # --- 4. 动态布局：条码和底部固定，中间均分间距 ---
     bottom_baseline = 2 * mm                       # 底部 SKU/MIC 基线（固定）
@@ -139,7 +173,7 @@ def generate_amazon_label_v4(
     c.drawString(width - 3 * mm - mic_width, bottom_baseline, mic_text)
 
     c.save()
-    print(f"✅ 标签生成成功: {output_path}")
+    print(f"[FBA Label] 标签生成成功: {output_path}")
     return output_path
 
 # ==================== 测试运行 ====================
