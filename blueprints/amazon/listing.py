@@ -1936,6 +1936,34 @@ def _sync_listings(shop_id, included_data=None, page_size=20, sync_products_asyn
         }
 
 
+def _sync_fnsku_to_products(fnsku_changes):
+    """将 amazon_listings 中发生变化的 fnsku 同步到 products 表"""
+    if not fnsku_changes:
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            for sku, fn_sku in fnsku_changes.items():
+                cursor.execute(
+                    """
+                    UPDATE products
+                    SET fnsku = %s,
+                        updated_at = NOW()
+                    WHERE seller_sku = %s
+                      AND (fnsku IS NULL OR fnsku = '' OR fnsku != %s)
+                    """,
+                    (fn_sku, sku, fn_sku)
+                )
+        conn.commit()
+        print(f"[FNSKU Sync] 已更新 {len(fnsku_changes)} 条 products fnsku")
+    except Exception as e:
+        print(f"[FNSKU Sync] 更新 products fnsku 失败: {str(e)}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
     """
     批量同步 Listing 数据到数据库（含子表）
@@ -1947,6 +1975,7 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
     conn = get_db_connection()
     count = 0
     new_skus = []
+    fnsku_changes = {}
     try:
         with conn.cursor() as cursor:
             all_skus = []
@@ -1956,14 +1985,15 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
                 )
                 all_skus.append(main_row['sku'])
 
-            existing_skus = set()
+            existing_rows = {}
             if all_skus:
                 placeholders = ','.join(['%s'] * len(all_skus))
                 cursor.execute(
-                    f"SELECT sku FROM amazon_listings WHERE shop_id = %s AND sku IN ({placeholders})",
+                    f"SELECT sku, fn_sku FROM amazon_listings WHERE shop_id = %s AND sku IN ({placeholders})",
                     [shop_id] + all_skus
                 )
-                existing_skus = {row['sku'] for row in cursor.fetchall()}
+                existing_rows = {row['sku']: row for row in cursor.fetchall()}
+            existing_skus = set(existing_rows.keys())
 
             for item in items:
                 main_row, bullets, images, issues, offers = _parse_listing_item(
@@ -1974,6 +2004,12 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
 
                 if sku not in existing_skus:
                     new_skus.append(sku)
+
+                # 检测 fnsku 变化，后续同步到 products 表
+                old_fn_sku = (existing_rows.get(sku, {}).get('fn_sku') or '').strip()
+                new_fn_sku = (main_row['fn_sku'] or '').strip()
+                if new_fn_sku and old_fn_sku != new_fn_sku:
+                    fnsku_changes[sku] = new_fn_sku
 
                 # 1. 写入/更新主表
                 sql_main = """
@@ -2095,6 +2131,9 @@ def sync_listings_to_db(shop_id, marketplace_id, seller_id, items):
         return count, str(e), new_skus
     finally:
         conn.close()
+
+    # 同步 fnsku 变化到 products 表（与 listing 主事务隔离，失败不影响 listing 同步）
+    _sync_fnsku_to_products(fnsku_changes)
 
     return count, None, new_skus
 
