@@ -17,6 +17,7 @@ from services.shop_service import get_sp_api_client
 from services.oss_uploader import upload_image_for_listing
 from services.mysql_service import get_db_connection
 from services.deepseekAI import generate_declaration_info
+from blueprints.asin_bsr import attach_bsr_info, get_bsr_trend
 
 amazon_listing_bp = Blueprint('amazon_listing', __name__, url_prefix='/api')
 
@@ -126,6 +127,62 @@ def get_listing_detail(sku):
         return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing DB] 详情查询异常: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/bsr-trend', methods=['GET'])
+@login_required
+@permission_required('amazon_listings:page')
+def get_listing_bsr_trend(sku):
+    """
+    查询单个 Listing 的 BSR 排名历史趋势（供弹框展示折线图）
+    查询参数（必填）:
+        shop_id  - 店铺ID
+    查询参数（可选）:
+        days - 最近 N 天，默认全部历史
+    """
+    try:
+        shop_id = _require_shop_id()
+        days = request.args.get('days', '').strip()
+        if days:
+            try:
+                days = int(days)
+            except ValueError:
+                days = None
+
+        listing = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
+        if not listing:
+            return jsonify({"status": "error", "message": "Listing 不存在"}), 404
+
+        asin = (listing.get('asin') or '').strip()
+        if not asin:
+            return jsonify({"status": "error", "message": "该 Listing 没有 ASIN"}), 400
+
+        marketplace_id = listing.get('marketplace_id') or 'ATVPDKIKX0DER'
+        trend = get_bsr_trend(asin, marketplace_id=marketplace_id, days=days)
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "asin": asin,
+                "sku": sku,
+                "marketplace_id": marketplace_id,
+                "current": {
+                    "bsr_rank": listing.get('bsr_rank'),
+                    "bsr_category": listing.get('bsr_category'),
+                    "bsr_sub_rank": listing.get('bsr_sub_rank'),
+                    "bsr_sub_category": listing.get('bsr_sub_category'),
+                    "bsr_change_pct": listing.get('bsr_change_pct'),
+                    "bsr_trend": listing.get('bsr_trend'),
+                },
+                "trend": trend
+            }
+        })
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        print(f"[Amazon Listing BSR Trend] 查询异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -2226,6 +2283,10 @@ def _get_listings_from_db(shop_id, sku=None, asin=None, product_type=None, statu
                 for r in rows:
                     r['issues'] = issues_map.get(r['sku'], [])
 
+            # 附加 BSR 摘要（当前排名 + 相对昨日涨跌）
+            if rows:
+                attach_bsr_info(rows)
+
             return {
                 "list": rows,
                 "total": total,
@@ -2281,6 +2342,9 @@ def _get_listing_detail_from_db(shop_id, sku):
                 ORDER BY id ASC
             """, (shop_id, sku))
             row['offers'] = cursor.fetchall()
+
+            # 附加 BSR 摘要
+            attach_bsr_info([row])
 
             return row
     finally:

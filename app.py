@@ -32,6 +32,7 @@ from blueprints.reports import reports_bp
 from blueprints.cron import cron_bp
 from blueprints.permissions import permissions_bp
 from blueprints.options import options_bp
+from blueprints.asin_bsr import asin_bsr_bp
 
 import services.notification_handlers
 
@@ -181,6 +182,9 @@ app.register_blueprint(permissions_bp)
 
 # 注册下拉选项路由
 app.register_blueprint(options_bp)
+
+# 注册 ASIN BSR 监控路由
+app.register_blueprint(asin_bsr_bp)
 
 # 启动箱唛整理后台工作线程
 from blueprints.fba_tools import _start_label_workers
