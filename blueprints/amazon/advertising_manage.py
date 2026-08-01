@@ -1426,7 +1426,7 @@ def create_keywords():
     try:
         client = get_ads_api_client(int(shop_id))
         resp = client.create_keywords(transformed)
-        _sync_created_keywords(resp, int(shop_id))
+        _sync_created_keywords(resp, int(shop_id), transformed)
         return jsonify({"status": "success", "data": resp})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -1517,7 +1517,7 @@ def upload_keywords():
         try:
             client = get_ads_api_client(int(shop_id))
             resp = client.create_keywords(transformed)
-            _sync_created_keywords(resp, int(shop_id))
+            _sync_created_keywords(resp, int(shop_id), transformed)
             return jsonify({"status": "success", "data": resp})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
@@ -2557,16 +2557,33 @@ def _sync_keywords(cursor, client, shop_id):
     return len(keywords)
 
 
-def _sync_created_keywords(resp, shop_id):
+def _sync_created_keywords(resp, shop_id, original_keywords):
     """将批量创建的关键词响应写入本地 DB"""
-    keywords = resp.get("keywords", {})
-    success_items = keywords.get("success", []) or resp.get("success", [])
+    if not resp or not original_keywords:
+        return
+
+    # 当前接口实际返回格式：
+    # {"keywords": {"error": [], "success": [{"index": 0, "keywordId": "..."}]}}
+    success_items = []
+    if isinstance(resp, dict):
+        keywords = resp.get("keywords")
+        if isinstance(keywords, dict):
+            success_items = keywords.get("success") or []
     if not success_items:
         return
+
     conn = _get_conn()
     try:
         with conn.cursor() as c:
             for item in success_items:
+                if not isinstance(item, dict):
+                    continue
+                idx = item.get("index")
+                keyword_id = item.get("keywordId")
+                if idx is None or keyword_id is None or idx < 0 or idx >= len(original_keywords):
+                    continue
+
+                req = original_keywords[idx]
                 c.execute("""
                     INSERT INTO amazon_ads_keywords
                         (campaign_id, ad_group_id, keyword_id, keyword_text,
@@ -2581,15 +2598,15 @@ def _sync_created_keywords(resp, shop_id):
                         last_update_datetime=VALUES(last_update_datetime),
                         synced_at=NOW()
                 """, (
-                    int(item.get("campaignId", 0)),
-                    int(item.get("adGroupId", 0)),
-                    int(item["keywordId"]),
-                    _safe_str(item.get("keywordText")),
-                    _safe_str(item.get("matchType")),
-                    _safe_str(item.get("state")),
-                    _safe_decimal(item.get("bid")),
-                    _safe_str(item.get("servingStatus")),
-                    _safe_date(item.get("lastUpdateDateTime")),
+                    int(req.get("campaignId", 0) or 0),
+                    int(req.get("adGroupId", 0) or 0),
+                    int(keyword_id),
+                    _safe_str(req.get("keywordText")),
+                    _safe_str(req.get("matchType")),
+                    _safe_str(req.get("state", "enabled")),
+                    _safe_decimal(req.get("bid")),
+                    "",  # 创建接口不返回 servingStatus
+                    None,
                 ))
         conn.commit()
     finally:
