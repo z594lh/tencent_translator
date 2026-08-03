@@ -578,6 +578,10 @@ def _parse_weight_kg(attrs):
                 value = float(value)
                 if unit == 'pounds':
                     return round(value * 0.453592, 3)
+                elif unit == 'ounces':
+                    return round(value * 0.028349523125, 3)
+                elif unit == 'grams':
+                    return round(value / 1000, 3)
                 elif unit == 'kg':
                     return round(value, 3)
                 return value

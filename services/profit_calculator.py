@@ -350,7 +350,8 @@ def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, d
     计算逻辑：
       1. 找到包含该 SKU 的最新有效货件（排除 CANCELLED）。
       2. 读取该货件绑定的运单总费用(CNY)。
-      3. 读取该货件下所有箱子的总重量(KG)。
+      3. 读取该货件绑定的运单计费总重量(KG)（货代为准，可能为实重或泡重；
+         运单无重量时回退为按该货件下所有箱子重量求和）。
       4. 读取产品表该 SKU 的单件重量(KG)。
       5. 单件头程(CNY) = 运单总费用 * SKU单件重量 / 货件总重量
       6. headway_usd = headway_cny * 汇率（汇率由调用方提供，避免在此再次查表）
@@ -391,10 +392,10 @@ def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, d
                 if it.get("msku") == seller_sku:
                     total_qty += int(it.get("quantity") or 0)
 
-    # 运单总费用
+    # 运单总费用 + 计费总重量
     cursor.execute(
         """
-        SELECT total_cost_cny FROM logistics_waybills
+        SELECT total_cost_cny, total_weight_kg FROM logistics_waybills
         WHERE shipment_id = %s ORDER BY created_at DESC LIMIT 1
         """,
         (shipment_id,),
@@ -408,19 +409,23 @@ def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, d
         )
     total_cost_cny = Decimal(str(waybill["total_cost_cny"]))
 
-    # 货件总重量
-    cursor.execute(
-        "SELECT weight_value, weight_unit FROM amazon_inbound_plan_boxes WHERE shipment_id = %s",
-        (shipment_id,),
-    )
-    boxes = cursor.fetchall()
-    total_weight_kg = Decimal("0")
-    for box in boxes:
-        w = Decimal(str(box.get("weight_value") or 0))
-        unit = (box.get("weight_unit") or "").upper()
-        if unit == "LB":
-            w = w * _LB_TO_KG
-        total_weight_kg += w
+    # 货件总重量：优先取运单计费重量（货代为准，实重或泡重）；
+    # 运单重量缺失/为0时，回退为货件下所有箱子重量求和
+    total_weight_source = "waybill"
+    total_weight_kg = Decimal(str(waybill["total_weight_kg"])) if waybill.get("total_weight_kg") else Decimal("0")
+    if total_weight_kg <= 0:
+        total_weight_source = "boxes_sum"
+        cursor.execute(
+            "SELECT weight_value, weight_unit FROM amazon_inbound_plan_boxes WHERE shipment_id = %s",
+            (shipment_id,),
+        )
+        boxes = cursor.fetchall()
+        for box in boxes:
+            w = Decimal(str(box.get("weight_value") or 0))
+            unit = (box.get("weight_unit") or "").upper()
+            if unit == "LB":
+                w = w * _LB_TO_KG
+            total_weight_kg += w
     if total_weight_kg <= 0:
         return (
             Decimal("0"),
@@ -450,6 +455,7 @@ def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, d
         "total_qty_in_shipment": total_qty,
         "waybill_total_cost_cny": float(total_cost_cny),
         "shipment_total_weight_kg": float(total_weight_kg),
+        "total_weight_source": total_weight_source,
         "sku_weight_kg": float(sku_weight_kg),
         "allocation_formula": f"{float(total_cost_cny)} * {float(sku_weight_kg)} / {float(total_weight_kg)}",
     }
