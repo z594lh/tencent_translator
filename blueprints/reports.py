@@ -21,6 +21,7 @@
     POST   /api/reports/inventory-turnover/batch-update-status  批量更新库存状态
   SKU 销售数据:
     GET    /api/reports/sku-sales                    分页查询 SKU 销售数据列表
+    GET    /api/reports/sku-sales/trend              单个 SKU 每日销售趋势（销量/广告费/利润/ACOS/TACOS）
     POST   /api/reports/sku-sales/generate           手动触发全量生成
     POST   /api/reports/sku-sales/generate/<sku>     手动触发单个 SKU 生成
   数据导入:
@@ -143,6 +144,24 @@ def _get_shop_id_optional():
         return int(shop_id)
     except ValueError:
         return None
+
+
+def _marketplace_currency(marketplace_id):
+    """
+    根据 marketplace_id（如 US-xxx）或 region 推断币种，未知时默认 USD。
+    """
+    mp = (marketplace_id or '').upper()
+    region = mp.split('-')[0] if '-' in mp else mp
+    mapping = {
+        'US': 'USD', 'GB': 'GBP', 'JP': 'JPY', 'CA': 'CAD', 'MX': 'MXN',
+        'BR': 'BRL', 'AU': 'AUD', 'AE': 'AED', 'SA': 'SAR', 'SG': 'SGD',
+        'PL': 'PLN', 'SE': 'SEK', 'TR': 'TRY', 'EG': 'EGP',
+    }
+    # 欧洲统一使用欧元
+    eu = {'AT', 'BE', 'DE', 'ES', 'FR', 'IT', 'NL', 'IE', 'LU', 'FI', 'SE'}
+    if region in eu:
+        return 'EUR'
+    return mapping.get(region, 'USD')
 
 
 # ============================================================
@@ -1211,6 +1230,199 @@ def trigger_sku_sales_single(sku):
         return jsonify({"status": "success", "message": "生成完成", "data": result})
     except Exception as e:
         print(f"[trigger_sku_sales_single] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@reports_bp.route('/reports/sku-sales/trend', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def sku_sales_trend():
+    """
+    获取单个 SKU 的每日销售趋势（销量/广告费/利润/ACOS/TACOS）
+
+    简介: 按天返回指定 SKU 在日期范围内的销售、广告费、利润、ACOS、TACOS，
+          数据来源于 sku_profit 每日聚合表，缺失日期补零保证折线连续。
+          传 shop_id 时返回单个店铺数据；不传 shop_id 时返回该 SKU 跨全部店铺
+          按日聚合的数据（ACOS/TACOS 用当日求和值重新计算，不取平均）。
+
+    查询参数:
+        sku           (必填) SKU 编号
+        shop_id       (可选) 店铺 ID；不传/为空时聚合全部店铺
+        start_date    (可选) 起始日期 YYYY-MM-DD
+        end_date      (可选) 结束日期 YYYY-MM-DD
+        days          (可选) 快捷天数（7/14/30/60），与 start_date/end_date 互斥，默认 30，最大 90
+    """
+    try:
+        sku = request.args.get('sku', '').strip()
+        shop_id_raw = request.args.get('shop_id', '').strip()
+        start_date = request.args.get('start_date', '').strip() or None
+        end_date = request.args.get('end_date', '').strip() or None
+        days_raw = request.args.get('days', '').strip() or None
+
+        if not sku:
+            return jsonify({"status": "error", "message": "缺少必要参数：sku"}), 400
+
+        shop_id = None
+        if shop_id_raw:
+            try:
+                shop_id = int(shop_id_raw)
+            except (TypeError, ValueError):
+                return jsonify({"status": "error", "message": "shop_id 格式错误"}), 400
+
+        today = datetime.now().date()
+        if start_date or end_date:
+            try:
+                start_d = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else today - timedelta(days=30)
+                end_d = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else today - timedelta(days=1)
+            except ValueError:
+                return jsonify({"status": "error", "message": "start_date/end_date 格式应为 YYYY-MM-DD"}), 400
+        else:
+            if days_raw:
+                try:
+                    days = int(days_raw)
+                except (TypeError, ValueError):
+                    days = 30
+            else:
+                days = 30
+            if days < 1 or days > 90:
+                days = 30
+            end_d = today - timedelta(days=1)
+            start_d = end_d - timedelta(days=days - 1)
+
+        if start_d > end_d:
+            return jsonify({"status": "error", "message": "start_date 不能晚于 end_date"}), 400
+        if (end_d - start_d).days > 90:
+            return jsonify({"status": "error", "message": "日期范围不能超过 90 天"}), 400
+
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cursor:
+                if shop_id is not None:
+                    cursor.execute(
+                        "SELECT id, region, marketplace_id FROM amazon_shops WHERE id = %s AND status = 1",
+                        (shop_id,))
+                    shop = cursor.fetchone()
+                    if not shop:
+                        return jsonify({"status": "error", "message": "店铺不存在或已停用"}), 400
+                    currency = _marketplace_currency(shop.get('marketplace_id') or shop.get('region'))
+                else:
+                    cursor.execute(
+                        "SELECT region, marketplace_id FROM amazon_shops WHERE status = 1 ORDER BY is_default DESC LIMIT 1")
+                    default_shop = cursor.fetchone()
+                    currency = _marketplace_currency(
+                        (default_shop.get('marketplace_id') if default_shop else None) or
+                        (default_shop.get('region') if default_shop else None))
+
+                if shop_id is None:
+                    cursor.execute("""
+                        SELECT report_date,
+                               SUM(sales_qty) AS sales_qty,
+                               SUM(sales_amount) AS sales_amount,
+                               SUM(ad_cost) AS ad_cost,
+                               SUM(ad_sales) AS ad_sales,
+                               SUM(ad_orders) AS ad_orders,
+                               SUM(gross_profit) AS gross_profit
+                        FROM sku_profit
+                        WHERE sku = %s
+                          AND report_date BETWEEN %s AND %s
+                        GROUP BY report_date
+                        ORDER BY report_date ASC
+                    """, (sku, start_d, end_d))
+                    rows = cursor.fetchall()
+                    stock = 0
+                    cursor.execute(
+                        "SELECT SUM(fulfillable_quantity) AS total FROM amazon_inventory WHERE seller_sku = %s",
+                        (sku,))
+                    inv = cursor.fetchone()
+                    if inv and inv['total']:
+                        stock = int(inv['total'] or 0)
+                else:
+                    cursor.execute("""
+                        SELECT report_date, sku, asin, product_name,
+                               sales_qty, sales_amount, avg_selling_price,
+                               ad_cost, ad_sales, ad_orders, gross_profit
+                        FROM sku_profit
+                        WHERE shop_id = %s AND sku = %s
+                          AND report_date BETWEEN %s AND %s
+                        ORDER BY report_date ASC
+                    """, (shop_id, sku, start_d, end_d))
+                    rows = cursor.fetchall()
+                    stock = 0
+                    cursor.execute(
+                        "SELECT fulfillable_quantity FROM amazon_inventory WHERE shop_id = %s AND seller_sku = %s LIMIT 1",
+                        (shop_id, sku))
+                    inv = cursor.fetchone()
+                    if inv:
+                        stock = int(inv['fulfillable_quantity'] or 0)
+
+            data_map = {str(r['report_date']): r for r in rows}
+
+            list_data = []
+            cur_date = start_d
+            while cur_date <= end_d:
+                key = str(cur_date)
+                r = data_map.get(key)
+                if r:
+                    sales_qty = int(r['sales_qty'] or 0)
+                    sales_amount = Decimal(str(r['sales_amount'] or 0))
+                    ad_cost = Decimal(str(r['ad_cost'] or 0))
+                    ad_sales = Decimal(str(r['ad_sales'] or 0))
+                    ad_orders = int(r['ad_orders'] or 0)
+                    gross_profit = Decimal(str(r['gross_profit'] or 0))
+                    acos = (ad_cost / ad_sales) if ad_sales > 0 else Decimal('0')
+                    tacos = (ad_cost / sales_amount) if sales_amount > 0 else Decimal('0')
+                    item = {
+                        'date': key,
+                        'sales': sales_qty,
+                        'sales_ad': ad_orders,
+                        'sales_natural': sales_qty - ad_orders,
+                        'revenue': float(sales_amount),
+                        'ad_revenue': float(ad_sales),
+                        'natural_revenue': float(sales_amount - ad_sales),
+                        'ad_cost': float(ad_cost),
+                        'profit': float(gross_profit),
+                        'acos': round(float(acos), 4),
+                        'tacos': round(float(tacos), 4),
+                    }
+                    if shop_id is not None:
+                        item['sell_price'] = float(Decimal(str(r.get('avg_selling_price') or 0)))
+                        item['stock'] = stock
+                else:
+                    item = {
+                        'date': key,
+                        'sales': 0,
+                        'sales_ad': 0,
+                        'sales_natural': 0,
+                        'revenue': 0,
+                        'ad_revenue': 0,
+                        'natural_revenue': 0,
+                        'ad_cost': 0,
+                        'profit': 0,
+                        'acos': 0,
+                        'tacos': 0,
+                    }
+                    if shop_id is not None:
+                        item['sell_price'] = 0
+                        item['stock'] = stock
+                list_data.append(item)
+                cur_date += timedelta(days=1)
+
+            return jsonify({
+                "status": "success",
+                "message": "ok",
+                "data": {
+                    "sku": sku,
+                    "shop_id": shop_id,
+                    "currency": currency,
+                    "start_date": str(start_d),
+                    "end_date": str(end_d),
+                    "list": list_data,
+                }
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[sku_sales_trend] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
