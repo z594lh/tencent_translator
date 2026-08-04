@@ -382,8 +382,14 @@ def list_product_board():
         all_batch = request.args.get('all_batch', '').strip().lower() in ('true', '1')
         sort_by = request.args.get('sort_by', 'sales_30d')
         sort_dir = request.args.get('sort_dir', 'desc')
-        page = int(request.args.get('page', 1))
-        page_size = int(request.args.get('page_size', 20))
+        try:
+            page = int(request.args.get('page', 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(request.args.get('page_size', 20))
+        except (TypeError, ValueError):
+            page_size = 20
 
         if page < 1:
             page = 1
@@ -420,12 +426,22 @@ def list_product_board():
                     params.append(amazon_status)
 
                 if min_sales:
-                    conditions.append("sales_30d >= %s")
-                    params.append(int(min_sales))
+                    try:
+                        min_sales_num = int(min_sales)
+                    except ValueError:
+                        min_sales_num = None
+                    if min_sales_num is not None:
+                        conditions.append("sales_30d >= %s")
+                        params.append(min_sales_num)
 
                 if min_margin:
-                    conditions.append("profit_margin_30d >= %s")
-                    params.append(float(min_margin))
+                    try:
+                        min_margin_num = float(min_margin)
+                    except ValueError:
+                        min_margin_num = None
+                    if min_margin_num is not None:
+                        conditions.append("profit_margin_30d >= %s")
+                        params.append(min_margin_num)
 
                 if is_listed is not None:
                     conditions.append("is_listed = %s")
@@ -460,7 +476,7 @@ def list_product_board():
                         WHERE {where_clause}
                         ORDER BY {sort_by} {sort_dir}
                         LIMIT %s OFFSET %s
-                    """, tuple(params + [latest_date_str, page_size, offset]))
+                    """, tuple([latest_date_str] + params + [page_size, offset]))
                 else:
                     cursor.execute(f"""
                         SELECT *, ({new_product_expr}) AS is_new_product
