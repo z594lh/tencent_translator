@@ -22,6 +22,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client, get_all_active_shops
 from services.mysql_service import get_db_connection
+from services.fee_parser import extract_fees_from_items
 
 amazon_finances_bp = Blueprint('amazon_finances', __name__, url_prefix='/api')
 
@@ -270,34 +271,7 @@ def _extract_fees_from_items(items):
 
     返回: (product_charges, fba_fees, commission) 均为正数
     """
-    pc = 0.0   # ProductCharges (售价, 正数)
-    fb = 0.0   # FBA fees (正数=费用)
-    cm = 0.0   # Commission (正数=费用)
-
-    for item in (items or []):
-        for bd in item.get("breakdowns", []) or []:
-            bt = bd.get("breakdownType", "")
-            if bt == "ProductCharges":
-                subs = bd.get("breakdowns", []) or []
-                if subs:
-                    for sub in subs:
-                        amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
-                        if amt > 0:
-                            pc += amt
-                else:
-                    amt = float((bd.get("breakdownAmount") or {}).get("currencyAmount", 0))
-                    if amt > 0:
-                        pc += amt
-            elif bt == "AmazonFees":
-                for sub in bd.get("breakdowns", []) or []:
-                    amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
-                    if amt < 0:
-                        if sub.get("breakdownType", "").startswith("FBAPer"):
-                            fb += abs(amt)
-                        elif sub.get("breakdownType", "") == "Commission":
-                            cm += abs(amt)
-
-    return round(pc, 2), round(fb, 2), round(cm, 2)
+    return extract_fees_from_items(items)
 
 
 # ============================================================
@@ -319,27 +293,7 @@ def _update_product_real_fees(shop_id, items):
             continue
 
         # 解析 item-level breakdowns (按件均摊) 取实际费用
-        fba = 0.0
-        comm = 0.0
-        price = 0.0
-        for bd in (item.get("breakdowns", []) or []):
-            bt = bd.get("breakdownType", "")
-            if bt == "ProductCharges":
-                subs = bd.get("breakdowns", []) or []
-                if subs:
-                    for sub in subs:
-                        price += float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
-                else:
-                    price += float((bd.get("breakdownAmount") or {}).get("currencyAmount", 0))
-            elif bt == "AmazonFees":
-                for sub in (bd.get("breakdowns", []) or []):
-                    amt = float((sub.get("breakdownAmount") or {}).get("currencyAmount", 0))
-                    if amt < 0:
-                        st = sub.get("breakdownType", "")
-                        if st.startswith("FBAPer"):
-                            fba += abs(amt)
-                        elif st == "Commission":
-                            comm += abs(amt)
+        price, fba, comm = extract_fees_from_items([item])
 
         if fba <= 0 and comm <= 0:
             continue

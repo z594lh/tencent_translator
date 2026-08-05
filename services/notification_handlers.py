@@ -146,7 +146,7 @@ def on_order_cancelled(shop_id: int, order_id: str, buyer_name: str):
 def on_inventory_turnover_warning(shop_id: int, period: str, warnings: list):
     warnings.sort(key=lambda x: x['turnover_days'])
     shop = _shop_label(shop_id)
-    lines = [f"## 库存周转预警 (周转天数 < 45天)\n"]
+    lines = [f"## 库存周转预警 (可售+在途 < 45天)\n"]
     lines.append(f"> 店铺：**{shop}**  |  日期: {period}  |  预警SKU: {len(warnings)} 个\n")
     for w in warnings:
         lines.append(
@@ -154,6 +154,8 @@ def on_inventory_turnover_warning(shop_id: int, period: str, warnings: list):
             f"  : 周转 **{w['turnover_days']}** 天"
             f"  | 近7天销量: {w['sales_7d']}"
             f"  | 当前库存: {w['current_stock']}"
+            f"  | 在途: {w.get('inbound_qty', 0)}"
+            f"  | 总可用: {w.get('total_available', w['current_stock'])}"
         )
     content = "\n".join(lines)
     send_markdown(content)

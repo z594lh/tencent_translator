@@ -36,6 +36,7 @@ from services.profit_calculator import (
     get_unit_costs,
     calculate_profit,
 )
+from services.fee_parser import extract_fees_from_items
 from services.notification_dispatcher import fire
 
 # 价格兜底 SQL：item_price 为 NULL 时用 listing_offers.our_price * 数量 替换
@@ -163,31 +164,7 @@ def _parse_finances_items(finance_rows):
             except (json.JSONDecodeError, TypeError):
                 items = []
         for item in (items or []):
-            it_pc = 0.0
-            it_fba = 0.0
-            it_com = 0.0
-            for bd in (item.get('breakdowns', []) or []):
-                bt = bd.get('breakdownType', '')
-                if bt == 'ProductCharges':
-                    subs = bd.get('breakdowns', []) or []
-                    if subs:
-                        for sub in subs:
-                            amt = float((sub.get('breakdownAmount') or {}).get('currencyAmount', 0))
-                            if amt > 0:
-                                it_pc += amt
-                    else:
-                        amt = float((bd.get('breakdownAmount') or {}).get('currencyAmount', 0))
-                        if amt > 0:
-                            it_pc += amt
-                elif bt == 'AmazonFees':
-                    for sub in (bd.get('breakdowns', []) or []):
-                        amt = float((sub.get('breakdownAmount') or {}).get('currencyAmount', 0))
-                        st = sub.get('breakdownType', '')
-                        if amt < 0:
-                            if st.startswith('FBAPer'):
-                                it_fba += abs(amt)
-                            elif st == 'Commission':
-                                it_com += abs(amt)
+            it_pc, it_fba, it_com = extract_fees_from_items([item])
             for ctx in (item.get('contexts', []) or []):
                 if ctx.get('contextType') == 'ProductContext':
                     sku = ctx.get('sku', '') or ''
@@ -1321,16 +1298,21 @@ def generate_inventory_turnover(shop_id=None):
 
                         if avg_daily_sales > 0:
                             turnover_days = int((Decimal(str(current_stock)) / avg_daily_sales).to_integral_value(rounding=ROUND_HALF_UP))
+                            turnover_days_available = int((Decimal(str(total_available)) / avg_daily_sales).to_integral_value(rounding=ROUND_HALF_UP))
                         else:
                             turnover_days = 9999
+                            turnover_days_available = 9999
 
-                        if turnover_days < 45 and current_stock > 0:
+                        # 预警判断: 可售+在途 周转不足45天才通知（已补货但未到货的 SKU 不再重复预警）
+                        if turnover_days_available < 45 and total_available > 0:
                             alert_warnings.append({
                                 'sku': sku,
                                 'product_name': product_name or sku,
-                                'turnover_days': turnover_days,
+                                'turnover_days': turnover_days_available,
                                 'sales_7d': sales_7d,
-                                'current_stock': current_stock
+                                'current_stock': current_stock,
+                                'inbound_qty': inbound_qty,
+                                'total_available': total_available,
                             })
 
                         # 状态判断
