@@ -431,11 +431,11 @@ def update_transaction(id):
                 cursor.execute("""
                     SELECT id, transaction_type, date, category, amount, remark, has_invoice,
                            invoice_image, account_type, reimbursed
-                    FROM transactions WHERE id = %s AND user_id = %s
-                """, (id, user_id))
+                    FROM transactions WHERE id = %s
+                """, (id,))
                 old_row = cursor.fetchone()
                 if not old_row:
-                    return jsonify({"status": "error", "message": "记录不存在或无权修改"}), 404
+                    return jsonify({"status": "error", "message": "记录不存在"}), 404
 
                 update_fields = []
                 params = []
@@ -593,12 +593,12 @@ def delete_transaction(id):
                 cursor.execute(
                     """SELECT id, transaction_type, date, category, amount, remark, has_invoice,
                               invoice_image, account_type, reimbursed
-                       FROM transactions WHERE id = %s AND user_id = %s""",
-                    (id, user_id)
+                       FROM transactions WHERE id = %s""",
+                    (id,)
                 )
                 row = cursor.fetchone()
                 if not row:
-                    return jsonify({"status": "error", "message": "记录不存在或无权删除"}), 404
+                    return jsonify({"status": "error", "message": "记录不存在"}), 404
 
                 cursor.execute("DELETE FROM transactions WHERE id = %s", (id,))
                 conn.commit()
@@ -842,6 +842,35 @@ def get_categories():
 
     except Exception as e:
         print(f"[Transactions] 获取分类列表异常: {e}")
+        return jsonify({"status": "error", "message": f"获取失败: {e}"}), 500
+
+
+# ============================================================
+# 分类管理: 详情
+# ============================================================
+@transactions_bp.route('/transactions/categories/<int:id>', methods=['GET'])
+@login_required
+@permission_required('transactions:page')
+def get_category_detail(id):
+    """获取单个交易分类详情"""
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, code, name, type, color, sort_order, is_active, created_at, updated_at
+                    FROM transaction_categories WHERE id = %s
+                """, (id,))
+                row = cursor.fetchone()
+                if not row:
+                    return jsonify({"status": "error", "message": "分类不存在"}), 404
+
+                return jsonify({"status": "success", "data": row})
+        finally:
+            conn.close()
+
+    except Exception as e:
+        print(f"[Transactions] 获取分类详情异常: {e}")
         return jsonify({"status": "error", "message": f"获取失败: {e}"}), 500
 
 
