@@ -445,6 +445,69 @@ def option_transaction_categories():
 
 
 # ============================================================
+# FBA 月度仓储费筛选下拉 — GET /api/options/reports/fba-storage-fees/filters
+# ============================================================
+
+@options_bp.route('/reports/fba-storage-fees/filters', methods=['GET'])
+def option_fba_storage_fee_filters():
+    """仓储费页面的动态筛选选项：计费月 / 国家 / 仓库 / 尺寸段"""
+    shop_id = request.args.get('shop_id', '').strip()
+    if not shop_id:
+        return jsonify({"status": "error", "message": "请提供 shop_id"}), 400
+    try:
+        shop_id = int(shop_id)
+    except ValueError:
+        return jsonify({"status": "error", "message": "shop_id 必须是整数"}), 400
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT DISTINCT month_of_charge AS v
+                FROM amazon_fba_storage_fees
+                WHERE shop_id = %s AND month_of_charge IS NOT NULL AND month_of_charge != ''
+                ORDER BY month_of_charge DESC
+            """, (shop_id,))
+            months = [r['v'] for r in cursor.fetchall()]
+
+            cursor.execute("""
+                SELECT DISTINCT country_code AS v
+                FROM amazon_fba_storage_fees
+                WHERE shop_id = %s AND country_code IS NOT NULL AND country_code != ''
+                ORDER BY country_code ASC
+            """, (shop_id,))
+            country_codes = [r['v'] for r in cursor.fetchall()]
+
+            cursor.execute("""
+                SELECT DISTINCT fulfillment_center AS v
+                FROM amazon_fba_storage_fees
+                WHERE shop_id = %s AND fulfillment_center IS NOT NULL AND fulfillment_center != ''
+                ORDER BY fulfillment_center ASC
+            """, (shop_id,))
+            fulfillment_centers = [r['v'] for r in cursor.fetchall()]
+
+            cursor.execute("""
+                SELECT DISTINCT product_size_tier AS v
+                FROM amazon_fba_storage_fees
+                WHERE shop_id = %s AND product_size_tier IS NOT NULL AND product_size_tier != ''
+                ORDER BY product_size_tier ASC
+            """, (shop_id,))
+            product_size_tiers = [r['v'] for r in cursor.fetchall()]
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "months": months,
+                "country_codes": country_codes,
+                "fulfillment_centers": fulfillment_centers,
+                "product_size_tiers": product_size_tiers,
+            }
+        })
+    finally:
+        conn.close()
+
+
+# ============================================================
 # 广告商品下拉 — GET /api/options/advertising/products
 # ============================================================
 

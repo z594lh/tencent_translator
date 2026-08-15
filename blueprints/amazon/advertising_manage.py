@@ -1897,6 +1897,14 @@ def list_search_terms():
     }
     _ALL_METRICS = {**_RAW_FIELDS, **_COMPUTED_FIELDS}
 
+    # 排序：sort_by / sort_dir 可选，字段无效时回退默认（cost desc）
+    sort_by = request.args.get("sort_by", "").strip()
+    sort_dir = request.args.get("sort_dir", "desc").strip()
+    if sort_by not in _ALL_METRICS:
+        sort_by = "cost"
+    sort_dir = "DESC" if sort_dir.lower() == "desc" else "ASC"
+    sort_expr = _ALL_METRICS[sort_by]
+
     having_clauses = []
     for field, expr in _ALL_METRICS.items():
         for suffix, op in _RANGE_OPS:
@@ -1997,7 +2005,7 @@ def list_search_terms():
                 {base_from}
                 {base_group}
                 {having_sql}
-                ORDER BY cost DESC
+                ORDER BY {sort_expr} {sort_dir}
                 LIMIT %s OFFSET %s
             """, params + having_params + [page_size, (page - 1) * page_size])
             rows = c.fetchall()
@@ -2013,6 +2021,39 @@ def list_search_terms():
                     except (ValueError, TypeError):
                         pass
         return jsonify({"status": "success", "data": {"list": list_data, "total": total}})
+    finally:
+        conn.close()
+
+
+@advertising_manage_bp.route('/reports/latest-date', methods=['GET'])
+def latest_report_date():
+    """获取最新报告日期（实际已有数据的最新日期，来自 amazon_ads_raw_reports）"""
+    shop_id = _get_shop_id_optional()
+    report_type = request.args.get("report_type", "").strip()
+
+    allowed_types = {"spCampaigns", "spAdvertisedProduct", "spTargeting",
+                     "spSearchTerm", "spCampaignsPlacement"}
+    if report_type and report_type not in allowed_types:
+        return jsonify({"status": "error", "message": f"无效的 report_type: {report_type}"}), 400
+
+    conn = _get_conn()
+    try:
+        where = []
+        params = []
+        if shop_id:
+            where.append("shop_id = %s"); params.append(shop_id)
+        if report_type:
+            where.append("report_type = %s"); params.append(report_type)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        with conn.cursor() as c:
+            c.execute(f"SELECT MAX(report_date) AS latest_date FROM amazon_ads_raw_reports {where_sql}", params)
+            row = c.fetchone()
+
+        latest_date = row["latest_date"] if row else None
+        if latest_date is not None:
+            latest_date = str(latest_date)
+        return jsonify({"status": "success", "data": {"latest_date": latest_date}})
     finally:
         conn.close()
 

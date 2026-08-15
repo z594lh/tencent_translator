@@ -39,7 +39,10 @@
 
 数据生成: services/report_generator.py（定时任务自动跑 + 本模块支持手动触发）
 """
-from flask import Blueprint, request, jsonify
+import csv
+import io
+
+from flask import Blueprint, request, jsonify, Response
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -2666,3 +2669,518 @@ def trigger_yesterday_reports():
     except Exception as e:
         print(f"[trigger_yesterday_reports] error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# 8. FBA 月度仓储费
+# ============================================================
+
+def _parse_csv_param(value):
+    """逗号分隔参数 → 去重列表，空返回 []"""
+    return [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
+def _require_shop_id_from_args():
+    """从 request.args 读取并校验必填 shop_id，返回 int，非法抛 ValueError"""
+    shop_id = request.args.get('shop_id', '').strip()
+    if not shop_id:
+        raise ValueError("缺少必要参数: shop_id")
+    try:
+        return int(shop_id)
+    except ValueError:
+        raise ValueError("shop_id 必须是整数")
+
+
+def _storage_fee_where(shop_id, months=None, search=None, country_codes=None,
+                       fulfillment_centers=None, product_size_tiers=None):
+    """构建仓储费 WHERE 子句，返回 (where_sql, params)"""
+    where = ["shop_id = %s"]
+    params = [shop_id]
+
+    if months:
+        where.append("month_of_charge IN (" + ",".join(["%s"] * len(months)) + ")")
+        params.extend(months)
+
+    if search:
+        like = f"%{search}%"
+        where.append(
+            "(asin LIKE %s OR fnsku LIKE %s OR seller_sku LIKE %s OR product_name LIKE %s "
+            "OR seller_sku IN (SELECT seller_sku FROM products "
+            "                  WHERE product_name LIKE %s OR declare_name_cn LIKE %s))"
+        )
+        params.extend([like, like, like, like, like, like])
+
+    for field, vals in (("country_code", country_codes),
+                        ("fulfillment_center", fulfillment_centers),
+                        ("product_size_tier", product_size_tiers)):
+        if vals:
+            where.append(f"{field} IN (" + ",".join(["%s"] * len(vals)) + ")")
+            params.extend(vals)
+
+    return " AND ".join(where), params
+
+
+def _build_storage_fee_filters():
+    """解析仓储费列表/导出的筛选参数，返回 (where_sql, params)；shop_id 非法抛 ValueError"""
+    shop_id = _require_shop_id_from_args()
+    return _storage_fee_where(
+        shop_id,
+        months=_parse_csv_param(request.args.get('month_of_charge', '')),
+        search=request.args.get('search', '').strip(),
+        country_codes=_parse_csv_param(request.args.get('country_code', '')),
+        fulfillment_centers=_parse_csv_param(request.args.get('fulfillment_center', '')),
+        product_size_tiers=_parse_csv_param(request.args.get('product_size_tier', '')),
+    )
+
+
+def _serialize_storage_fee_row(row):
+    """Decimal → 保留精度的字符串（如 '10.7400'），datetime → 字符串"""
+    out = {}
+    for k, v in (row or {}).items():
+        if v is None:
+            out[k] = None
+        elif isinstance(v, Decimal):
+            out[k] = str(v)
+        elif hasattr(v, 'strftime'):
+            out[k] = v.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            out[k] = v
+    return out
+
+
+_STORAGE_FEE_SELECT = """
+    asin, fnsku, seller_sku, product_name, fulfillment_center,
+    country_code, month_of_charge, product_size_tier,
+    average_quantity_on_hand, estimated_total_item_volume,
+    base_rate, utilization_surcharge_rate, currency,
+    estimated_monthly_storage_fee, total_incentive_fee_amount, synced_at
+"""
+
+
+@reports_bp.route('/reports/fba-storage-fees', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def list_fba_storage_fees():
+    """
+    分页查询 FBA 月度仓储费明细
+
+    查询参数:
+        shop_id           (必填) 店铺ID
+        month_of_charge   (可选) 计费月 YYYY-MM，逗号分隔多选
+        search            (可选) 模糊搜索 ASIN/FNSKU/SKU/商品名称
+        country_code      (可选) 国家代码，逗号分隔多选
+        fulfillment_center(可选) 仓库代码，逗号分隔多选
+        product_size_tier (可选) 尺寸段，逗号分隔多选
+        page / page_size  (可选) 分页
+    """
+    try:
+        where_sql, params = _build_storage_fee_filters()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    page, page_size = _parse_pagination()
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as c:
+            # 汇总（按筛选后的全量数据，不随分页变化）
+            c.execute(f"""
+                SELECT
+                    COALESCE(SUM(estimated_monthly_storage_fee), 0) AS total_storage_fee,
+                    COALESCE(SUM(total_incentive_fee_amount), 0) AS total_incentive_fee,
+                    COALESCE(SUM(average_quantity_on_hand), 0) AS total_average_quantity,
+                    COALESCE(SUM(estimated_total_item_volume), 0) AS total_volume,
+                    MAX(currency) AS currency
+                FROM amazon_fba_storage_fees
+                WHERE {where_sql}
+            """, params)
+            sum_row = c.fetchone()
+
+            c.execute(f"SELECT COUNT(*) AS total FROM amazon_fba_storage_fees WHERE {where_sql}", params)
+            total = c.fetchone()['total']
+
+            c.execute(f"""
+                SELECT {_STORAGE_FEE_SELECT}
+                FROM amazon_fba_storage_fees
+                WHERE {where_sql}
+                ORDER BY month_of_charge DESC, estimated_monthly_storage_fee DESC
+                LIMIT %s OFFSET %s
+            """, params + [page_size, (page - 1) * page_size])
+            rows = c.fetchall()
+
+        total_storage = float(sum_row['total_storage_fee'] or 0)
+        total_incentive = float(sum_row['total_incentive_fee'] or 0)
+        summary = {
+            "total_storage_fee": round(total_storage, 2),
+            "total_incentive_fee": round(total_incentive, 2),
+            "net_storage_fee": round(total_storage - total_incentive, 2),
+            "total_average_quantity": round(float(sum_row['total_average_quantity'] or 0), 2),
+            "total_volume": round(float(sum_row['total_volume'] or 0), 4),
+            "currency": sum_row['currency'] or 'USD',
+        }
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "total": total,
+                "list": [_serialize_storage_fee_row(r) for r in rows],
+                "summary": summary,
+            }
+        })
+    finally:
+        conn.close()
+
+
+@reports_bp.route('/reports/fba-storage-fees/export', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def export_fba_storage_fees():
+    """
+    导出 FBA 月度仓储费（CSV），筛选参数同列表接口（不含 page/page_size）。
+    """
+    try:
+        where_sql, params = _build_storage_fee_filters()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    headers = ["ASIN", "FNSKU", "SKU", "商品名称", "仓库", "国家", "计费月", "尺寸段",
+               "月均库存", "月均体积(立方英尺)", "基础费率", "附加费率", "币种",
+               "月仓储费", "激励抵扣", "同步时间"]
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(f"""
+                SELECT {_STORAGE_FEE_SELECT}
+                FROM amazon_fba_storage_fees
+                WHERE {where_sql}
+                ORDER BY month_of_charge DESC, estimated_monthly_storage_fee DESC
+            """, params)
+            rows = c.fetchall()
+
+        output = io.StringIO()
+        output.write('\ufeff')  # BOM，保证 Excel 正确识别 UTF-8
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        for r in rows:
+            writer.writerow([
+                r['asin'] or '', r['fnsku'] or '', r['seller_sku'] or '',
+                r['product_name'] or '', r['fulfillment_center'] or '',
+                r['country_code'] or '', r['month_of_charge'] or '',
+                r['product_size_tier'] or '',
+                str(r['average_quantity_on_hand']) if r['average_quantity_on_hand'] is not None else '',
+                str(r['estimated_total_item_volume']) if r['estimated_total_item_volume'] is not None else '',
+                str(r['base_rate']) if r['base_rate'] is not None else '',
+                str(r['utilization_surcharge_rate']) if r['utilization_surcharge_rate'] is not None else '',
+                r['currency'] or '',
+                str(r['estimated_monthly_storage_fee']) if r['estimated_monthly_storage_fee'] is not None else '',
+                str(r['total_incentive_fee_amount']) if r['total_incentive_fee_amount'] is not None else '',
+                r['synced_at'].strftime('%Y-%m-%d %H:%M:%S') if r['synced_at'] else '',
+            ])
+
+        date_str = datetime.now().strftime('%Y%m%d')
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename="fba_storage_fees_{date_str}.csv"'}
+        )
+    finally:
+        conn.close()
+
+
+# ============================================================
+# 9. FBA 月度仓储费 — SKU 维度透视 / 详情 / 导出
+# ============================================================
+
+_SKU_EXPR = "COALESCE(NULLIF(seller_sku, ''), fnsku)"
+
+
+def _build_sku_pivot_data(conn, shop_id, months, search, country_codes,
+                          fulfillment_centers, product_size_tiers):
+    """构建 SKU 维度透视数据，返回 (months, list_data, summary)"""
+    with conn.cursor() as c:
+        # 未指定月份 → 取该店铺最近 6 个有数据的计费月
+        if not months:
+            c.execute("""
+                SELECT DISTINCT month_of_charge AS m
+                FROM amazon_fba_storage_fees
+                WHERE shop_id = %s AND month_of_charge IS NOT NULL AND month_of_charge != ''
+                ORDER BY month_of_charge DESC LIMIT 6
+            """, (shop_id,))
+            months = [r['m'] for r in c.fetchall()]
+        else:
+            months = sorted(set(months), reverse=True)
+
+        where_sql, params = _storage_fee_where(
+            shop_id, months=months, search=search,
+            country_codes=country_codes,
+            fulfillment_centers=fulfillment_centers,
+            product_size_tiers=product_size_tiers,
+        )
+
+        # 一次查询聚合到 SKU × 计费月
+        c.execute(f"""
+            SELECT {_SKU_EXPR} AS sku,
+                   MAX(asin) AS asin, MAX(fnsku) AS fnsku,
+                   MAX(product_name) AS product_name, MAX(currency) AS currency,
+                   month_of_charge,
+                   COALESCE(SUM(estimated_monthly_storage_fee), 0) AS storage_fee,
+                   COALESCE(SUM(total_incentive_fee_amount), 0) AS incentive_fee
+            FROM amazon_fba_storage_fees
+            WHERE {where_sql}
+            GROUP BY {_SKU_EXPR}, month_of_charge
+            ORDER BY {_SKU_EXPR}
+        """, params)
+        agg_rows = c.fetchall()
+
+        # 汇总（全量筛选后，不随分页变化）
+        c.execute(f"""
+            SELECT COALESCE(SUM(estimated_monthly_storage_fee), 0) AS ts,
+                   COALESCE(SUM(total_incentive_fee_amount), 0) AS ti
+            FROM amazon_fba_storage_fees WHERE {where_sql}
+        """, params)
+        s = c.fetchone()
+
+        # 商品名称 / 申报中文名 取自 products 表
+        skus = sorted({r['sku'] for r in agg_rows})
+        prod_map = {}
+        if skus:
+            placeholders = ",".join(["%s"] * len(skus))
+            c.execute(f"""
+                SELECT seller_sku, product_name, declare_name_cn
+                FROM products
+                WHERE seller_sku IN ({placeholders}) AND status = 1
+            """, skus)
+            for pr in c.fetchall():
+                prod_map[pr['seller_sku']] = pr
+
+    sku_info = {}
+    fee_map = {}
+    for r in agg_rows:
+        sku = r['sku']
+        sku_info.setdefault(sku, {
+            'asin': r['asin'], 'fnsku': r['fnsku'],
+            'product_name': r['product_name'], 'currency': r['currency'] or 'USD',
+        })
+        fee_map.setdefault(sku, {})[r['month_of_charge']] = {
+            'storage': float(r['storage_fee'] or 0),
+            'incentive': float(r['incentive_fee'] or 0),
+        }
+
+    list_data = []
+    for sku in sorted(sku_info):
+        info = sku_info[sku]
+        prod = prod_map.get(sku)
+        product_name = (prod['product_name'] if prod and prod.get('product_name') else info['product_name'])
+        declare_name_cn = (prod['declare_name_cn'] if prod else None)
+        mf = {}
+        t_storage = t_incentive = 0.0
+        for m in months:
+            e = fee_map.get(sku, {}).get(m)
+            s_val = e['storage'] if e else 0.0
+            i_val = e['incentive'] if e else 0.0
+            mf[m] = {
+                'storage_fee': round(s_val, 2),
+                'incentive_fee': round(i_val, 2),
+                'net_fee': round(s_val - i_val, 2),
+            }
+            t_storage += s_val
+            t_incentive += i_val
+        list_data.append({
+            'seller_sku': sku,
+            'asin': info['asin'],
+            'fnsku': info['fnsku'],
+            'product_name': product_name,
+            'declare_name_cn': declare_name_cn,
+            'currency': info['currency'],
+            'month_fees': mf,
+            'total_storage_fee': round(t_storage, 2),
+            'total_incentive_fee': round(t_incentive, 2),
+            'total_net_fee': round(t_storage - t_incentive, 2),
+        })
+
+    ts = float(s['ts'] or 0)
+    ti = float(s['ti'] or 0)
+    summary = {
+        'total_storage_fee': round(ts, 2),
+        'total_incentive_fee': round(ti, 2),
+        'total_net_fee': round(ts - ti, 2),
+    }
+    return months, list_data, summary
+
+
+@reports_bp.route('/reports/fba-storage-fees/by-sku', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def list_fba_storage_fees_by_sku():
+    """
+    SKU 维度仓储费透视表
+
+    查询参数:
+        shop_id (必填), months (可选, 默认最近6个月), search (可选),
+        country_code / fulfillment_center / product_size_tier (可选, 逗号分隔),
+        page / page_size (可选)
+    """
+    try:
+        shop_id = _require_shop_id_from_args()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    months = _parse_csv_param(request.args.get('months', ''))
+    search = request.args.get('search', '').strip()
+    country_codes = _parse_csv_param(request.args.get('country_code', ''))
+    fulfillment_centers = _parse_csv_param(request.args.get('fulfillment_center', ''))
+    product_size_tiers = _parse_csv_param(request.args.get('product_size_tier', ''))
+    page, page_size = _parse_pagination()
+
+    conn = _get_conn()
+    try:
+        months, list_data, summary = _build_sku_pivot_data(
+            conn, shop_id, months, search, country_codes,
+            fulfillment_centers, product_size_tiers,
+        )
+        total = len(list_data)
+        start = (page - 1) * page_size
+        paged = list_data[start:start + page_size]
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "total": total,
+                "months": months,
+                "list": paged,
+                "summary": summary,
+            }
+        })
+    finally:
+        conn.close()
+
+
+@reports_bp.route('/reports/fba-storage-fees/by-sku/detail', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def detail_fba_storage_fees_by_sku():
+    """
+    单个 SKU 按仓库维度的仓储费明细（结构同 /reports/fba-storage-fees 的 list 项）
+
+    查询参数:
+        shop_id (必填), seller_sku (必填), months (可选, 逗号分隔)
+    """
+    try:
+        shop_id = _require_shop_id_from_args()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    seller_sku = request.args.get('seller_sku', '').strip()
+    if not seller_sku:
+        return jsonify({"status": "error", "message": "缺少必要参数: seller_sku"}), 400
+    months = _parse_csv_param(request.args.get('months', ''))
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as c:
+            where = ["shop_id = %s", f"{_SKU_EXPR} = %s"]
+            params = [shop_id, seller_sku]
+            if months:
+                where.append("month_of_charge IN (" + ",".join(["%s"] * len(months)) + ")")
+                params.extend(months)
+            where_sql = " AND ".join(where)
+
+            c.execute(f"""
+                SELECT {_STORAGE_FEE_SELECT}
+                FROM amazon_fba_storage_fees
+                WHERE {where_sql}
+                ORDER BY month_of_charge DESC, estimated_monthly_storage_fee DESC
+            """, params)
+            rows = c.fetchall()
+
+            c.execute(f"""
+                SELECT COALESCE(SUM(estimated_monthly_storage_fee), 0) AS ts,
+                       COALESCE(SUM(total_incentive_fee_amount), 0) AS ti
+                FROM amazon_fba_storage_fees WHERE {where_sql}
+            """, params)
+            s = c.fetchone()
+
+            # 商品名称 / 申报中文名 取自 products 表
+            c.execute("""
+                SELECT product_name, declare_name_cn
+                FROM products WHERE seller_sku = %s AND status = 1 LIMIT 1
+            """, (seller_sku,))
+            prod = c.fetchone()
+
+        ts = float(s['ts'] or 0)
+        ti = float(s['ti'] or 0)
+
+        list_rows = []
+        for r in rows:
+            item = _serialize_storage_fee_row(r)
+            if prod:
+                item['product_name'] = prod.get('product_name') or item.get('product_name')
+                item['declare_name_cn'] = prod.get('declare_name_cn')
+            else:
+                item['declare_name_cn'] = None
+            list_rows.append(item)
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "list": list_rows,
+                "summary": {
+                    "total_storage_fee": round(ts, 2),
+                    "total_incentive_fee": round(ti, 2),
+                    "total_net_fee": round(ts - ti, 2),
+                },
+            }
+        })
+    finally:
+        conn.close()
+
+
+@reports_bp.route('/reports/fba-storage-fees/by-sku/export', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def export_fba_storage_fees_by_sku():
+    """
+    导出 SKU 维度仓储费透视表（CSV），参数同 by-sku（不含 page/page_size）。
+    表头：SKU / ASIN / 商品名称 / 各月净仓储费 / 合计净仓储费 / 币种。
+    """
+    try:
+        shop_id = _require_shop_id_from_args()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    months = _parse_csv_param(request.args.get('months', ''))
+    search = request.args.get('search', '').strip()
+    country_codes = _parse_csv_param(request.args.get('country_code', ''))
+    fulfillment_centers = _parse_csv_param(request.args.get('fulfillment_center', ''))
+    product_size_tiers = _parse_csv_param(request.args.get('product_size_tier', ''))
+
+    conn = _get_conn()
+    try:
+        months, list_data, _ = _build_sku_pivot_data(
+            conn, shop_id, months, search, country_codes,
+            fulfillment_centers, product_size_tiers,
+        )
+
+        headers = ["SKU", "ASIN", "商品名称"] + [f"{m} 净仓储费" for m in months] + ["合计净仓储费", "币种"]
+
+        output = io.StringIO()
+        output.write('\ufeff')
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        for row in list_data:
+            line = [row['seller_sku'], row['asin'] or '', row['product_name'] or '']
+            for m in months:
+                line.append(f"{row['month_fees'][m]['net_fee']:.2f}")
+            line.append(f"{row['total_net_fee']:.2f}")
+            line.append(row['currency'])
+            writer.writerow(line)
+
+        date_str = datetime.now().strftime('%Y%m%d')
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename="fba_storage_fees_by_sku_{date_str}.csv"'}
+        )
+    finally:
+        conn.close()

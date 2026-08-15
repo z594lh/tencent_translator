@@ -23,6 +23,7 @@ from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client, get_all_active_shops
 from services.mysql_service import get_db_connection
 from services.fee_parser import extract_fees_from_items
+from services.fba_storage_fee_service import sync_storage_fees, sync_all_storage_fees
 
 amazon_finances_bp = Blueprint('amazon_finances', __name__, url_prefix='/api')
 
@@ -156,6 +157,37 @@ def trigger_finances_sync():
         return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Finances] 同步异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_finances_bp.route('/amazon/fba-storage-fees/sync', methods=['POST'])
+@login_required
+@permission_required('amazon_finances:sync')
+def sync_fba_storage_fees():
+    """
+    触发 FBA 月度仓储费同步（同步等待报告生成，耗时约 1~3 分钟）
+
+    请求体 (JSON):
+        shop_id     (可选) 指定店铺ID，缺省同步所有启用店铺
+        start_date  (可选) YYYY-MM-DD 数据起点，默认 120 天前
+        end_date    (可选) YYYY-MM-DD 数据终点，默认今天
+    """
+    data = request.get_json() or {}
+    shop_id = data.get('shop_id')
+    start_date = data.get('start_date')
+    end_date = data.get('end_date')
+
+    try:
+        if shop_id is not None and shop_id != '':
+            shop_id = int(shop_id)
+            result = sync_storage_fees(shop_id, start_date=start_date, end_date=end_date)
+        else:
+            result = sync_all_storage_fees(start_date=start_date, end_date=end_date)
+        return jsonify({"status": "success", "message": "同步完成", "data": result})
+    except ValueError:
+        return jsonify({"status": "error", "message": "shop_id 必须是整数"}), 400
+    except Exception as e:
+        print(f"[Finances] 仓储费同步异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
