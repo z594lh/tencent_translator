@@ -20,8 +20,6 @@ Amazon Selling Partner API (SP-API) 客户端
 """
 import os
 import time
-from datetime import datetime
-from urllib.parse import urlencode
 
 import requests
 from requests_aws4auth import AWS4Auth
@@ -44,6 +42,10 @@ AWS_SIGN_REGIONS = {
 }
 
 SP_API_SERVICE = "execute-api"
+TOKEN_REQUEST_TIMEOUT = 30
+API_REQUEST_TIMEOUT = 60
+DEFAULT_TOKEN_EXPIRES_IN = 3600
+TOKEN_EXPIRY_SAFETY_WINDOW = 300
 
 DEFAULT_HEADERS = {
     "Content-Type": "application/json",
@@ -139,15 +141,15 @@ class AmazonSpApiClient:
             LWA_TOKEN_URL,
             data=payload,
             proxies=self.proxies,
-            timeout=30,
+            timeout=TOKEN_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
 
         self._access_token = data["access_token"]
         # access_token 有效期通常为 1 小时，提前 5 分钟刷新
-        expires_in = data.get("expires_in", 3600)
-        self._token_expires_at = time.time() + expires_in - 300
+        expires_in = data.get("expires_in", DEFAULT_TOKEN_EXPIRES_IN)
+        self._token_expires_at = time.time() + expires_in - TOKEN_EXPIRY_SAFETY_WINDOW
         return self._access_token
 
     def _get_access_token(self) -> str:
@@ -167,6 +169,58 @@ class AmazonSpApiClient:
 
     # -------------------- 基础请求 --------------------
 
+    def _build_request_headers(self, headers: dict = None) -> dict:
+        """构建 SP-API 请求头，并允许调用方覆盖默认值。"""
+        request_headers = {
+            **DEFAULT_HEADERS,
+            "x-amz-access-token": self._get_access_token(),
+        }
+        if headers:
+            request_headers.update(headers)
+        return request_headers
+
+    def _send_request(
+        self,
+        method: str,
+        url: str,
+        params: dict,
+        json_data: dict,
+        headers: dict,
+        auth,
+    ):
+        """发送一次 SP-API HTTP 请求；重试策略由 ``_request`` 控制。"""
+        return requests.request(
+            method=method,
+            url=url,
+            params=params,
+            json=json_data,
+            headers=headers,
+            auth=auth,
+            proxies=self.proxies,
+            timeout=API_REQUEST_TIMEOUT,
+        )
+
+    @staticmethod
+    def _raise_for_status(resp) -> None:
+        """保留现有错误日志格式，并继续抛出 requests HTTPError。"""
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            try:
+                err_body = resp.json()
+            except Exception:
+                err_body = resp.text
+            print(f"[SP-API Error] {resp.status_code} {resp.url}")
+            print(f"[SP-API Error Body] {err_body}")
+            raise
+
+    @staticmethod
+    def _parse_response(resp) -> dict:
+        """将 204/空响应转换为空字典，其余响应按 JSON 解析。"""
+        if resp.status_code == 204 or not resp.text:
+            return {}
+        return resp.json()
+
     def _request(
         self,
         method: str,
@@ -177,54 +231,32 @@ class AmazonSpApiClient:
     ) -> dict:
         """发送带 AWS SigV4 签名 + LWA Token 的 SP-API 请求"""
         url = f"{self.base_url}{path}"
-        token = self._get_access_token()
-
-        h = {**DEFAULT_HEADERS, "x-amz-access-token": token}
-        if headers:
-            h.update(headers)
-
+        request_headers = self._build_request_headers(headers)
         auth = self._get_aws_auth()
-
-        resp = requests.request(
-            method=method,
-            url=url,
-            params=params,
-            json=json_data,
-            headers=h,
-            auth=auth,
-            proxies=self.proxies,
-            timeout=60,
+        resp = self._send_request(
+            method,
+            url,
+            params,
+            json_data,
+            request_headers,
+            auth,
         )
 
         # 401 时尝试刷新 token 重试一次
         if resp.status_code == 401:
             self._access_token = None
-            h["x-amz-access-token"] = self._get_access_token()
-            resp = requests.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                headers=h,
-                auth=auth,
-                proxies=self.proxies,
-                timeout=60,
+            request_headers["x-amz-access-token"] = self._get_access_token()
+            resp = self._send_request(
+                method,
+                url,
+                params,
+                json_data,
+                request_headers,
+                auth,
             )
 
-        try:
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            # 打印亚马逊返回的详细错误信息，便于调试
-            try:
-                err_body = resp.json()
-            except Exception:
-                err_body = resp.text
-            print(f"[SP-API Error] {resp.status_code} {resp.url}")
-            print(f"[SP-API Error Body] {err_body}")
-            raise
-        if resp.status_code == 204 or not resp.text:
-            return {}
-        return resp.json()
+        self._raise_for_status(resp)
+        return self._parse_response(resp)
 
     # -------------------- Orders API --------------------
 

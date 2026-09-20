@@ -35,7 +35,10 @@ static/shipping_invoice_templates/task/*
 doc/
 docs/
 sql/
-scripts/*
+/AGENTS.md
+/ARCHITECTURE.md
+/tests/
+scripts/temp/*
 !scripts/cron/
 !scripts/cron/*
 migrations/

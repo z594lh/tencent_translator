@@ -862,7 +862,10 @@ def download_organize_task(task_id):
 # ==================== 后台工作线程 + CURD ====================
 
 def _pick_pending_task():
-    """取出一个 pending 任务并锁定为 running"""
+    """在事务中取出一个 pending 任务并锁定为 running。
+
+    ``FOR UPDATE`` 保证多个消费者并发轮询时，同一任务不会被重复领取。
+    """
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -873,17 +876,29 @@ def _pick_pending_task():
                 WHERE status = 'pending'
                 ORDER BY created_at ASC
                 LIMIT 1
+                FOR UPDATE
             """)
             row = cursor.fetchone()
             if row:
-                cursor.execute("UPDATE fba_label_tasks SET status = 'running' WHERE id = %s", (row['id'],))
+                cursor.execute(
+                    "UPDATE fba_label_tasks SET status = 'running' WHERE id = %s AND status = 'pending'",
+                    (row['id'],),
+                )
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    return None
                 conn.commit()
                 if row.get('crop_config'):
                     try:
                         row['crop_config'] = json.loads(row['crop_config'])
                     except Exception:
                         row['crop_config'] = None
+            else:
+                conn.rollback()
             return row
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -902,10 +917,10 @@ def _reset_running_tasks():
         conn.close()
 
 
-def _label_worker_loop():
+def _label_worker_loop(stop_event=None):
     """后台工作线程主循环：轮询 pending 任务并执行"""
     print("[Label Worker] 工作线程已启动")
-    while True:
+    while not (stop_event and stop_event.is_set()):
         try:
             task = _pick_pending_task()
             if task:
@@ -925,20 +940,34 @@ def _label_worker_loop():
                     traceback.print_exc()
                     _update_task(task_id, status='failed', message=str(e)[:500])
             else:
-                time.sleep(3)
+                if stop_event:
+                    stop_event.wait(3)
+                else:
+                    time.sleep(3)
         except Exception as e:
             print(f"[Label Worker] 轮询异常: {e}")
             import traceback
             traceback.print_exc()
-            time.sleep(5)
+            if stop_event:
+                stop_event.wait(5)
+            else:
+                time.sleep(5)
+    print("[Label Worker] 工作线程已停止")
 
 
-def _start_label_workers():
+def _start_label_workers(stop_event=None, daemon=True, reset_running=True):
     """启动后台工作线程（服务初始化时调用）"""
-    _reset_running_tasks()
-    t = threading.Thread(target=_label_worker_loop, daemon=True)
+    if reset_running:
+        _reset_running_tasks()
+    t = threading.Thread(
+        target=_label_worker_loop,
+        args=(stop_event,),
+        name='label-worker',
+        daemon=daemon,
+    )
     t.start()
     print("[Label Worker] 后台工作线程已启动")
+    return t
 
 
 def _list_tasks(shop_id, status=None, page=1, page_size=10):

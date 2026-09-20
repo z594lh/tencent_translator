@@ -44,17 +44,13 @@ def getConfigUrl():
     """从配置中读取链接"""
     return config.get_tencent_url()
 
-# 确保 log 目录存在，并生成当天的日志文件路径
+# 访问日志目录（相对于 WorkingDirectory，保持现有部署行为）
 LOG_DIR = 'log'
-os.makedirs(LOG_DIR, exist_ok=True)
-
-
-app = Flask(__name__, template_folder='templates', static_folder='static')
-CORS(app, expose_headers=['Content-Disposition'], max_age=3600)
 
 # 自定义 JSON 序列化：datetime 统一返回 %Y-%m-%d %H:%M:%S
 try:
     from flask.json.provider import DefaultJSONProvider
+
     class CustomJSONProvider(DefaultJSONProvider):
         def default(self, o):
             if isinstance(o, datetime):
@@ -62,9 +58,9 @@ try:
             if isinstance(o, date):
                 return o.strftime('%Y-%m-%d')
             return super().default(o)
-    app.json = CustomJSONProvider(app)
 except ImportError:
     from flask.json import JSONEncoder
+
     class CustomJSONEncoder(JSONEncoder):
         def default(self, o):
             if isinstance(o, datetime):
@@ -72,27 +68,12 @@ except ImportError:
             if isinstance(o, date):
                 return o.strftime('%Y-%m-%d')
             return super().default(o)
-    app.json_encoder = CustomJSONEncoder
-
-OUTPUT_DIR = os.path.join(app.static_folder, 'output')
-
-# 确保文件夹存在，不存在就建一个，省得报错
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
-
-try:
-    # Flask 2.0+ / 3.0+
-    app.json.ensure_ascii = False
-except AttributeError:
-    # Flask 1.x 老版本
-    app.config['JSON_AS_ASCII'] = False
 
 
-@app.before_request
 def log_request():
     print(f"[Request] {request.method} {request.path} - Content-Length: {request.content_length}", flush=True)
 
-@app.after_request
+
 def log_response(response):
     ip = request.headers.get('X-Forwarded-For', request.access_route[0] if request.access_route else request.remote_addr)
     route = request.endpoint or 'N/A'
@@ -115,84 +96,83 @@ def log_response(response):
     return response
 
 
-@app.route('/api/config', methods=['GET'])
 def get_config():
     return jsonify({
         'author_link': getConfigUrl()
     })
 
 
-# 注册页面路由
-app.register_blueprint(pages_bp)
+BLUEPRINTS = (
+    pages_bp,
+    auth_bp,
+    translation_bp,
+    ai_image_bp,
+    transactions_bp,
+    fba_tools_bp,
+    amazon_inventory_bp,
+    amazon_shipments_bp,
+    amazon_inbound_plans_bp,
+    amazon_invoice_export_bp,
+    amazon_orders_bp,
+    amazon_listing_bp,
+    amazon_finances_bp,
+    advertising_bp,
+    advertising_manage_bp,
+    shops_bp,
+    supplier_bp,
+    products_bp,
+    logistics_bp,
+    pricing_bp,
+    product_board_bp,
+    reports_bp,
+    cron_bp,
+    permissions_bp,
+    options_bp,
+    asin_bsr_bp,
+)
 
-# 注册用户认证路由
-app.register_blueprint(auth_bp)
 
-# 注册翻译路由
-app.register_blueprint(translation_bp)
+def create_app(test_config=None):
+    """创建 Flask 应用。
 
-# 注册AI生图路由
-app.register_blueprint(ai_image_bp)
+    这里只组装 Web 应用，不启动箱唛或发票后台线程。后台任务由
+    ``worker.py`` 的独立单实例进程负责，避免 Gunicorn 多 worker
+    重复消费同一任务。
+    """
+    flask_app = Flask(__name__, template_folder='templates', static_folder='static')
+    if test_config:
+        flask_app.config.update(test_config)
 
-# 注册收支记账路由
-app.register_blueprint(transactions_bp)
+    # 保留现有跨域行为。前端既可能经 Cloudflare Pages Function 代理，
+    # 也可能直接访问 api.zhongyuwen.cn；下载接口需要暴露文件名响应头。
+    CORS(flask_app, expose_headers=['Content-Disposition'], max_age=3600)
 
-# 注册 FBA 工具路由
-app.register_blueprint(fba_tools_bp)
+    try:
+        flask_app.json = CustomJSONProvider(flask_app)
+    except NameError:
+        flask_app.json_encoder = CustomJSONEncoder
 
-# 注册亚马逊 API 路由
-app.register_blueprint(amazon_inventory_bp)
-app.register_blueprint(amazon_shipments_bp)
-app.register_blueprint(amazon_inbound_plans_bp)
-app.register_blueprint(amazon_invoice_export_bp)
-app.register_blueprint(amazon_orders_bp)
-app.register_blueprint(amazon_listing_bp)
-app.register_blueprint(amazon_finances_bp)
-app.register_blueprint(advertising_bp)
+    try:
+        flask_app.json.ensure_ascii = False
+    except AttributeError:
+        flask_app.config['JSON_AS_ASCII'] = False
 
-# 注册 CPC 广告管理路由
-app.register_blueprint(advertising_manage_bp)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(os.path.join(flask_app.static_folder, 'output'), exist_ok=True)
 
-# 注册店铺管理路由
-app.register_blueprint(shops_bp)
+    flask_app.before_request(log_request)
+    flask_app.after_request(log_response)
+    flask_app.add_url_rule('/api/config', 'get_config', get_config, methods=['GET'])
 
-# 注册供应商管理路由
-app.register_blueprint(supplier_bp)
+    for blueprint in BLUEPRINTS:
+        flask_app.register_blueprint(blueprint)
 
-# 注册产品管理路由
-app.register_blueprint(products_bp)
+    return flask_app
 
-# 注册货代管理路由
-app.register_blueprint(logistics_bp)
 
-# 注册定价计算路由
-app.register_blueprint(pricing_bp)
-
-# 注册选品看板路由
-app.register_blueprint(product_board_bp)
-
-# 注册数据报表路由
-app.register_blueprint(reports_bp)
-
-# 注册计划任务看板路由
-app.register_blueprint(cron_bp)
-
-# 注册权限管理路由
-app.register_blueprint(permissions_bp)
-
-# 注册下拉选项路由
-app.register_blueprint(options_bp)
-
-# 注册 ASIN BSR 监控路由
-app.register_blueprint(asin_bsr_bp)
-
-# 启动箱唛整理后台工作线程
-from blueprints.fba_tools import _start_label_workers
-_start_label_workers()
-
-# 启动发票整理后台工作线程
-from blueprints.amazon.invoice_export import _start_invoice_workers
-_start_invoice_workers()
+# 保留 Gunicorn 的 ``app:app`` 入口兼容性。
+app = create_app()
+OUTPUT_DIR = os.path.join(app.static_folder, 'output')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

@@ -18,8 +18,7 @@ Amazon 货件发票导出模块
      匹配对应货代的发票模板，填充数据后返回 xlsx。
   2. 批量整理：根据 inbound_plan_id 提交异步任务，后台 Worker 遍历该计划下所有货件，
      逐个生成 xlsx 并打包为 zip；前端轮询任务进度后下载。
-  3. 后台 Worker 在 app 启动时（app.py）通过 _start_invoice_workers() 拉起，
-     以守护线程运行，每 3 秒轮询 pending 任务。
+  3. 后台 Worker 由独立 worker.py 进程拉起，每 3 秒轮询 pending 任务。
 """
 import io
 import json
@@ -1004,13 +1003,25 @@ def _pick_pending_invoice_task():
                    FROM fba_invoice_tasks
                    WHERE status = 'pending'
                    ORDER BY created_at ASC
-                   LIMIT 1"""
+                   LIMIT 1
+                   FOR UPDATE"""
             )
             row = cursor.fetchone()
             if row:
-                cursor.execute("UPDATE fba_invoice_tasks SET status = 'running' WHERE id = %s", (row['id'],))
+                cursor.execute(
+                    "UPDATE fba_invoice_tasks SET status = 'running' WHERE id = %s AND status = 'pending'",
+                    (row['id'],),
+                )
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    return None
                 conn.commit()
+            else:
+                conn.rollback()
             return row
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1136,7 +1147,7 @@ def _execute_invoice_task(task_id, shop_id, inbound_plan_id, provider_id):
         _update_invoice_task(task_id, status='failed', message=str(e)[:500])
 
 
-def _invoice_worker_loop():
+def _invoice_worker_loop(stop_event=None):
     """
     Worker 主循环
 
@@ -1147,7 +1158,7 @@ def _invoice_worker_loop():
       - 执行异常仅标记失败，不影响循环继续
     """
     print("[Invoice Worker] 工作线程已启动")
-    while True:
+    while not (stop_event and stop_event.is_set()):
         try:
             task = _pick_pending_invoice_task()
             if task:
@@ -1160,23 +1171,37 @@ def _invoice_worker_loop():
                     traceback.print_exc()
                     _update_invoice_task(task['id'], status='failed', message=str(e)[:500])
             else:
-                time.sleep(3)
+                if stop_event:
+                    stop_event.wait(3)
+                else:
+                    time.sleep(3)
         except Exception as e:
             print(f"[Invoice Worker] 轮询异常: {e}")
-            time.sleep(5)
+            if stop_event:
+                stop_event.wait(5)
+            else:
+                time.sleep(5)
+    print("[Invoice Worker] 工作线程已停止")
 
 
-def _start_invoice_workers():
+def _start_invoice_workers(stop_event=None, daemon=True, reset_running=True):
     """
     启动后台 Worker 线程
 
     简介: 由 app.py 在应用启动时调用，重置遗留任务并启动守护线程。
 
     详细:
-      - 先调用 _reset_running_invoice_tasks 清理上次中断的 running 任务
-      - 以 daemon=True 启动线程，应用退出时自动终止
+      - reset_running=True 时先恢复上次中断的 running 任务
+      - daemon 参数控制线程是否随主进程自动终止
     """
-    _reset_running_invoice_tasks()
-    t = threading.Thread(target=_invoice_worker_loop, daemon=True)
+    if reset_running:
+        _reset_running_invoice_tasks()
+    t = threading.Thread(
+        target=_invoice_worker_loop,
+        args=(stop_event,),
+        name='invoice-worker',
+        daemon=daemon,
+    )
     t.start()
     print("[Invoice Worker] 后台工作线程已启动")
+    return t

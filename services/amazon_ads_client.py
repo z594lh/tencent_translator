@@ -30,6 +30,12 @@ ADS_API_ENDPOINTS = {
     "fe": "https://advertising-api-fe.amazon.com",
 }
 
+TOKEN_REQUEST_TIMEOUT = 30
+API_REQUEST_TIMEOUT = 60
+REPORT_DOWNLOAD_TIMEOUT = 120
+DEFAULT_TOKEN_EXPIRES_IN = 3600
+TOKEN_EXPIRY_SAFETY_WINDOW = 300
+
 
 def _upper(val):
     """Amazon Ads API 的 state 字段必须大写"""
@@ -92,14 +98,14 @@ class AmazonAdsApiClient:
             LWA_TOKEN_URL,
             data=payload,
             proxies=self.proxies,
-            timeout=30,
+            timeout=TOKEN_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
 
         self._access_token = data["access_token"]
-        expires_in = data.get("expires_in", 3600)
-        self._token_expires_at = time.time() + expires_in - 300
+        expires_in = data.get("expires_in", DEFAULT_TOKEN_EXPIRES_IN)
+        self._token_expires_at = time.time() + expires_in - TOKEN_EXPIRY_SAFETY_WINDOW
         return self._access_token
 
     def _get_access_token(self) -> str:
@@ -126,43 +132,33 @@ class AmazonAdsApiClient:
             h.update(extra)
         return h
 
-    def _request(
+    @staticmethod
+    def _media_type_headers(media_type: str) -> dict:
+        """构建 Ads v3 同值的 Content-Type/Accept 请求头。"""
+        return {"Content-Type": media_type, "Accept": media_type}
+
+    def _send_request(
         self,
         method: str,
-        path: str,
-        params: dict = None,
-        json_data: dict = None,
-        with_scope: bool = True,
-        headers: dict = None,
-    ) -> dict:
-        """发送带 LWA Token + ClientId/Scope 头的广告 API 请求"""
-        url = f"{self.base_url}{path}"
-        h = self._headers(with_scope=with_scope, extra=headers)
-
-        resp = requests.request(
+        url: str,
+        params: dict,
+        json_data: dict,
+        headers: dict,
+    ):
+        """发送一次 Ads API HTTP 请求；重试策略由 ``_request`` 控制。"""
+        return requests.request(
             method=method,
             url=url,
             params=params,
             json=json_data,
-            headers=h,
+            headers=headers,
             proxies=self.proxies,
-            timeout=60,
+            timeout=API_REQUEST_TIMEOUT,
         )
 
-        # 401 时刷新 token 重试一次
-        if resp.status_code == 401:
-            self._access_token = None
-            h = self._headers(with_scope=with_scope, extra=headers)
-            resp = requests.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                headers=h,
-                proxies=self.proxies,
-                timeout=60,
-            )
-
+    @staticmethod
+    def _raise_for_status(resp) -> None:
+        """保留现有错误日志格式，并继续抛出 requests HTTPError。"""
         try:
             resp.raise_for_status()
         except requests.exceptions.HTTPError:
@@ -174,9 +170,47 @@ class AmazonAdsApiClient:
             print(f"[Ads-API Error Body] {err_body}")
             raise
 
+    @staticmethod
+    def _parse_response(resp):
+        """将 204/空响应转换为空字典，其余响应按 JSON 解析。"""
         if resp.status_code == 204 or not resp.text:
             return {}
         return resp.json()
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict = None,
+        json_data: dict = None,
+        with_scope: bool = True,
+        headers: dict = None,
+    ) -> dict:
+        """发送带 LWA Token + ClientId/Scope 头的广告 API 请求"""
+        url = f"{self.base_url}{path}"
+        request_headers = self._headers(with_scope=with_scope, extra=headers)
+        resp = self._send_request(
+            method,
+            url,
+            params,
+            json_data,
+            request_headers,
+        )
+
+        # 401 时刷新 token 重试一次
+        if resp.status_code == 401:
+            self._access_token = None
+            request_headers = self._headers(with_scope=with_scope, extra=headers)
+            resp = self._send_request(
+                method,
+                url,
+                params,
+                json_data,
+                request_headers,
+            )
+
+        self._raise_for_status(resp)
+        return self._parse_response(resp)
 
     # -------------------- Profiles --------------------
 
@@ -198,8 +232,10 @@ class AmazonAdsApiClient:
             body["stateFilter"] = {"include": state_filter}
         if next_token:
             body["nextToken"] = next_token
-        return self._request("POST", "/sp/campaigns/list", json_data=body,
-                             headers={"Content-Type": self._V3_SP_CAMPAIGN_CT, "Accept": self._V3_SP_CAMPAIGN_CT})
+        return self._request(
+            "POST", "/sp/campaigns/list", json_data=body,
+            headers=self._media_type_headers(self._V3_SP_CAMPAIGN_CT),
+        )
 
     # -------------------- 异步报告 (v3 Reporting) --------------------
 
@@ -210,7 +246,7 @@ class AmazonAdsApiClient:
         resp = self._request(
             "POST", "/reporting/reports",
             json_data=report_body,
-            headers={"Content-Type": self._V3_REPORT_CT, "Accept": self._V3_REPORT_CT},
+            headers=self._media_type_headers(self._V3_REPORT_CT),
         )
         report_id = resp.get("reportId")
         if not report_id:
@@ -243,7 +279,7 @@ class AmazonAdsApiClient:
 
         处理三种可能的格式: GZIP 压缩的 JSON 数组 / GZIP 压缩的 JSON-Lines / 未压缩 JSON。
         """
-        resp = requests.get(url, timeout=120, proxies=self.proxies)
+        resp = requests.get(url, timeout=REPORT_DOWNLOAD_TIMEOUT, proxies=self.proxies)
         resp.raise_for_status()
         data = resp.content
         try:
@@ -343,7 +379,7 @@ class AmazonAdsApiClient:
         return self._request(
             "PUT", "/sp/campaigns",
             json_data={"campaigns": [body]},
-            headers={"Content-Type": self._V3_SP_CAMPAIGN_CT, "Accept": self._V3_SP_CAMPAIGN_CT},
+            headers=self._media_type_headers(self._V3_SP_CAMPAIGN_CT),
         )
 
     _ID_FIELDS = {"campaignId", "adGroupId", "keywordId", "targetId", "adId"}
@@ -363,7 +399,7 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/campaigns",
             json_data={"campaigns": campaigns},
-            headers={"Content-Type": self._V3_SP_CAMPAIGN_CT, "Accept": self._V3_SP_CAMPAIGN_CT},
+            headers=self._media_type_headers(self._V3_SP_CAMPAIGN_CT),
         )
 
     # ==================== 广告组 (Ad Groups) v3 ====================
@@ -382,7 +418,7 @@ class AmazonAdsApiClient:
             body["nextToken"] = next_token
         return self._request(
             "POST", "/sp/adGroups/list", json_data=body,
-            headers={"Content-Type": self._V3_SP_ADGROUP_CT, "Accept": self._V3_SP_ADGROUP_CT},
+            headers=self._media_type_headers(self._V3_SP_ADGROUP_CT),
         )
 
     def update_ad_group(self, ad_group_id: int, updates: dict) -> dict:
@@ -395,7 +431,7 @@ class AmazonAdsApiClient:
         return self._request(
             "PUT", "/sp/adGroups",
             json_data={"adGroups": [body]},
-            headers={"Content-Type": self._V3_SP_ADGROUP_CT, "Accept": self._V3_SP_ADGROUP_CT},
+            headers=self._media_type_headers(self._V3_SP_ADGROUP_CT),
         )
 
     def create_ad_groups(self, ad_groups: list) -> dict:
@@ -404,7 +440,7 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/adGroups",
             json_data={"adGroups": ad_groups},
-            headers={"Content-Type": self._V3_SP_ADGROUP_CT, "Accept": self._V3_SP_ADGROUP_CT},
+            headers=self._media_type_headers(self._V3_SP_ADGROUP_CT),
         )
 
     # ==================== 产品广告 (Product Ads) v3 ====================
@@ -429,7 +465,7 @@ class AmazonAdsApiClient:
             body["nextToken"] = next_token
         return self._request(
             "POST", "/sp/productAds/list", json_data=body,
-            headers={"Content-Type": self._V3_SP_PRODUCT_AD_CT, "Accept": self._V3_SP_PRODUCT_AD_CT},
+            headers=self._media_type_headers(self._V3_SP_PRODUCT_AD_CT),
         )
 
     def update_product_ad(self, ad_id: int, updates: dict) -> dict:
@@ -440,7 +476,7 @@ class AmazonAdsApiClient:
         return self._request(
             "PUT", "/sp/productAds",
             json_data={"productAds": [body]},
-            headers={"Content-Type": self._V3_SP_PRODUCT_AD_CT, "Accept": self._V3_SP_PRODUCT_AD_CT},
+            headers=self._media_type_headers(self._V3_SP_PRODUCT_AD_CT),
         )
 
     def create_product_ads(self, product_ads: list) -> dict:
@@ -449,7 +485,7 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/productAds",
             json_data={"productAds": product_ads},
-            headers={"Content-Type": self._V3_SP_PRODUCT_AD_CT, "Accept": self._V3_SP_PRODUCT_AD_CT},
+            headers=self._media_type_headers(self._V3_SP_PRODUCT_AD_CT),
         )
 
     # ==================== 关键词 (Keywords) v3 ====================
@@ -475,7 +511,7 @@ class AmazonAdsApiClient:
             body["nextToken"] = next_token
         return self._request(
             "POST", "/sp/keywords/list", json_data=body,
-            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
+            headers=self._media_type_headers(self._V3_SP_KEYWORD_CT),
         )
 
     def update_keyword(self, keyword_id: int, updates: dict) -> dict:
@@ -488,7 +524,7 @@ class AmazonAdsApiClient:
         return self._request(
             "PUT", "/sp/keywords",
             json_data={"keywords": [body]},
-            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
+            headers=self._media_type_headers(self._V3_SP_KEYWORD_CT),
         )
 
     def create_keywords(self, keywords: list) -> dict:
@@ -497,7 +533,7 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/keywords",
             json_data={"keywords": keywords},
-            headers={"Content-Type": self._V3_SP_KEYWORD_CT, "Accept": self._V3_SP_KEYWORD_CT},
+            headers=self._media_type_headers(self._V3_SP_KEYWORD_CT),
         )
 
     def get_keyword_recommendations(self, payload: dict) -> dict:
@@ -529,7 +565,7 @@ class AmazonAdsApiClient:
             body["nextToken"] = next_token
         return self._request(
             "POST", "/sp/targets/list", json_data=body,
-            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+            headers=self._media_type_headers(self._V3_SP_TARGET_CT),
         )
 
     def update_target(self, target_id: int, updates: dict) -> dict:
@@ -542,7 +578,7 @@ class AmazonAdsApiClient:
         return self._request(
             "PUT", "/sp/targets",
             json_data={"targetingClauses": [body]},
-            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+            headers=self._media_type_headers(self._V3_SP_TARGET_CT),
         )
 
     def create_targets(self, targets: list) -> dict:
@@ -551,7 +587,7 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/targets",
             json_data={"targetingClauses": targets},
-            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+            headers=self._media_type_headers(self._V3_SP_TARGET_CT),
         )
 
     def get_target_bid_recommendations(self, payload: dict) -> dict:
@@ -573,8 +609,25 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/targets/categories",
             json_data=payload,
-            headers={"Content-Type": self._V3_SP_TARGET_CT, "Accept": self._V3_SP_TARGET_CT},
+            headers=self._media_type_headers(self._V3_SP_TARGET_CT),
         )
+
+    def _archive_without_content_type(self, path: str) -> dict:
+        """执行 Ads 归档 DELETE，保持现有不发送 Content-Type 的行为。"""
+        url = f"{self.base_url}{path}"
+        headers = {
+            "Authorization": f"Bearer {self._get_access_token()}",
+            "Amazon-Advertising-API-ClientId": self.client_id,
+            "Amazon-Advertising-API-Scope": str(self.profile_id),
+        }
+        resp = requests.delete(
+            url,
+            headers=headers,
+            proxies=self.proxies,
+            timeout=API_REQUEST_TIMEOUT,
+        )
+        self._raise_for_status(resp)
+        return self._parse_response(resp)
 
     # ==================== 否定关键词 (Negative Keywords) v3 ====================
 
@@ -598,7 +651,7 @@ class AmazonAdsApiClient:
             body["nextToken"] = next_token
         return self._request(
             "POST", "/sp/negativeKeywords/list", json_data=body,
-            headers={"Content-Type": self._V3_SP_NEG_KEYWORD_CT, "Accept": self._V3_SP_NEG_KEYWORD_CT},
+            headers=self._media_type_headers(self._V3_SP_NEG_KEYWORD_CT),
         )
 
     def update_negative_keyword(self, keyword_id: int, updates: dict) -> dict:
@@ -609,7 +662,7 @@ class AmazonAdsApiClient:
         return self._request(
             "PUT", "/sp/negativeKeywords",
             json_data={"negativeKeywords": [body]},
-            headers={"Content-Type": self._V3_SP_NEG_KEYWORD_CT, "Accept": self._V3_SP_NEG_KEYWORD_CT},
+            headers=self._media_type_headers(self._V3_SP_NEG_KEYWORD_CT),
         )
 
     def create_negative_keywords(self, keywords: list) -> dict:
@@ -618,31 +671,12 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/negativeKeywords",
             json_data={"negativeKeywords": keywords},
-            headers={"Content-Type": self._V3_SP_NEG_KEYWORD_CT, "Accept": self._V3_SP_NEG_KEYWORD_CT},
+            headers=self._media_type_headers(self._V3_SP_NEG_KEYWORD_CT),
         )
 
     def archive_negative_keyword(self, keyword_id: int) -> dict:
         """归档 SP 否定关键词（直连 DELETE，不送 Content-Type）"""
-        url = f"{self.base_url}/sp/negativeKeywords/{keyword_id}"
-        h = {
-            "Authorization": f"Bearer {self._get_access_token()}",
-            "Amazon-Advertising-API-ClientId": self.client_id,
-            "Amazon-Advertising-API-Scope": str(self.profile_id),
-        }
-        resp = requests.delete(url, headers=h, proxies=self.proxies, timeout=60)
-        try:
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError:
-            try:
-                err_body = resp.json()
-            except Exception:
-                err_body = resp.text
-            print(f"[Ads-API Error] {resp.status_code} {resp.url}")
-            print(f"[Ads-API Error Body] {err_body}")
-            raise
-        if resp.status_code == 204 or not resp.text:
-            return {}
-        return resp.json()
+        return self._archive_without_content_type(f"/sp/negativeKeywords/{keyword_id}")
 
     # ==================== 否定投放 (Negative Targets) v3 ====================
 
@@ -666,7 +700,7 @@ class AmazonAdsApiClient:
             body["nextToken"] = next_token
         return self._request(
             "POST", "/sp/negativeTargets/list", json_data=body,
-            headers={"Content-Type": self._V3_SP_NEG_TARGET_CT, "Accept": self._V3_SP_NEG_TARGET_CT},
+            headers=self._media_type_headers(self._V3_SP_NEG_TARGET_CT),
         )
 
     def update_negative_target(self, target_id: int, updates: dict) -> dict:
@@ -677,7 +711,7 @@ class AmazonAdsApiClient:
         return self._request(
             "PUT", "/sp/negativeTargets",
             json_data={"negativeTargetingClauses": [body]},
-            headers={"Content-Type": self._V3_SP_NEG_TARGET_CT, "Accept": self._V3_SP_NEG_TARGET_CT},
+            headers=self._media_type_headers(self._V3_SP_NEG_TARGET_CT),
         )
 
     def create_negative_targets(self, targets: list) -> dict:
@@ -686,31 +720,12 @@ class AmazonAdsApiClient:
         return self._request(
             "POST", "/sp/negativeTargets",
             json_data={"negativeTargetingClauses": targets},
-            headers={"Content-Type": self._V3_SP_NEG_TARGET_CT, "Accept": self._V3_SP_NEG_TARGET_CT},
+            headers=self._media_type_headers(self._V3_SP_NEG_TARGET_CT),
         )
 
     def archive_negative_target(self, target_id: int) -> dict:
         """归档 SP 否定投放（直连 DELETE，不送 Content-Type）"""
-        url = f"{self.base_url}/sp/negativeTargets/{target_id}"
-        h = {
-            "Authorization": f"Bearer {self._get_access_token()}",
-            "Amazon-Advertising-API-ClientId": self.client_id,
-            "Amazon-Advertising-API-Scope": str(self.profile_id),
-        }
-        resp = requests.delete(url, headers=h, proxies=self.proxies, timeout=60)
-        try:
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError:
-            try:
-                err_body = resp.json()
-            except Exception:
-                err_body = resp.text
-            print(f"[Ads-API Error] {resp.status_code} {resp.url}")
-            print(f"[Ads-API Error Body] {err_body}")
-            raise
-        if resp.status_code == 204 or not resp.text:
-            return {}
-        return resp.json()
+        return self._archive_without_content_type(f"/sp/negativeTargets/{target_id}")
 
     # ==================== 广告组合 (Portfolios) ====================
 
