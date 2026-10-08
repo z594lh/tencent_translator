@@ -24,3 +24,4 @@ requests-aws4auth
 apscheduler
 oss2>=2.18.1
 croniter
+tzdata

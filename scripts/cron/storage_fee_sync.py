@@ -7,8 +7,9 @@
     python scripts/cron/storage_fee_sync.py --shop 1   仅同步指定店铺
     python scripts/cron/storage_fee_sync.py --start 2026-05-01 --end 2026-08-01  指定数据范围
 
-定时: 仓储费每月约 7 号出上月的账，建议每月 8 号执行一次
-      crontab: 0 8 8 * * cd /path && python scripts/cron/storage_fee_sync.py >> log/storage_fee_sync.log 2>&1
+定时: 已核实生产为每月8日8点，本版本复用原调度，不自动修改crontab。
+      0 8 8 * * python scripts/cron/storage_fee_sync.py >> log/cron/storage_fee_sync.log 2>&1
+      若当次报告尚未出账，需查看实际账期/错误后明确重试，不能认为部署自动补齐历史。
 """
 import os
 import sys
@@ -22,6 +23,12 @@ from scripts.cron import _now_str
 
 
 def run(shop_id=None, start_date=None, end_date=None):
+    """调用真实仓储同步并打印单店/逐店结果，无返回值。
+
+    shop_id指定则仅同步该店，否则遍历全部启用店铺；日期字符串交Service校验。
+    会申请Amazon报告、下载文件并写amazon_fba_storage_fees，不是只读报表生成。
+    单店异常向外抛，多店结果逐店打印；月份以报告实际返回为准，不自动伪造补齐。
+    """
     from services.fba_storage_fee_service import sync_storage_fees, sync_all_storage_fees
 
     if shop_id:

@@ -19,6 +19,8 @@ from blueprints.amazon.inbound_plans import amazon_inbound_plans_bp
 from blueprints.amazon.invoice_export import amazon_invoice_export_bp
 from blueprints.amazon.orders import amazon_orders_bp
 from blueprints.amazon.listing import amazon_listing_bp
+from blueprints.amazon.listing_ownership import listing_ownership_bp
+from blueprints.performance import performance_bp
 from blueprints.amazon.finances import amazon_finances_bp
 from blueprints.amazon.advertising import advertising_bp
 from blueprints.amazon.advertising_manage import advertising_manage_bp
@@ -115,6 +117,8 @@ BLUEPRINTS = (
     amazon_invoice_export_bp,
     amazon_orders_bp,
     amazon_listing_bp,
+    listing_ownership_bp,
+    performance_bp,
     amazon_finances_bp,
     advertising_bp,
     advertising_manage_bp,

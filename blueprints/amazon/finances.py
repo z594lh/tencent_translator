@@ -184,8 +184,8 @@ def sync_fba_storage_fees():
         else:
             result = sync_all_storage_fees(start_date=start_date, end_date=end_date)
         return jsonify({"status": "success", "message": "同步完成", "data": result})
-    except ValueError:
-        return jsonify({"status": "error", "message": "shop_id 必须是整数"}), 400
+    except ValueError as error:
+        return jsonify({"status": "error", "message": f"店铺或日期参数无效：{error}"}), 400
     except Exception as e:
         print(f"[Finances] 仓储费同步异常: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
