@@ -6,7 +6,7 @@ domain_response也被绩效路由复用，统一总开关、安全JSON和业务�
 本文件不直接实现负责区间SQL、利润计算或外部同步。
 """
 from functools import wraps
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 from blueprints.user_auth import login_required, permission_required
 from services.listing_performance import ownership_service as service
 from services.listing_performance.common import DomainError, require_enabled, positive_id, json_data
@@ -20,16 +20,19 @@ def domain_response(fn):
     """装饰归属/绩效HTTP方法，统一功能开关与响应包络。
 
     fn返回业务数据或(data,status)；序列化日期/Decimal后输出success/data。
+    已鉴权下载路由返回Response时原样传递附件，不把文件塞进JSON包络。
     DomainError按其HTTP状态安全返回，系统异常记录日志并给通用500提示。
     不代替登录/权限装饰器，不启动计算任务。"""
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        """执行已鉴权路由并包装JSON响应。
+        """执行已鉴权路由，包装JSON或传递文件响应。
 
         先require_enabled，处理服务自定义状态码和安全错误；不吞异常为成功数据。"""
         try:
             require_enabled()
             data = fn(*args, **kwargs)
+            if isinstance(data, Response):
+                return data
             status = 200
             if isinstance(data,tuple):
                 data,status = data
