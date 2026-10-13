@@ -1,205 +1,76 @@
-"""
-计划任务看板 - 只读展示系统 crontab 中的计划任务
-"""
-import os
-import re
-import subprocess
-from datetime import datetime
-from flask import Blueprint, jsonify
-from croniter import croniter
+"""计划任务管理：只处理HTTP输入、鉴权和响应，不执行命令。"""
+import logging
+from functools import wraps
+
+from flask import Blueprint, jsonify, request
 from blueprints.user_auth import login_required, permission_required
+from services.permissions_service import get_user_permission_codes
+from services.cron_tasks import service, repository
 
 cron_bp = Blueprint('cron', __name__, url_prefix='/api/cron')
+logger = logging.getLogger(__name__)
 
 
-def _parse_last_run(log_path, task_name):
-    """读取日志文件，提取该任务最近一次执行的时间戳"""
-    if not log_path or not os.path.exists(log_path):
-        return None
-
-    try:
-        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 2048), os.SEEK_SET)
-            tail = f.read()
-    except Exception:
-        return None
-
-    ts_pattern = re.compile(r'\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]')
-
-    candidates = []
-    for line in tail.splitlines():
-        if task_name and task_name not in line:
-            continue
-        match = ts_pattern.search(line)
-        if match:
-            try:
-                dt = datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S')
-                candidates.append(dt)
-            except ValueError:
-                continue
-
-    return max(candidates) if candidates else None
+def response(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            payload = function(*args, **kwargs)
+            result = jsonify(payload[0]) if isinstance(payload, tuple) else jsonify(payload)
+            if isinstance(payload, tuple):
+                result.status_code = payload[1]
+        except repository.TaskError as exc:
+            result = jsonify({'success': False, 'message': str(exc)})
+            result.status_code = exc.status
+        except ValueError:
+            result = jsonify({'success': False, 'message': '任务或请求参数无效'})
+            result.status_code = 400
+        except Exception as exc:
+            logger.error('计划任务接口异常：%s', type(exc).__name__)
+            result = jsonify({'success': False, 'message': '计划任务服务暂不可用，请核对数据库迁移和服务配置；不会自动重试'})
+            result.status_code = 503
+        result.headers['Cache-Control'] = 'no-store'
+        return result
+    return wrapped
 
 
-def _calc_next_run(schedule):
-    """根据 cron 表达式计算下次执行时间"""
-    try:
-        itr = croniter(schedule, datetime.now())
-        return itr.get_next(datetime)
-    except Exception:
-        return None
+def pagination():
+    page = max(1, min(request.args.get('page', 1, type=int), 100000))
+    per_page = max(1, min(request.args.get('per_page', 10, type=int), 100))
+    return page, per_page
 
 
-def parse_crontab():
-    """执行 crontab -l，返回与当前项目相关的结构化任务列表"""
-    try:
-        result = subprocess.run(
-            ['crontab', '-l'],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
-            return {'error': f"crontab -l 执行失败: {result.stderr.strip()}", 'tasks': []}
-        lines = result.stdout.splitlines()
-    except FileNotFoundError:
-        return {'error': '当前系统不支持 crontab 命令', 'tasks': []}
-    except subprocess.TimeoutExpired:
-        return {'error': 'crontab -l 执行超时', 'tasks': []}
-    except Exception as e:
-        return {'error': f"读取 crontab 异常: {str(e)}", 'tasks': []}
-
-    tasks = []
-    pending_comment = []
-
-    cron_pattern = re.compile(
-        r'^\s*([\*\d,\-\/]+)\s+'
-        r'([\*\d,\-\/]+)\s+'
-        r'([\*\d,\-\/]+)\s+'
-        r'([\*\d,\-\/]+)\s+'
-        r'([\*\d,\-\/]+)\s+'
-        r'(.+)$'
-    )
-
-    cron_dir = '/home/root/tencent_translator/scripts/cron'
-
-    for line in lines:
-        line = line.rstrip('\n')
-        stripped = line.strip()
-
-        if not stripped or stripped.startswith('SHELL=') or stripped.startswith('PATH='):
-            pending_comment = []
-            continue
-
-        if stripped.startswith('#'):
-            comment_text = stripped.lstrip('#').strip()
-            if comment_text:
-                pending_comment.append(comment_text)
-            continue
-
-        match = cron_pattern.match(stripped)
-        if match:
-            minute, hour, dom, month, dow, command = match.groups()
-
-            # 匹配子模块路径: scripts/cron/xxx.py [--arg]
-            task_name = ''
-            display_command = command
-            m = re.search(r'scripts/cron/(\w+)\.py(?:\s+(--\S+))?', command)
-
-            if m:
-                module = m.group(1)
-                arg = m.group(2) or ''
-                task_name = (module + (f' {arg}' if arg else '')).strip()
-                display_command = f"cron/{module}.py{arg and ' ' + arg or ''}"
-            else:
-                pending_comment = []
-                continue
-
-            log_path = ''
-            m = re.search(r'>+\s+(\S+)', command)
-            if m:
-                log_path = m.group(1)
-
-            raw_desc = ' '.join(pending_comment) if pending_comment else ''
-            clean_desc = re.sub(r'=+', '', raw_desc).strip()
-
-            schedule = f"{minute} {hour} {dom} {month} {dow}"
-
-            tasks.append({
-                'schedule': schedule,
-                'minute': minute,
-                'hour': hour,
-                'day_of_month': dom,
-                'month': month,
-                'day_of_week': dow,
-                'command': display_command,
-                'full_command': command,
-                'task_name': task_name,
-                'log_path': log_path,
-                'description': clean_desc,
-                'last_run': _parse_last_run(log_path, task_name),
-                'next_run': _calc_next_run(schedule),
-            })
-            pending_comment = []
-        else:
-            pending_comment = []
-
-    return {'tasks': tasks}
-
-
-def _paginate_and_filter(tasks, keyword, page, per_page):
-    """对任务列表进行搜索过滤和分页"""
-    if keyword:
-        filtered = []
-        for t in tasks:
-            task_name = (t.get('task_name') or '').lower()
-            description = (t.get('description') or '').lower()
-            if keyword in task_name or keyword in description:
-                filtered.append(t)
-        tasks = filtered
-
-    total = len(tasks)
-    total_pages = (total + per_page - 1) // per_page if total > 0 else 1
-    start = (page - 1) * per_page
-    end = start + per_page
-    paged_tasks = tasks[start:end]
-
-    return paged_tasks, {
-        'page': page,
-        'per_page': per_page,
-        'total': total,
-        'total_pages': total_pages,
-    }
-
-
-@cron_bp.route('/tasks', methods=['GET'])
+@cron_bp.get('/tasks')
 @login_required
 @permission_required('tasks:page')
+@response
 def get_tasks():
-    """获取计划任务列表，支持搜索和分页"""
-    from flask import request
-
-    keyword = request.args.get('keyword', '').strip().lower()
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
-
-    if page < 1:
-        page = 1
-    if per_page < 1:
-        per_page = 10
-    if per_page > 100:
-        per_page = 100
-
-    result = parse_crontab()
-    if 'error' in result:
-        return jsonify({'success': False, 'error': result['error'], 'tasks': result['tasks']}), 500
-    tasks = result['tasks']
+    page, per_page = pagination()
+    codes = get_user_permission_codes(request.current_user['id'])
+    return service.list_tasks(request.args.get('keyword', '').strip().lower()[:100], page, per_page, 'tasks:execute' in codes)
 
 
-    paged_tasks, pagination = _paginate_and_filter(tasks, keyword, page, per_page)
+@cron_bp.post('/tasks/<task_id>/execute')
+@login_required
+@permission_required('tasks:page')
+@permission_required('tasks:execute')
+@response
+def execute_task(task_id):
+    record, created = service.submit(task_id, request.get_json(silent=True), request.current_user)
+    return {'success': True, 'record': record, 'message': '请求已接收' if created else '已找到原请求记录，未重复执行'}, 202 if created else 200
 
-    return jsonify({
-        'success': True,
-        'tasks': paged_tasks,
-        'pagination': pagination,
-    })
+
+@cron_bp.get('/tasks/<task_id>/runs')
+@login_required
+@permission_required('tasks:page')
+@response
+def task_history(task_id):
+    return service.history(task_id, *pagination())
+
+
+@cron_bp.get('/runs/<int:run_id>')
+@login_required
+@permission_required('tasks:page')
+@response
+def run_detail(run_id):
+    return service.detail(run_id)

@@ -12,6 +12,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from services.notification_dispatcher import fire
 
 amazon_orders_bp = Blueprint('amazon_orders', __name__, url_prefix='/api')
@@ -133,6 +134,7 @@ def amazon_order_detail(order_id):
 @amazon_orders_bp.route('/amazon/sync/orders', methods=['POST'])
 @login_required
 @permission_required('amazon_orders:sync')
+@resource_guard('orders')
 def sync_amazon_orders():
     """
     手动触发订单数据同步（从 API 写入数据库）
@@ -177,6 +179,7 @@ def sync_amazon_orders():
 @amazon_orders_bp.route('/amazon/sync/orders/<order_id>/items', methods=['POST'])
 @login_required
 @permission_required('amazon_orders:sync')
+@resource_guard('orders')
 def sync_amazon_order_items(order_id):
     """
     手动触发指定订单的商品数据同步
@@ -208,6 +211,7 @@ def sync_amazon_order_items(order_id):
 @amazon_orders_bp.route('/amazon/sync/orders-all', methods=['POST'])
 @login_required
 @permission_required('amazon_orders:sync')
+@resource_guard('orders')
 def sync_amazon_orders_all():
     """
     一键同步订单及其商品数据

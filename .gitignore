@@ -32,6 +32,7 @@ static/shipping_invoice_templates/task/*
 
 .claude/
 .codegraph/
+deploy/
 doc/
 docs/
 sql/

@@ -22,6 +22,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from blueprints.amazon.listing import sync_listings_to_db, _auto_sync_products
 
 amazon_inbound_plans_bp = Blueprint('amazon_inbound_plans', __name__, url_prefix='/api')
@@ -197,6 +198,7 @@ def amazon_inbound_plan_boxes_by_shipment():
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-shipments', methods=['POST'])
 @login_required
 @permission_required('amazon_inbound_plans:sync')
+@resource_guard('inbound')
 def sync_amazon_inbound_shipments():
     """
     一键同步最新货件数据
@@ -230,6 +232,7 @@ def sync_amazon_inbound_shipments():
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>/boxes', methods=['POST'])
 @login_required
 @permission_required('amazon_inbound_plans:sync')
+@resource_guard('inbound')
 def sync_amazon_inbound_plan_boxes(plan_id):
     """
     手动触发指定入库计划的箱子数据同步
@@ -257,6 +260,7 @@ def sync_amazon_inbound_plan_boxes(plan_id):
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-shipments/<shipment_id>/detail', methods=['POST'])
 @login_required
 @permission_required('amazon_inbound_plans:sync')
+@resource_guard('inbound')
 def sync_amazon_inbound_shipment_detail(shipment_id):
     """
     手动触发单个货件详情同步
@@ -307,6 +311,7 @@ def sync_amazon_inbound_shipment_detail(shipment_id):
 @amazon_inbound_plans_bp.route('/amazon/sync/inbound-plans/<plan_id>', methods=['POST'])
 @login_required
 @permission_required('amazon_inbound_plans:sync')
+@resource_guard('inbound')
 def sync_amazon_inbound_plan_full(plan_id):
     """
     手动触发单个入库计划全量同步（货件列表 + 箱子 + 货件详情）

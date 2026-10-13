@@ -16,6 +16,7 @@ from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.oss_uploader import upload_image_for_listing
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from services.deepseekAI import generate_declaration_info
 from blueprints.asin_bsr import attach_bsr_info, get_bsr_trend
 
@@ -189,6 +190,7 @@ def get_listing_bsr_trend(sku):
 @amazon_listing_bp.route('/amazon/sync/listings', methods=['POST'])
 @login_required
 @permission_required('amazon_listings:sync')
+@resource_guard('listing')
 def sync_listings():
     """
     手动触发 Listing 同步（从 SP-API 写入数据库）
@@ -234,6 +236,7 @@ def sync_listings():
 @amazon_listing_bp.route('/amazon/listings/<sku>/sync', methods=['POST'])
 @login_required
 @permission_required('amazon_listings:sync')
+@resource_guard('listing')
 def sync_single_listing(sku):
     """
     从 SP-API 实时拉取单条 Listing 并写入本地数据库

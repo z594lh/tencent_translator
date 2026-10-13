@@ -26,6 +26,7 @@ import openpyxl
 from flask import Blueprint, request, jsonify, g
 
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from services.shop_service import get_ads_api_client, get_shop_by_id, get_all_active_shops
 
 advertising_manage_bp = Blueprint('advertising_manage', __name__, url_prefix='/api/cpc')
@@ -2825,6 +2826,7 @@ def sync_all_shops():
 # =================================================================
 
 @advertising_manage_bp.route('/entities/sync', methods=['POST'])
+@resource_guard('ads_entities')
 def trigger_entity_sync():
     """一键同步指定店铺的全量广告实体（campaign/group/product-ad/keyword/target/negative）"""
     body = request.get_json() or {}
@@ -2851,6 +2853,7 @@ def trigger_entity_sync():
 
 
 @advertising_manage_bp.route('/entities/sync-all', methods=['POST'])
+@resource_guard('ads_entities')
 def trigger_entity_sync_all():
     """一键同步所有店铺的全量广告实体"""
     t0 = time.time()

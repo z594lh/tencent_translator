@@ -22,6 +22,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client, get_all_active_shops
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from services.fee_parser import extract_fees_from_items
 from services.fba_storage_fee_service import sync_storage_fees, sync_all_storage_fees
 
@@ -106,6 +107,7 @@ def list_finances():
 @amazon_finances_bp.route('/amazon/finances/sync', methods=['POST'])
 @login_required
 @permission_required('amazon_finances:sync')
+@resource_guard('finances')
 def trigger_finances_sync():
     """
     触发财务数据同步
@@ -163,6 +165,7 @@ def trigger_finances_sync():
 @amazon_finances_bp.route('/amazon/fba-storage-fees/sync', methods=['POST'])
 @login_required
 @permission_required('amazon_finances:sync')
+@resource_guard('storage_fees')
 def sync_fba_storage_fees():
     """
     触发 FBA 月度仓储费同步（同步等待报告生成，耗时约 1~3 分钟）

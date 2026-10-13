@@ -12,6 +12,7 @@ from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from services.notification_dispatcher import fire
 
 amazon_inventory_bp = Blueprint('amazon_inventory', __name__, url_prefix='/api')
@@ -95,6 +96,7 @@ def amazon_inventory():
 @amazon_inventory_bp.route('/amazon/sync/inventory', methods=['POST'])
 @login_required
 @permission_required('amazon_inventory:sync')
+@resource_guard('inventory')
 def sync_amazon_inventory():
     """
     手动触发库存数据同步（从 API 写入数据库）

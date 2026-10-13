@@ -48,6 +48,7 @@ from decimal import Decimal
 
 from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from services.report_generator import (
     generate_business_daily,
     generate_sku_profit,
@@ -465,6 +466,7 @@ def business_trend():
 @reports_bp.route('/reports/business/generate', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
+@resource_guard('reporting')
 def trigger_business_report():
     """
     手动触发经营日报生成
@@ -781,6 +783,7 @@ def sku_profit_aggregate():
 @reports_bp.route('/reports/sku-profit/generate', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
+@resource_guard('reporting')
 def trigger_sku_profit():
     """
     手动触发 SKU 利润表生成（按天生成，支持日期范围）
@@ -997,6 +1000,7 @@ def inventory_turnover_stats():
 @reports_bp.route('/reports/inventory-turnover/generate', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
+@resource_guard('reporting')
 def trigger_inventory_turnover():
     """
     手动触发库存周转生成
@@ -1182,6 +1186,7 @@ def list_sku_sales():
 @reports_bp.route('/reports/sku-sales/generate', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
+@resource_guard('reporting')
 def trigger_sku_sales():
     """
     手动触发 SKU 销售数据全量生成
@@ -1209,6 +1214,7 @@ def trigger_sku_sales():
 @reports_bp.route('/reports/sku-sales/generate/<sku>', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
+@resource_guard('reporting')
 def trigger_sku_sales_single(sku):
     """
     手动触发单个 SKU 的销售数据生成
@@ -2250,6 +2256,7 @@ def advertising_daily_products(date, campaign_id, ad_group_id):
 @reports_bp.route('/reports/advertising/generate', methods=['POST'])
 @login_required
 @permission_required('reports_advertising:generate')
+@resource_guard('reporting')
 def trigger_advertising_report():
     """
     手动触发广告效果日报生成
@@ -2656,6 +2663,7 @@ def list_products_detail():
 @reports_bp.route('/reports/generate-yesterday', methods=['POST'])
 @login_required
 @permission_required('reports:generate')
+@resource_guard('reporting')
 def trigger_yesterday_reports():
     """
     一键生成最近10天全部报表

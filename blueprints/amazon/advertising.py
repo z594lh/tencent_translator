@@ -21,6 +21,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
+from services.cron_tasks.execution import resource_guard
 from services.shop_service import get_shop_by_id
 from services.credential_service import get_ads_app_credentials
 advertising_bp = Blueprint('advertising', __name__, url_prefix='/api')
@@ -759,6 +760,7 @@ def run_ads_sync(shop_id, date_str=None, force_refresh=False):
 @advertising_bp.route('/amazon/ads/reports/sync', methods=['POST'])
 @login_required
 @permission_required('shops:edit')
+@resource_guard('reporting')
 def trigger_sync():
     data = request.get_json() or {}
     shop_id = data.get('shop_id')
@@ -773,6 +775,7 @@ def trigger_sync():
 @advertising_bp.route('/amazon/ads/reports/sync-all', methods=['POST'])
 @login_required
 @permission_required('shops:edit')
+@resource_guard('reporting')
 def trigger_sync_all():
     from services.shop_service import get_all_active_shops
     data = request.get_json() or {}
