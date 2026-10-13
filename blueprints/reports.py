@@ -2900,6 +2900,23 @@ def export_fba_storage_fees():
 # 9. FBA 月度仓储费 — SKU 维度透视 / 详情 / 导出
 # ============================================================
 
+@reports_bp.route('/reports/fba-storage-fees/monthly-trend', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def fba_storage_fee_monthly_trend():
+    """当前店铺截至最新计费月的12个月趋势，币种独立，不执行同步。"""
+    from services.fba_storage_fee_report_service import monthly_trend
+    try:
+        shop_id = _require_shop_id_from_args()
+        if shop_id <= 0:
+            raise ValueError('shop_id 必须是正整数')
+    except ValueError as error:
+        return jsonify({'status': 'error', 'message': str(error)}), 400
+    result = jsonify({'status': 'success', 'data': monthly_trend(shop_id)})
+    result.headers['Cache-Control'] = 'no-store'
+    return result
+
+
 _SKU_EXPR = "COALESCE(NULLIF(seller_sku, ''), fnsku)"
 
 
