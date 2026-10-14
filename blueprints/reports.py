@@ -2920,6 +2920,58 @@ def fba_storage_fee_monthly_trend():
 _SKU_EXPR = "COALESCE(NULLIF(seller_sku, ''), fnsku)"
 
 
+@reports_bp.route('/reports/fba-storage-fees/analysis', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def storage_cost_worklist():
+    from services.storage_cost_analysis import worklist
+    from services.permissions_service import get_user_permission_codes
+    try:
+        result = worklist(_require_shop_id_from_args(), request.args)
+        result['can_sync'] = 'amazon_finances:sync' in get_user_permission_codes(request.current_user['id'])
+        response = jsonify({'status': 'success', 'data': result})
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except ValueError as error:
+        return jsonify({'status': 'error', 'message': str(error)}), 400
+
+
+@reports_bp.route('/reports/fba-storage-fees/analysis/detail', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def storage_cost_detail():
+    from services.storage_cost_analysis import detail
+    try:
+        result = detail(_require_shop_id_from_args(), request.args)
+        response = jsonify({'status': 'success', 'data': result})
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except ValueError as error:
+        return jsonify({'status': 'error', 'message': str(error)}), 400
+
+
+@reports_bp.route('/reports/fba-storage-fees/analysis/sync', methods=['POST'])
+@login_required
+@permission_required('reports:page')
+@permission_required('amazon_finances:sync')
+@resource_guard('storage_fees')
+def storage_cost_sync():
+    from services.storage_analysis_reports import advance
+    data = request.get_json(silent=True)
+    try:
+        if not isinstance(data, dict) or set(data) - {'shop_id', 'kind', 'month', 'action'}:
+            raise ValueError('仅接受指定店铺、资料类型、月份和创建/检查操作')
+        shop_id = data.get('shop_id')
+        if isinstance(shop_id, bool) or not str(shop_id).isdigit() or int(shop_id) <= 0:
+            raise ValueError('shop_id必须为正整数')
+        result = advance(int(shop_id), data.get('kind'), data.get('month'), data.get('action'))
+        response = jsonify({'status': 'success', 'data': result})
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except ValueError as error:
+        return jsonify({'status': 'error', 'message': str(error)}), 400
+
+
 def _build_sku_pivot_data(conn, shop_id, months, search, country_codes,
                           fulfillment_centers, product_size_tiers):
     """构建 SKU 维度透视数据，返回 (months, list_data, summary)"""

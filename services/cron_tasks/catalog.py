@@ -48,6 +48,7 @@ TASKS = {t.id: t for t in (
     _task('rebuild_reports', 'rebuild_reports', 'reporting', '消费报表重建任务', '处理当前待重建列表，不创建新回填范围'),
     _task('exchange_rate', 'exchange_rate', 'exchange_rate', '更新汇率', '原脚本默认币种'),
     _task('storage_fee_sync', 'storage_fee_sync', 'storage_fees', '同步月度仓储费', '全部启用店铺，原脚本默认账期'),
+    _task('storage_analysis_sync', 'storage_analysis_sync', 'storage_fees', '采集仓储完整报告', '全部启用店铺；每日库存健康、最近两个完整月的月费/超龄/超量报告及历史在途续查'),
     _task('auto_complete', 'auto_complete', 'auto_complete', '超期订单自动完结', '会完结采购单/运单并入账；禁止手动执行', manual=False),
 )}
 GROUPS = sorted({t.group for t in TASKS.values()})
