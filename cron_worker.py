@@ -41,11 +41,11 @@ def main():
         with TaskLock('_worker'):
             instance = uuid.uuid4().hex
             server, uid = identity()
-            child = None
+            children = {}
             last_heartbeat = last_reconcile = last_prune = 0
-            while not stop or child is not None:
-                if child is not None and child.poll() is not None:
-                    child = None
+            while not stop or children:
+                # 不同任务的手动执行互不阻塞；同任务排重由公共入口的独立锁/占用槽负责。
+                children = {run_id: child for run_id, child in children.items() if child.poll() is None}
                 now = time.monotonic()
                 try:
                     if now - last_heartbeat >= 3:
@@ -57,10 +57,10 @@ def main():
                     if now - last_prune >= 86400:
                         prune_logs()
                         last_prune = now
-                    if not stop and child is None:
+                    if not stop:
                         pending = repo.pending(instance)
-                        if pending:
-                            child = subprocess.Popen([sys.executable, '-u', str(catalog.RUNNER),
+                        if pending and pending['id'] not in children:
+                            children[pending['id']] = subprocess.Popen([sys.executable, '-u', str(catalog.RUNNER),
                                 '--run-id', str(pending['id']), '--instance', instance],
                                 cwd=str(catalog.ROOT), stdin=subprocess.DEVNULL, close_fds=True, shell=False)
                 except Exception as exc:

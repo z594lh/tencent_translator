@@ -92,10 +92,8 @@ def submit(task, actor, request_id, server_id, uid):
             return existing
         if not worker_online(runtime, server_id, uid):
             raise TaskError('执行服务未就绪，请稍后刷新或联系管理员', 503)
-        if runtime['active_manual_id']:
-            raise TaskError('已有手动任务启动或执行中，请等待结束')
         if _slot(cursor, task.group):
-            raise TaskError('相关任务正在执行或状态待核实，请先查看执行记录')
+            raise TaskError('此任务正在执行或状态待核实，请先查看执行记录')
         cursor.execute('SELECT created_at FROM cron_task_runs WHERE task_id=%s AND source=%s ORDER BY id DESC LIMIT 1', (task.id, 'manual'))
         last = cursor.fetchone()
         if last and now - last['created_at'] < timedelta(seconds=60):
@@ -111,7 +109,6 @@ def submit(task, actor, request_id, server_id, uid):
              request_id, '请求已接收，等待执行服务启动；30秒内未启动将失效', runtime['worker_instance'], server_id, now))
         run_id = cursor.lastrowid
         cursor.execute('UPDATE cron_task_slots SET active_run_id=%s WHERE group_key=%s', (run_id, task.group))
-        cursor.execute('UPDATE cron_task_runtime SET active_manual_id=%s WHERE id=1', (run_id,))
         cursor.execute('SELECT * FROM cron_task_runs WHERE id=%s', (run_id,))
         return cursor.fetchone()
 
@@ -128,7 +125,7 @@ def begin_run(task, server_id, run_id=None, instance=None):
             cursor.execute('''INSERT INTO cron_task_runs
                 (run_key,task_id,group_key,source,status,summary,server_id,created_at,started_at,heartbeat_at,finished_at)
                 VALUES (%s,%s,%s,'scheduled',%s,%s,%s,%s,%s,%s,%s)''',
-                (uuid.uuid4().hex, task.id, task.group, status, '相关任务已占用，本轮跳过' if occupied else '正在执行原任务脚本',
+                (uuid.uuid4().hex, task.id, task.group, status, '此任务已占用，本轮跳过' if occupied else '正在执行原任务脚本',
                  server_id, now, None if occupied else now, now, now if occupied else None))
             run_id = cursor.lastrowid
             if not occupied:
@@ -139,7 +136,7 @@ def begin_run(task, server_id, run_id=None, instance=None):
                 raise TaskError('执行服务已停止或实例已变化，当前请求不执行')
             cursor.execute('SELECT * FROM cron_task_runs WHERE id=%s FOR UPDATE', (run_id,))
             row = cursor.fetchone()
-            if not row or row['task_id'] != task.id or row['status'] != 'pending' or occupied != run_id:
+            if not row or row['task_id'] != task.id or row['group_key'] != task.group or row['status'] != 'pending' or occupied != run_id:
                 raise TaskError('请求已失效或不属于当前任务')
             if row['worker_instance'] != instance or row['server_id'] != server_id or now - row['created_at'] > timedelta(seconds=30):
                 raise TaskError('请求已过期，不会延迟执行')
@@ -155,7 +152,7 @@ def scheduled_skip(task, server_id):
         cursor.execute('''INSERT INTO cron_task_runs
             (run_key,task_id,group_key,source,status,summary,server_id,created_at,finished_at)
             VALUES (%s,%s,%s,'scheduled','skipped',%s,%s,%s,%s)''',
-            (uuid.uuid4().hex, task.id, task.group, '相关任务持有执行锁，本轮跳过', server_id, now, now))
+            (uuid.uuid4().hex, task.id, task.group, '此任务持有执行锁，本轮跳过', server_id, now, now))
 
 
 def finish(run_id, status, summary, exit_code=None):

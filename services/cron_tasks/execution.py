@@ -77,8 +77,8 @@ def _validate_manual(row, instance):
     codes = get_user_permission_codes(row['actor_id'])
     if not actor or actor['status'] != 1 or not {'tasks:page', 'tasks:execute'}.issubset(codes):
         raise repo.TaskError('操作人权限已变化，当前请求不执行', 403)
-    if row['worker_instance'] != instance:
-        raise repo.TaskError('请求所属执行服务已变化')
+    if row['worker_instance'] != instance or row['group_key'] != task.group:
+        raise repo.TaskError('请求所属执行服务或任务锁已变化')
     return task
 
 
@@ -104,14 +104,14 @@ def execute(task_id=None, run_id=None, instance=None):
         if run_id is None:
             repo.scheduled_skip(task, server)
         else:
-            repo.finish(run_id, 'skipped', '相关任务已持有执行锁，本次未启动，不会排队重试')
+            repo.finish(run_id, 'skipped', '此任务已持有执行锁，本次未启动，不会排队重试')
         return 0
     log = None
     child = None
     try:
         row = repo.begin_run(task, server, run_id, instance)
         if row['status'] == 'skipped':
-            print(f'[{task.id}] 相关任务已占用，本轮跳过', flush=True)
+            print(f'[{task.id}] 此任务已占用，本轮跳过', flush=True)
             return 0
         run_id = row['id']
         print(f'[{task.id}] 开始执行，记录#{run_id}', flush=True)

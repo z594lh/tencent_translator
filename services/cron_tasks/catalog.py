@@ -26,32 +26,36 @@ class Task:
     manual: bool = True
 
 
-def _task(key, script, group, title, scope, *args, manual=True):
-    return Task(key, script, args, group, title, scope, manual)
+def _task(key, script, title, scope, *args, manual=True):
+    # 每个计划任务独立互斥，手动与自动由同一个task_id确定锁，禁止跨任务共组。
+    return Task(key, script, args, 'task_' + key, title, scope, manual)
 
 
 TASKS = {t.id: t for t in (
-    _task('orders_recent', 'orders', 'orders', '近期订单同步', '全部启用店铺，最近24小时', '--recent'),
-    _task('orders_week', 'orders', 'orders', '本周订单同步', '全部启用店铺，最近7天', '--week'),
-    _task('orders_month', 'orders', 'orders', '本月订单列表同步', '全部启用店铺，最近30天，仅订单列表', '--month'),
-    _task('inventory', 'inventory', 'inventory', 'FBA库存同步', '全部启用店铺，当前库存'),
-    _task('listing', 'listing', 'listing', 'Listing同步', '全部启用店铺，按原脚本同步'),
-    _task('inbound_recent', 'inbound', 'inbound', '近期入库同步', '全部启用店铺，原30分钟模式', '--30min'),
-    _task('inbound_full', 'inbound', 'inbound', '完整入库同步', '全部启用店铺，原6小时模式', '--6h'),
-    _task('finances', 'finances', 'finances', '财务明细同步', '最近30天；本版仅定时执行', manual=False),
-    _task('product_fees', 'product_fees', 'product_fees', '产品费用同步', '全部启用店铺，按原脚本同步'),
-    _task('ads_create', 'ads_create', 'reporting', '创建广告报告', '全部启用店铺，昨日；不强制重建'),
-    _task('ads_download', 'ads_download', 'reporting', '下载广告报告', '全部启用店铺，昨日；不强制重建'),
-    _task('ads_entity_sync', 'ads_entity_sync', 'ads_entities', '广告实体同步', '全部启用店铺，只同步实体，不调整广告'),
-    _task('ads_report', 'ads_report', 'reporting', '生成广告日报', '昨日广告日报', '--daily'),
-    _task('reports', 'reports', 'reporting', '生成经营报表', '最近10天经营日报及原SKU/库存汇总', '--daily'),
-    _task('rebuild_reports', 'rebuild_reports', 'reporting', '消费报表重建任务', '处理当前待重建列表，不创建新回填范围'),
-    _task('exchange_rate', 'exchange_rate', 'exchange_rate', '更新汇率', '原脚本默认币种'),
-    _task('storage_fee_sync', 'storage_fee_sync', 'storage_fees', '同步月度仓储费', '全部启用店铺，原脚本默认账期'),
-    _task('storage_analysis_sync', 'storage_analysis_sync', 'storage_fees', '采集仓储完整报告', '全部启用店铺；每日库存健康、最近两个完整月的月费/超龄/超量报告及历史在途续查'),
-    _task('auto_complete', 'auto_complete', 'auto_complete', '超期订单自动完结', '会完结采购单/运单并入账；禁止手动执行', manual=False),
+    _task('orders_recent', 'orders', '近期订单同步', '全部启用店铺，最近24小时', '--recent'),
+    _task('orders_week', 'orders', '本周订单同步', '全部启用店铺，最近7天', '--week'),
+    _task('orders_month', 'orders', '本月订单列表同步', '全部启用店铺，最近30天，仅订单列表', '--month'),
+    _task('inventory', 'inventory', 'FBA库存同步', '全部启用店铺，当前库存'),
+    _task('listing', 'listing', 'Listing同步', '全部启用店铺，按原脚本同步'),
+    _task('inbound_recent', 'inbound', '近期入库同步', '全部启用店铺，原30分钟模式', '--30min'),
+    _task('inbound_full', 'inbound', '完整入库同步', '全部启用店铺，原6小时模式', '--6h'),
+    _task('finances', 'finances', '财务明细同步', '最近30天；本版仅定时执行', manual=False),
+    _task('product_fees', 'product_fees', '产品费用同步', '全部启用店铺，按原脚本同步'),
+    _task('ads_create', 'ads_create', '创建广告报告', '全部启用店铺，昨日；不强制重建'),
+    _task('ads_download', 'ads_download', '下载广告报告', '全部启用店铺，昨日；不强制重建'),
+    _task('ads_entity_sync', 'ads_entity_sync', '广告实体同步', '全部启用店铺，只同步实体，不调整广告'),
+    _task('ads_report', 'ads_report', '生成广告日报', '昨日广告日报', '--daily'),
+    _task('reports', 'reports', '生成经营报表', '最近10天经营日报及原SKU/库存汇总', '--daily'),
+    _task('rebuild_reports', 'rebuild_reports', '消费报表重建任务', '处理当前待重建列表，不创建新回填范围'),
+    _task('exchange_rate', 'exchange_rate', '更新汇率', '原脚本默认币种'),
+    _task('storage_fee_sync', 'storage_fee_sync', '同步月度仓储费', '全部启用店铺，原脚本默认账期'),
+    _task('storage_analysis_sync', 'storage_analysis_sync', '采集仓储完整报告', '全部启用店铺；每日库存健康、最近两个完整月的月费/超龄/超量报告及历史在途续查'),
+    _task('auto_complete', 'auto_complete', '超期订单自动完结', '会完结采购单/运单并入账；禁止手动执行', manual=False),
 )}
 GROUPS = sorted({t.group for t in TASKS.values()})
+# 普通业务HTTP页面的原锁名，仅兼容既有入口/旧审计；新计划任务不使用这些锁。
+LEGACY_HTTP_GROUPS = ('orders', 'inventory', 'listing', 'inbound', 'finances', 'product_fees',
+                      'reporting', 'ads_entities', 'exchange_rate', 'storage_fees', 'auto_complete')
 
 
 def get_task(task_id):

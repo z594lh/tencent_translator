@@ -3,7 +3,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from services.cron_tasks.catalog import GROUPS, ROOT, supported
+from services.cron_tasks.catalog import GROUPS, LEGACY_HTTP_GROUPS, ROOT, supported
 
 STATE_ROOT = ROOT / 'log' / 'cron-control'
 
@@ -40,7 +40,7 @@ def safe_directory(name):
 class TaskLock:
     """子进程继承fd，即使父执行器异常退出也不能提前释放实际任务的锁。"""
     def __init__(self, group):
-        if group not in GROUPS and group != '_worker':
+        if group not in GROUPS and group not in LEGACY_HTTP_GROUPS and group != '_worker':
             raise ValueError('未知任务锁')
         self.group = group
         self.fd = None

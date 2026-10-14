@@ -82,9 +82,7 @@ def list_tasks(keyword, page, per_page, can_execute):
         elif not ready or not task['managed']:
             reason = message or '任务尚未接入统一防重入口'
         elif status != 'idle':
-            reason = '相关任务正在执行或状态待核实'
-        elif runtime and runtime['active_manual_id']:
-            reason = '已有手动任务启动或执行中'
+            reason = '此任务正在执行或状态待核实'
         task['can_execute'] = not bool(reason)
         task['disabled_reason'] = reason
     stats = {'total': len(rows), 'running': sum(t['status'] == 'running' for t in rows),
@@ -117,7 +115,7 @@ def submit(task_id, data, actor):
     if not any(t['task_id'] == task_id and t['managed'] for t in discovery['tasks']):
         raise repo.TaskError('该任务未配置为受保护的定时任务', 409)
     if is_busy(task.group):
-        raise repo.TaskError('相关任务正在执行，请稍后再试')
+        raise repo.TaskError('此任务正在执行，请稍后再试')
     server, uid = identity()
     return public_run(repo.submit(task, actor, request_id, server, uid)), True
 
