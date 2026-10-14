@@ -8,6 +8,12 @@ from services.cron_tasks.locking import host_identity
 
 ACTIVE = ('pending', 'running', 'unknown')
 
+# 只允许明确结束的状态；未知状态及占用引用永不按年龄自动删除。
+_EXPIRED_RUN_WHERE = """r.status IN ('finished','failed','skipped','expired','interrupted')
+    AND r.finished_at < %s
+    AND NOT EXISTS (SELECT 1 FROM cron_task_slots s WHERE s.active_run_id=r.id)
+    AND NOT EXISTS (SELECT 1 FROM cron_task_runtime t WHERE t.active_manual_id=r.id)"""
+
 
 class TaskError(Exception):
     def __init__(self, message, status=409):
@@ -217,3 +223,33 @@ def get_run(run_id):
     with transaction() as cursor:
         cursor.execute('SELECT * FROM cron_task_runs WHERE id=%s', (run_id,))
         return cursor.fetchone()
+
+
+def _retention_host(cursor, lock=False):
+    runtime = _runtime(cursor, lock)
+    host = host_identity()
+    if not host or runtime.get('host_key') != host:
+        raise TaskError('执行记录清理只能在已绑定的同一服务器执行', 503)
+
+
+def expired_runs(cutoff):
+    """候选只读；按真实结束时间，单批最多200条，不回收任何任务占用。"""
+    with transaction() as cursor:
+        _retention_host(cursor)
+        cursor.execute('SELECT r.id,r.run_key FROM cron_task_runs r WHERE ' + _EXPIRED_RUN_WHERE +
+                       ' ORDER BY r.id LIMIT 200', (cutoff,))
+        return list(cursor.fetchall())
+
+
+def delete_expired_runs(run_ids, cutoff):
+    """文件处理后再短事务删除，并在统一服务锁内重新核对结束状态/占用。"""
+    if not run_ids:
+        return 0
+    if len(run_ids) > 200:
+        raise ValueError('执行记录清理超过单批上限')
+    with transaction() as cursor:
+        _retention_host(cursor, True)
+        placeholders = ','.join(['%s'] * len(run_ids))
+        cursor.execute('DELETE r FROM cron_task_runs r WHERE ' + _EXPIRED_RUN_WHERE +
+                       f' AND r.id IN ({placeholders})', (cutoff, *run_ids))
+        return cursor.rowcount

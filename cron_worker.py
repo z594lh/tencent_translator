@@ -11,18 +11,8 @@ load_dotenv(Path(__file__).resolve().parent / '.env', override=True)
 
 from services.cron_tasks import catalog, repository as repo
 from services.cron_tasks.execution import reconcile
-from services.cron_tasks.locking import TaskLock, BusyError, identity, safe_directory
-
-
-def prune_logs():
-    """仅清理本执行器已结束且超过30天的随机日志，保留数据库审计记录。"""
-    active = {row['run_key'] + '.log' for row in repo.active_runs()}
-    directory = safe_directory('runs')
-    import re
-    for path in directory.iterdir():
-        if re.fullmatch(r'[0-9a-f]{32}\.log', path.name) and path.name not in active and not path.is_symlink():
-            if path.is_file() and path.stat().st_mtime < time.time() - 30 * 86400:
-                path.unlink()
+from services.cron_tasks.locking import TaskLock, BusyError, identity
+from services.cron_tasks.retention import prune_history
 
 
 def main():
@@ -43,6 +33,7 @@ def main():
             server, uid = identity()
             children = {}
             last_heartbeat = last_reconcile = last_prune = 0
+            prune_interval = 3600
             while not stop or children:
                 # 不同任务的手动执行互不阻塞；同任务排重由公共入口的独立锁/占用槽负责。
                 children = {run_id: child for run_id, child in children.items() if child.poll() is None}
@@ -54,9 +45,17 @@ def main():
                     if now - last_reconcile >= 10:
                         reconcile(instance)
                         last_reconcile = now
-                    if now - last_prune >= 86400:
-                        prune_logs()
+                    if last_prune == 0 or now - last_prune >= prune_interval:
                         last_prune = now
+                        try:
+                            result = prune_history()
+                            # 历史较多时分批推进，不在一次循环长时间持有数据库锁。
+                            prune_interval = 60 if result['more'] else 3600
+                            if result['records'] or result['files'] or result['errors']:
+                                print(f"计划任务七天清理：记录{result['records']}条，日志{result['files']}个，未处理{result['errors']}个", flush=True)
+                        except Exception as exc:
+                            prune_interval = 60
+                            print(f'执行记录清理暂不可用（{type(exc).__name__}），稍后重试，不影响任务领取', flush=True)
                     if not stop:
                         pending = repo.pending(instance)
                         if pending and pending['id'] not in children:
