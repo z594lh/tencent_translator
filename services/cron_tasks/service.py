@@ -39,6 +39,22 @@ def manual_gate(discovery=None):
     return discovery
 
 
+def next_run_timestamp(task):
+    """使用明确带时区的计划时间；缺失/无效时间只置后，不伪造即将执行。"""
+    try:
+        value = datetime.fromisoformat(str(task.get('next_run') or '').replace('Z', '+00:00'))
+        return value.timestamp() if value.tzinfo else None
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def display_order(task):
+    """只排序展示：执行中、启动中优先，其余下次执行由近到远；同键稳定排序。"""
+    rank = 0 if task.get('status') in ('running', 'external') else 1 if task.get('status') == 'pending' else 2
+    stamp = next_run_timestamp(task)
+    return rank, stamp if stamp is not None else float('inf')
+
+
 def list_tasks(keyword, page, per_page, can_execute):
     discovery = catalog.discover()
     rows = discovery['tasks']
@@ -85,10 +101,13 @@ def list_tasks(keyword, page, per_page, can_execute):
             reason = '此任务正在执行或状态待核实'
         task['can_execute'] = not bool(reason)
         task['disabled_reason'] = reason
+    now = datetime.now(timezone.utc).timestamp()
     stats = {'total': len(rows), 'running': sum(t['status'] == 'running' for t in rows),
-             'upcoming': sum(bool(t['next_run']) and 0 <= (datetime.fromisoformat(t['next_run']) - datetime.now(timezone.utc)).total_seconds() <= 3600 for t in rows)}
+             'upcoming': sum(stamp is not None and 0 <= stamp-now <= 3600 for stamp in (next_run_timestamp(t) for t in rows))}
     if keyword:
         rows = [t for t in rows if keyword in (t['task_name'] + t['description'] + (t['task_id'] or '')).lower()]
+    # 必须全量排完再分页，否则更早执行的任务可能被留在后页。
+    rows = sorted(rows, key=display_order)
     total = len(rows)
     return {'success': True, 'tasks': rows[(page - 1) * per_page:page * per_page],
             'pagination': {'page': page, 'per_page': per_page, 'total': total},

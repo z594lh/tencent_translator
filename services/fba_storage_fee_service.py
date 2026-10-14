@@ -66,7 +66,7 @@ def _parse_tsv(text):
     """解析完整TSV文本，返回只保留需要字段的记录列表。
 
     必需列、规范计费月份、有效费用与币种必须存在，失败抛ValueError且尚未写库。
-    FNSKU/月/仓库空身份最终由sync_storage_fees跳过并反馈skipped；不伪造账期。"""
+    FNSKU/月/仓库空身份由归集阶段拒绝整批，不保存半批，也不伪造账期。"""
     rows = []
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     required = {'fnsku','month_of_charge','fulfillment_center','estimated_monthly_storage_fee','currency'}
@@ -90,6 +90,89 @@ def _parse_tsv(text):
             raise ValueError('仓储费报告金额或币种缺失，未写入任何数据')
         rows.append(row)
     return rows
+
+
+def aggregate_monthly_rows(rows):
+    """同一存储身份的原行是费用明细，先Decimal求和再UPSERT，重复同步不叠加。
+
+    旧唯一键不含国家/币种；碰到不兼容身份必须拒绝整批，不覆盖另一国家费用。
+    费率不是可加金额，多费率保留未知；费用、抵扣、数量和体积均只加已知完整列。
+    """
+    groups = {}
+    for original in rows:
+        row = dict(original)
+        row['fulfillment_center'] = _clean_fc(row.get('fulfillment_center'))
+        key = tuple(row.get(k) for k in ('fnsku', 'fulfillment_center', 'month_of_charge'))
+        if not all(key):
+            raise ValueError('仓储费原行身份缺失，整批未保存')
+        groups.setdefault(key, []).append(row)
+    result = []
+    additive = _DECIMAL_FIELDS - {'base_rate', 'utilization_surcharge_rate'}
+    for records in groups.values():
+        if len({(r.get('country_code'), r.get('currency')) for r in records}) != 1:
+            raise ValueError('仓储费唯一身份存在不同国家或币种，整批未保存')
+        row = dict(records[0])
+        for field in additive:
+            values = [_to_decimal(r.get(field)) for r in records]
+            row[field] = sum(values, Decimal('0')) if all(v is not None for v in values) else None
+        for field in ('base_rate', 'utilization_surcharge_rate'):
+            values = {_to_decimal(r.get(field)) for r in records}
+            row[field] = next(iter(values)) if len(values) == 1 else None
+        if row['estimated_monthly_storage_fee'] is None or not row.get('currency'):
+            raise ValueError('仓储费原行金额或币种缺失，整批未保存')
+        result.append(row)
+    return result
+
+
+def project_monthly_rows(cursor, shop_id, rows):
+    """调用方事务内更新完整报告覆盖账期/国家/币种的历史投影，不提交，不碰订单/财务。
+
+    与工作台共用报告原行，避免旧UPSERT最后一行覆盖其他同仓费用。
+    SKU只从同店库存或既有仓储费映射，未唯一映射保留FNSKU，不跨店猜测。
+    """
+    grouped = aggregate_monthly_rows(rows)
+    cursor.execute('SELECT fn_sku AS fnsku,seller_sku FROM amazon_inventory WHERE shop_id=%s', (shop_id,))
+    identities = list(cursor.fetchall())
+    cursor.execute('SELECT fnsku,seller_sku,fulfillment_center,month_of_charge,country_code,currency FROM amazon_fba_storage_fees WHERE shop_id=%s FOR UPDATE', (shop_id,))
+    existing = list(cursor.fetchall())
+    identities += existing
+    previous = {(r['fnsku'], _clean_fc(r['fulfillment_center']), r['month_of_charge']): (r['country_code'], r['currency']) for r in existing}
+    mapping = {}
+    for item in identities:
+        if item.get('fnsku') and item.get('seller_sku'):
+            mapping.setdefault(item['fnsku'], set()).add(item['seller_sku'])
+    for row in grouped:
+        key = (row['fnsku'], row['fulfillment_center'], row['month_of_charge'])
+        if key in previous and previous[key] != (row.get('country_code'), row['currency']):
+            raise ValueError('历史仓储费唯一身份对应另一国家或币种，未覆盖')
+    covered = {(r['month_of_charge'], r.get('country_code'), r['currency']) for r in grouped}
+    incoming = {(r['fnsku'], r['fulfillment_center'], r['month_of_charge']) for r in grouped}
+    # 完整报告中消失的旧明细不能继续残留在年度图；仅清理已覆盖范围，未返回月份/国家保留。
+    for item in existing:
+        key = (item['fnsku'], _clean_fc(item['fulfillment_center']), item['month_of_charge'])
+        if (item['month_of_charge'], item['country_code'], item['currency']) in covered and (key not in incoming or item['fulfillment_center'] != key[1]):
+            cursor.execute('''DELETE FROM amazon_fba_storage_fees WHERE shop_id=%s AND fnsku=%s
+                AND fulfillment_center=%s AND month_of_charge=%s AND country_code=%s AND currency=%s''',
+                (shop_id, item['fnsku'], item['fulfillment_center'], item['month_of_charge'], item['country_code'], item['currency']))
+    for row in grouped:
+        candidates = mapping.get(row['fnsku'], set())
+        seller_sku = next(iter(candidates)) if len(candidates) == 1 else None
+        cursor.execute('''INSERT INTO amazon_fba_storage_fees
+            (shop_id,asin,fnsku,seller_sku,product_name,fulfillment_center,country_code,month_of_charge,
+             product_size_tier,average_quantity_on_hand,estimated_total_item_volume,base_rate,
+             utilization_surcharge_rate,currency,estimated_monthly_storage_fee,total_incentive_fee_amount)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE asin=VALUES(asin),seller_sku=VALUES(seller_sku),product_name=VALUES(product_name),
+             country_code=VALUES(country_code),product_size_tier=VALUES(product_size_tier),
+             average_quantity_on_hand=VALUES(average_quantity_on_hand),estimated_total_item_volume=VALUES(estimated_total_item_volume),
+             base_rate=VALUES(base_rate),utilization_surcharge_rate=VALUES(utilization_surcharge_rate),currency=VALUES(currency),
+             estimated_monthly_storage_fee=VALUES(estimated_monthly_storage_fee),total_incentive_fee_amount=VALUES(total_incentive_fee_amount),
+             synced_at=CURRENT_TIMESTAMP''',
+            (shop_id, row.get('asin'), row['fnsku'], seller_sku, row.get('product_name'), row['fulfillment_center'],
+             row.get('country_code'), row['month_of_charge'], row.get('product_size_tier'), row.get('average_quantity_on_hand'),
+             row.get('estimated_total_item_volume'), row.get('base_rate'), row.get('utilization_surcharge_rate'),
+             row['currency'], row['estimated_monthly_storage_fee'], row.get('total_incentive_fee_amount')))
+    return len(grouped)
 
 
 def _download(url, compression=None, proxies=None):
@@ -250,58 +333,21 @@ def _load_fnsku_sku_map(shop_id):
 def sync_storage_fees(shop_id, start_date=None, end_date=None):
     """同步指定shop_id真实仓储费，返回rows/saved/months/skipped等统计。
 
-    先下载校验完整报告，再映射SKU；缺FNSKU/月/仓库行跳过，未映射SKU可保留原FNSKU。
-    按既有唯一键UPSERT金额和同步时间，所有本批行同事务；异常回滚并关闭连接。
+    先下载校验完整报告，再按同仓原行归集；身份或金额缺失整批不保存。
+    按既有唯一键更新投影及同步时间，所有本批行同事务；异常回滚并关闭连接。
     saved是本次成功处理行数，含已有行更新，不等于纯新增条数；不会自动补缺月份。"""
     client = get_sp_api_client(shop_id)
-    rows = _fetch_report(client, start_date=start_date, end_date=end_date)
-
-    fnsku_map = _load_fnsku_sku_map(shop_id)
+    original_rows = _fetch_report(client, start_date=start_date, end_date=end_date)
+    rows = aggregate_monthly_rows(original_rows)
 
     conn = get_db_connection()
     inserted = 0
     try:
+        conn.begin()
         with conn.cursor() as c:
-            for row in rows:
-                fnsku = row.get("fnsku")
-                month = row.get("month_of_charge")
-                fc = row.get("fulfillment_center")
-                if not fnsku or not month or not fc:
-                    continue
-                seller_sku = fnsku_map.get(fnsku)
-
-                c.execute("""
-                    INSERT INTO amazon_fba_storage_fees (
-                        shop_id, asin, fnsku, seller_sku, product_name,
-                        fulfillment_center, country_code, month_of_charge,
-                        product_size_tier, average_quantity_on_hand,
-                        estimated_total_item_volume, base_rate,
-                        utilization_surcharge_rate, currency,
-                        estimated_monthly_storage_fee, total_incentive_fee_amount
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE
-                        asin = VALUES(asin),
-                        seller_sku = VALUES(seller_sku),
-                        product_name = VALUES(product_name),
-                        country_code = VALUES(country_code),
-                        product_size_tier = VALUES(product_size_tier),
-                        average_quantity_on_hand = VALUES(average_quantity_on_hand),
-                        estimated_total_item_volume = VALUES(estimated_total_item_volume),
-                        base_rate = VALUES(base_rate),
-                        utilization_surcharge_rate = VALUES(utilization_surcharge_rate),
-                        currency = VALUES(currency),
-                        estimated_monthly_storage_fee = VALUES(estimated_monthly_storage_fee),
-                        total_incentive_fee_amount = VALUES(total_incentive_fee_amount),
-                        synced_at = CURRENT_TIMESTAMP
-                """, (
-                    shop_id, row.get("asin"), fnsku, seller_sku, row.get("product_name"),
-                    fc, row.get("country_code"), month,
-                    row.get("product_size_tier"), row.get("average_quantity_on_hand"),
-                    row.get("estimated_total_item_volume"), row.get("base_rate"),
-                    row.get("utilization_surcharge_rate"), row.get("currency") or "USD",
-                    row.get("estimated_monthly_storage_fee"), row.get("total_incentive_fee_amount"),
-                ))
-                inserted += 1
+            inserted = project_monthly_rows(c, shop_id, original_rows)
+            c.execute('SELECT COUNT(DISTINCT fnsku) AS mapped FROM amazon_fba_storage_fees WHERE shop_id=%s AND seller_sku IS NOT NULL', (shop_id,))
+            mapped = c.fetchone()['mapped']
         conn.commit()
     except Exception:
         conn.rollback()
@@ -311,11 +357,12 @@ def sync_storage_fees(shop_id, start_date=None, end_date=None):
 
     return {
         "shop_id": shop_id,
-        "rows": len(rows),
+        "rows": len(original_rows),
         "saved": inserted,
-        "skus_mapped": len(fnsku_map),
+        "skus_mapped": mapped,
         "months": sorted({row['month_of_charge'] for row in rows if row.get('month_of_charge')}),
-        "skipped":len(rows)-inserted,
+        "skipped":0,
+        "merged_rows":len(original_rows)-len(rows),
     }
 
 

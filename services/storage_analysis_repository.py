@@ -1,4 +1,4 @@
-"""仓储分析独立资料的短事务和只读查询，不修改原业务表。"""
+"""仓储分析资料短事务；完整月报同时更新仓储费投影，不改订单/库存/财务。"""
 from contextlib import contextmanager
 from datetime import datetime
 import hashlib
@@ -7,6 +7,9 @@ import json
 import pymysql
 from services.mysql_service import get_db_connection
 from services.shop_service import get_shop_by_id
+from services.fba_storage_fee_service import project_monthly_rows, _parse_tsv, _clean_fc
+import csv
+import io
 
 
 def scope(shop_id):
@@ -145,9 +148,40 @@ def save_monthly(batch_row, rows):
                 cursor.execute('''UPDATE fba_storage_analysis_batches SET report_id=%s,requested_at=%s WHERE id=%s''',
                                (batch_row['report_id'], batch_row['requested_at'], target_id))
             _replace(cursor, target_id, values, month + '-01')
+            # 原字段完整保留；旧半年表与年度图采用同一原行汇总，和批次保存一起提交/回滚。
+            _project_monthly(cursor, binding[0], [r['payload']['report_fields'] for r in values])
         if batch_row['period_key'] not in groups:
             cursor.execute('''UPDATE fba_storage_analysis_batches SET attempt_status='no_data',attempt_message=%s,checked_at=%s WHERE id=%s''',
                 ('Amazon未返回请求月；已按实际计费月份保存其他月，原成功资料保留', datetime.utcnow(), batch_row['id']))
+
+
+def _project_monthly(cursor, shop_id, raw):
+    if not raw:
+        return
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(raw[0]), delimiter='\t')
+    writer.writeheader()
+    writer.writerows(raw)
+    project_monthly_rows(cursor, shop_id, _parse_tsv(output.getvalue()))
+
+
+def rebuild_monthly_projection(batch_row):
+    """人工复用已有成功报告时修复旧历史表，无需重新调用Amazon；短事务失败全回滚。"""
+    with transaction() as cursor:
+        cursor.execute('SELECT * FROM fba_storage_analysis_batches WHERE id=%s FOR UPDATE', (batch_row['id'],))
+        current = cursor.fetchone()
+        if not current or current['report_id'] != batch_row['report_id'] or not current['data_at']:
+            raise ValueError('成功月报已变化，未更新历史数据')
+        cursor.execute('SELECT payload FROM fba_storage_analysis_rows WHERE batch_id=%s', (batch_row['id'],))
+        raw = []
+        for row in cursor.fetchall():
+            payload = json.loads(row['payload']) if isinstance(row['payload'], str) else row['payload']
+            if payload['charge_month'] != batch_row['period_key']:
+                raise ValueError('已保存月报存在其他账期，未更新历史数据')
+            raw.append(payload['report_fields'])
+        if len(raw) != current['row_count'] or not raw:
+            raise ValueError('成功月报原行不完整，未更新历史数据')
+        _project_monthly(cursor, batch_row['shop_id'], raw)
 
 
 def read_sources(binding, month, prior=None):
@@ -168,6 +202,7 @@ def read_sources(binding, month, prior=None):
             for row in rows:
                 row['kind'], row['period_key'] = kinds[row['batch_id']]
                 row['payload'] = json.loads(row['payload']) if isinstance(row['payload'], str) else row['payload']
+                row['fulfillment_center'] = _clean_fc(row['fulfillment_center'])
             return batches, rows, True
     except pymysql.err.ProgrammingError as error:
         if error.args[0] != 1146:

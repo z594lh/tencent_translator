@@ -1,10 +1,10 @@
 """仓储成本工作台只读编排：精确月份/国家/币种，规则不是Amazon收费标准。"""
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 
 from services import storage_analysis_repository as repo
-from services.storage_analysis_reports import valid_month, public_batch, country, REPORT_TYPES
+from services.storage_analysis_reports import valid_month, public_batch, country, REPORT_TYPES, overage_policy
 
 ZERO = Decimal('0')
 
@@ -40,6 +40,20 @@ def component_gap(payload):
     return values[0]-values[1]-values[2] if all(v is not None for v in values) else None
 
 
+def base_rate_verified(payload):
+    """参考拆分缺口时独立验证原月费；不倒填基础费、不捏造缺口原因。"""
+    if component_gap(payload) in (None, ZERO) or dec(payload.get('utilization_fee')) != ZERO:
+        return False
+    raw = payload.get('report_fields', {})
+    try:
+        volume, rate = dec(raw.get('estimated_total_item_volume')), dec(raw.get('base_rate'))
+        if volume is None or rate is None or not volume.is_finite() or not rate.is_finite():
+            return False
+        return (volume * rate).quantize(Decimal('.01'), rounding=ROUND_HALF_UP) == dec(payload.get('storage_fee'))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
 def fee_group(rows):
     storage = sum_known([dec(row['estimated_monthly_storage_fee']) for row in rows])
     incentive = sum_known([dec(row['total_incentive_fee_amount']) for row in rows])
@@ -52,7 +66,7 @@ def fee_group(rows):
 
 
 def complete_monthly_rows(original, sources):
-    """完整月报按实际月份替代工作台旧快照，不写回原月费；重复身份的非零数值保持未知。"""
+    """按报告每一原行归集，同仓多行不是重复导入；完整批次替换已保证重复同步不叠加。"""
     mapping = {}
     for row in original:
         if row.get('fnsku') and row.get('seller_sku'):
@@ -66,17 +80,14 @@ def complete_monthly_rows(original, sources):
             p = row['payload']
             identity = p.get('business_key') or (p['charge_month'], row['fnsku'], row['fulfillment_center'], row['country_code'], row['currency'])
             groups.setdefault(identity, []).append(row)
-    months = {records[0]['payload']['charge_month'] for records in groups.values()}
-    result = [{**r, 'fee_source':'原月费快照'} for r in original if r['month_of_charge'] not in months]
+    covered = {(records[0]['payload']['charge_month'], records[0]['country_code'], records[0]['currency']) for records in groups.values()}
+    result = [{**r, 'fee_source':'原月费快照'} for r in original if (r['month_of_charge'], country(r['country_code']), r['currency']) not in covered]
     for records in groups.values():
         first, p = records[0], records[0]['payload']
-        ambiguous = len(records) > 1 or p.get('identity_rows', 1) > 1
+        multiple = len(records) > 1 or p.get('identity_rows', 1) > 1
         def value(field):
             values = [dec(r['payload'].get(field)) for r in records]
-            if not ambiguous:
-                return values[0]
-            # 重复身份只在全部明确为0时可确认0；同额非零也不能断言是一次还是多次收费。
-            return ZERO if all(v == ZERO for v in values) else None
+            return sum_known(values)
         candidates = mapping.get((first['fnsku'], first['country_code']), set())
         result.append({'id':None, 'seller_sku':first.get('sku') or (next(iter(candidates)) if len(candidates) == 1 else None),
             'fnsku':first['fnsku'], 'asin':first.get('asin'), 'product_name':p.get('product_name'),
@@ -84,8 +95,8 @@ def complete_monthly_rows(original, sources):
             'month_of_charge':p['charge_month'], 'product_size_tier':p.get('size_tier'),
             'estimated_monthly_storage_fee':value('storage_fee'), 'total_incentive_fee_amount':value('incentive_fee'),
             'average_quantity_on_hand':value('average_quantity'), 'base_fee':value('base_fee'), 'utilization_fee':value('utilization_fee'),
-            'component_difference':component_gap(p) if not ambiguous else None,
-            'fee_source':'完整月报', 'ambiguous_identity':ambiguous})
+            'component_difference':sum_known([component_gap(r['payload']) for r in records]),
+            'fee_source':'完整月报', 'ambiguous_identity':False, 'merged_source_rows':len(records) if multiple else 1})
     return result
 
 
@@ -237,11 +248,9 @@ def dataset(shop_id, requested_month=None):
         gap = sum_known([dec(r.get('component_difference')) for r in values])
         tags, priority = classify(net, before, share, paid, context, utilization)
         if values and net is None:
-            tags.append({'code':'fee_review', 'label':'月报金额待核对', 'tone':'warning'})
+            tags.append({'code':'fee_review', 'label':'月报金额资料不全', 'tone':'warning'})
             priority = max(priority, 2)
-        if gap is not None and gap != 0:
-            tags.append({'code':'split_review','label':'月费拆分待核对','tone':'info'})
-            priority = max(priority, 1)
+        # 拆分参考列不是新增收费，结论采用月费原金额；不因参考差额触发经营风险。
         warehouse_groups = {}
         for item in values:
             fc = item['fulfillment_center'] or '未标明仓库'
@@ -269,10 +278,18 @@ def dataset(shop_id, requested_month=None):
                        'warehouses': sorted({row['fulfillment_center'] for row in values if row['fulfillment_center']}),
                        'size_tiers': sorted({row['product_size_tier'] for row in values if row['product_size_tier']})})
     selected_batches = [b for b in batches if b['kind'] == 'health' or b['period_key'] == month]
-    return {'month': month, 'prior_month': prior, 'months': available, 'rows': result, 'original': original, 'fee_rows':fee_rows,
+    return {'binding':binding, 'month': month, 'prior_month': prior, 'months': available, 'rows': result, 'original': original, 'fee_rows':fee_rows,
             'sources': sources, 'batches': selected_batches, 'schema_ready': schema_ready, 'totals': totals,
             'known_totals':{key:sum_known([v for v in values if v is not None]) for key,values in known_parts.items()},
             'unknown_amount_groups':unknown_groups}
+
+
+def current_age_evidence(rows):
+    """当前有效完整库龄只解释当前库存，不推断历史收费，缺日期/档位仍待更新。"""
+    identities = {(r['seller_sku'], r['country_code']): r.get('health') for r in rows}
+    valid = [h for h in identities.values() if h and h['fresh'] and h['age_fresh'] and h['aged_quantity_complete']]
+    return {'count':len(valid), 'missing':len(identities)-len(valid),
+            'quantity':sum((dec(h['aged_quantity']) for h in valid), ZERO)}
 
 
 def report_coverage(data):
@@ -282,13 +299,75 @@ def report_coverage(data):
     for kind in ('monthly', 'health', 'aged', 'overage'):
         batch = next((r for r in data['batches'] if r['kind'] == kind), None)
         rows = [r for r in data['sources'] if r['kind'] == kind and (kind == 'health' or r.get('period_key', r['payload'].get('charge_month', data['month'])) == data['month'])]
-        result.append({**(public_batch(batch) if batch else {'attempt_status':'missing','row_count':0}),
+        policy = overage_policy(data['binding'], data['month']) if kind == 'overage' else None
+        multiple = len({r['payload'].get('business_key') for r in rows if r['payload'].get('identity_rows',1)>1})
+        gaps = sum(component_gap(r['payload']) not in (None,ZERO) for r in rows) if kind == 'monthly' else 0
+        verified = sum(base_rate_verified(r['payload']) for r in rows) if kind == 'monthly' else 0
+        note = '原始明细完整保留；金额按每行月费减抵扣汇总' if kind == 'monthly' and rows else ''
+        if multiple:
+            note += f'；{multiple}组同仓多行已合并，不是重复导入'
+        if gaps:
+            note += f'；{gaps}行参考拆分与总额不同，采用原月费金额，不额外加费'
+        if verified:
+            note += f'；其中{verified}行原月费已按体积×基础费率复核一致'
+        display_label, context_note = '', ''
+        if kind == 'aged' and (not batch or (not batch.get('data_at') and batch['attempt_status'] in ('failed', 'no_data', 'missing'))):
+            display_label = '暂无收费明细'
+            evidence = current_age_evidence(data['rows'])
+            if evidence['count'] and evidence['quantity'] == ZERO:
+                context_note = f"当前{evidence['count']}个有效库龄SKU未见180天以上库存，可能尚无符合条件的超龄收费记录。"
+                if evidence['missing']:
+                    context_note += f"另{evidence['missing']}个SKU库龄资料待更新。"
+            context_note += '未取得所选历史月收费明细，不等于已确认0收费；真实请求状态仍保留供查看。'
+        result.append({**(policy or (public_batch(batch) if batch else {'attempt_status':'missing','row_count':0})),
             'kind':kind, 'label':labels[kind], 'report_type':REPORT_TYPES[kind],
             'scope':'当前库存快照' if kind == 'health' else '店铺 / 存储类型，不分摊SKU' if kind == 'overage' else data['month'],
             'field_count':max((len(r['payload'].get('report_fields', {})) for r in rows), default=0),
-            'ambiguous_groups':len({r['payload'].get('business_key') for r in rows if r['payload'].get('identity_rows',1)>1}),
-            'component_mismatch_rows':sum(component_gap(r['payload']) not in (None,ZERO) for r in rows) if kind == 'monthly' else 0})
+            'ambiguous_groups':0, 'merged_identity_groups':multiple,
+            'component_mismatch_rows':gaps, 'verified_base_rate_rows':verified, 'processing_note':note,
+            'display_status_label':display_label, 'context_note':context_note})
     return result
+
+
+def analysis_summary(data):
+    """全店分国家/币种生成结果和处理方向；不受筛选/分页影响，不捏造收费或销量。"""
+    summaries = []
+    for key in sorted({(r['country_code'], r['currency']) for r in data['rows']}):
+        rows = [r for r in data['rows'] if (r['country_code'], r['currency']) == key]
+        fees = [r for r in data['fee_rows'] if r['month_of_charge'] == data['month'] and (country(r['country_code']), r['currency']) == key]
+        before = [r for r in data['fee_rows'] if r['month_of_charge'] == data['prior_month'] and (country(r['country_code']), r['currency']) == key]
+        current, prior = fee_group(fees), fee_group(before)
+        top = sorted([r for r in rows if dec(r['net_fee']) is not None], key=lambda r: dec(r['net_fee']), reverse=True)[:3]
+        names = '、'.join(f"{r['product_name'] or r['seller_sku']}（{r['net_fee']}）" for r in top)
+        slow = [r for r in rows if any(t['code']=='slow' for t in r['tags'])]
+        no_sales = [r for r in slow if (dec(r['health']['sales_30d']) == ZERO)]
+        aging = [r for r in rows if any(t['code']=='aging' for t in r['tags'])]
+        excess = [r for r in rows if any(t['code']=='excess' for t in r['tags'])]
+        actions = []
+        if names:
+            actions.append('月费主要集中于：'+names+'。先查看其仓库排名与单件月费，不因总费高直接清仓。')
+        if slow or excess:
+            actions.append(f'当前{len(slow)}个SKU库存消化慢（其中{len(no_sales)}个近30天无销量），{len(excess)}个有Amazon预计冗余。优先检查高费用且积压的SKU，评估减缓补货、促销及去库存成本。')
+        if aging:
+            actions.append(f'{len(aging)}个SKU存在180天以上库存；查看库龄数量与预计收费，再比较继续持有、促销和移除成本。')
+        aged_batch = next((b for b in data['batches'] if b['kind']=='aged'), None)
+        if not aged_batch or not aged_batch.get('data_at'):
+            latest = previous_month(datetime.utcnow().strftime('%Y-%m'))
+            recent = {latest, previous_month(latest)}
+            followup = '计划任务继续自动复查' if data['month'] in recent else '可用补齐按钮更新历史报告'
+            evidence = current_age_evidence(rows)
+            current_age = ''
+            if evidence['count']:
+                description = '未见180天以上库存' if evidence['quantity'] == ZERO else f"180天以上库存合计{format(evidence['quantity'].normalize(), 'f')}件"
+                current_age = f"当前{evidence['count']}个有效库龄SKU{description}。"
+                if evidence['missing']:
+                    current_age += f"另{evidence['missing']}个SKU库龄资料待更新。"
+            actions.append(f'{current_age}暂无该历史月超龄收费明细，{followup}；未返回明细不代表已确认0收费。')
+        summaries.append({'country_code':key[0], 'currency':key[1], 'storage_fee':money(current['storage']),
+            'incentive_fee':money(current['incentive']), 'net_fee':money(current['net']),
+            'change':change(current['net'], prior['net']), 'actions':actions,
+            'slow_count':len(slow), 'excess_count':len(excess), 'aging_count':len(aging)})
+    return summaries
 
 
 def overage_rows(data):
@@ -310,7 +389,7 @@ def worklist(shop_id, query):
                 (not query.get('product_size_tier') or query['product_size_tier'] in row['size_tiers']) and
                 (not term or term in (row['seller_sku'] + row['product_name']).lower()) and
                 (not query.get('risk') or any(tag['code'] == query['risk'] for tag in row['tags']))]
-    sort = query.get('sort', 'priority')
+    sort = query.get('sort', 'net_fee')
     if sort not in ('priority', 'net_fee', 'aged_fee', 'change', 'days_of_supply', 'aged_quantity'):
         raise ValueError('排序字段无效')
     if query.get('order', 'desc') not in ('asc', 'desc'):
@@ -329,7 +408,7 @@ def worklist(shop_id, query):
     return {'month': data['month'], 'prior_month': data['prior_month'], 'months': data['months'],
             'list': selected[(page - 1) * size:page * size], 'total': len(selected), 'totals': totals,
             'currencies': currencies, 'countries': countries, 'schema_ready': data['schema_ready'],
-            'sources': [public_batch(row) for row in data['batches']],
+            'sources': report_coverage(data), 'summary':analysis_summary(data),
             'report_coverage':report_coverage(data), 'overage_rows':overage_rows(data),
             'risk_count': sum(bool(row['tags']) for row in rows),
             'rules': '预警独立判断，不要求费用上涨：已有超龄收费；有库存且近30天无销量、预计消化>120天；Amazon预计冗余/超龄费用；库龄>180天（>365天重点）。费用占比≥10%、涨费≥30%且增加≥5币种单位仍作参考。库龄天数只是运营筛查线，不是当地收费标准；报告/库龄快照分别超过7天暂停对应预警，缺资料不代表无风险。'}
@@ -396,7 +475,7 @@ def detail(shop_id, query):
     if 'rising' in codes:
         suggestions.append('查看增费最多仓库的月均库存、基础费和利用率附加费，区分存放数量增加与单位成本变化。')
     if 'fee_review' in codes:
-        suggestions.insert(0, '完整月报存在重复业务身份或缺少金额，已保留全部原行；先核对原字段及Amazon账单，不累加疑似重复费用，也不把未知金额当0。')
+        suggestions.insert(0, '月费必需金额资料缺失，暂不生成完整费用结论；系统后续更新报告，不把未知金额当0。')
     if 'utilization' in codes:
         suggestions.insert(0, '仓储利用率附加费来自月费报告，与按库存年龄计收的超龄费不同；先核对利用率比率及计费库存/体积，不把这项拆分再次加回月费。')
     if not row['health'] or not row['health']['fresh']:

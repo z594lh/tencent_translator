@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 
 from services import storage_analysis_repository as repo
 from services.shop_service import get_sp_api_client
-from services.fba_storage_fee_service import _download, _report_time
+from services.fba_storage_fee_service import _download, _report_time, _clean_fc
 
 REPORT_TYPES = {
     'health': 'GET_FBA_INVENTORY_PLANNING_DATA',
@@ -23,6 +23,24 @@ COUNTRIES = {
     'A1VC38T7YXB528': ('JP', 'fe'), 'A1RKKUPIHCS9HS': ('ES', 'eu'),
     'APJ6JRA9NG5V4': ('IT', 'eu'), 'A13V1IB3VIYZZH': ('FR', 'eu'),
 }
+OVERAGE_RETIRED_MARKETS = {'ATVPDKIKX0DER', 'A2EUQ1WTGCTBG2', 'A1F83G8C2ARO7P',
+                          'A1PA6795UKMFR9', 'A1RKKUPIHCS9HS', 'APJ6JRA9NG5V4', 'A13V1IB3VIYZZH'}
+OVERAGE_POLICY_URL = 'https://sellercentral.amazon.nl/help/hub/reference/external/GV8JEETWV9Q33CMX'
+
+
+def overage_policy(binding, month):
+    """Amazon于2024-07停止美国/加拿大/英国/欧洲超量费；不套用于日本或更早账期。"""
+    if binding[1] in OVERAGE_RETIRED_MARKETS and valid_month(month) >= '2024-07':
+        return {'kind':'overage', 'period_key':month, 'attempt_status':'not_applicable',
+                'attempt_message':'该站点自2024-07-01起不再收取仓储超量费；此账期不需申请超量报告。与利用率附加费、超龄费不同。',
+                'row_count':0, 'data_at':None, 'policy_url':OVERAGE_POLICY_URL}
+    return None
+
+
+def report_window(kind, month):
+    start, end = period_range(month)
+    # 官方要求超龄请求跨度恰好一个月，不能把月末最后一秒推断为修复方式。
+    return start, end
 
 
 def valid_month(value):
@@ -99,7 +117,7 @@ def parse_report(text, kind, period, binding, all_months=False):
         cur = (r.get('currency') or r.get('currency_code') or '').upper()
         co = country(r.get('country') or r.get('country_code'))
         date = None
-        fc = r.get('fulfillment_center') or None
+        fc = _clean_fc(r.get('fulfillment_center')) or None
         if kind == 'health':
             expected = COUNTRIES.get(binding[1])
             if not expected or expected[1] != binding[3]:
@@ -176,7 +194,7 @@ def parse_report(text, kind, period, binding, all_months=False):
         identity = [sku, fnsku, asin, co, cur, fc, date, r.get('condition'), payload.get('tier'), payload.get('storage_type')]
         key = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
         if kind == 'monthly':
-            # 实测月报同业务身份可出现多行，保留全部原行；分析层不得据此盲目累计库存/非零费用。
+            # 同仓可能多条有效计费明细，保留每行及序号；整批替换防重复同步，不按唯一键丢掉后行。
             payload['business_key'] = key
             monthly_counts[key] = monthly_counts.get(key, 0) + 1
             fingerprint = hashlib.sha256(json.dumps([identity, payload['report_fields']], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -212,7 +230,11 @@ def advance(shop_id, kind, month, action, *, automatic=False, expected_binding=N
     if kind == 'health' and (binding[1] not in COUNTRIES or COUNTRIES[binding[1]][1] != binding[3]):
         raise ValueError('当前站点的健康报告国家映射尚未确认，暂不创建请求')
     period = 'latest' if kind == 'health' else valid_month(month)
-    window = None if kind == 'health' else period_range(period)
+    window = None if kind == 'health' else report_window(kind, period)
+    if kind == 'overage':
+        policy = overage_policy(binding, period)
+        if policy:
+            return policy
     with repo.report_lock(binding):
         row = repo.batch(binding, kind, period)
         now = datetime.utcnow()
@@ -237,6 +259,8 @@ def advance(shop_id, kind, month, action, *, automatic=False, expected_binding=N
             if dates and now - max(dates) < timedelta(hours=24):
                 return public_batch(row)
         if not pending and row and row['data_at'] and now - row['data_at'] < timedelta(hours=6):
+            if kind == 'monthly':
+                repo.rebuild_monthly_projection(row)
             return public_batch(row)
         if not pending and row and row['attempt_status'] == 'no_data' and row['requested_at'] and now - row['requested_at'] < timedelta(hours=6):
             result = public_batch(row)
@@ -261,7 +285,9 @@ def advance(shop_id, kind, month, action, *, automatic=False, expected_binding=N
             result = client.get_report(row['report_id'])
             if result.get('reportType') != REPORT_TYPES[kind] or binding[1] not in (result.get('marketplaceIds') or []):
                 raise ValueError('报告类型或站点与请求不符')
-            if window and (_report_time(result.get('dataStartTime')) != window[0] or _report_time(result.get('dataEndTime')) != window[1]):
+            # 兼容此前次月零点上界的在途ID；收费文件仍逐行校验所属月份。
+            valid_ends = {window[1], window[1] - timedelta(seconds=1)} if window else set()
+            if window and (_report_time(result.get('dataStartTime')) != window[0] or _report_time(result.get('dataEndTime')) not in valid_ends):
                 raise ValueError('报告日期范围与请求不符')
             status = result.get('processingStatus')
             if status == 'DONE':
@@ -277,7 +303,10 @@ def advance(shop_id, kind, month, action, *, automatic=False, expected_binding=N
                 else:
                     repo.save(row, rows)
             elif status in ('CANCELLED', 'FATAL'):
-                message = 'Amazon取消报告；金额未知，原成功资料保留，6小时内复用取消状态' if status == 'CANCELLED' else 'Amazon未能生成报告；金额未知，原成功资料保留'
+                message = ('Amazon本次未返回收费明细（可能无可报告费用或重复申请）；不按0收费处理，近期账期由计划任务复查'
+                           if status == 'CANCELLED' else 'Amazon本次生成未完成，近期账期由计划任务复查；不影响已获取月费和库存结果')
+                if result.get('reportDocumentId'):
+                    message = failure_diagnostic(client, result, message)
                 repo.state(row['id'], 'no_data' if status == 'CANCELLED' else 'failed', message)
             elif status not in ('IN_QUEUE', 'IN_PROGRESS'):
                 raise ValueError('报告状态未知')
@@ -287,3 +316,21 @@ def advance(shop_id, kind, month, action, *, automatic=False, expected_binding=N
             # 网络/限流暂时失败保留原reportId；下次只检查，不新建报告。
             repo.state(row['id'], 'pending', '本次检查未完成，可稍后继续；未重建报告，原资料保留')
         return public_batch(repo.batch(binding, kind, period))
+
+
+def failure_diagnostic(client, result, fallback):
+    """失败文档只提取安全错误分类，不把签名地址或完整响应写入资料/页面。"""
+    try:
+        doc = client.get_report_document(result['reportDocumentId'])
+        content = _download(doc['url'], doc.get('compressionAlgorithm'), proxies=client.proxies)
+        payload = json.loads(content)
+        message = str(payload.get('errorDetails') or payload.get('message') or '').lower()
+        if 'permission' in message or 'unauthorized' in message or 'access denied' in message:
+            return 'Amazon报告授权不足，系统已定位为接口权限问题；月费和库存结果仍可查看'
+        if 'parameter' in message or 'date range' in message:
+            return 'Amazon未接受该账期请求参数，系统已记录日期范围问题；不把缺失收费当0'
+        if 'no data' in message or 'no records' in message:
+            return 'Amazon诊断文件说明本次没有可返回的收费记录；未计入额外收费'
+    except Exception:
+        pass
+    return fallback
