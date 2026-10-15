@@ -49,6 +49,7 @@ from decimal import Decimal
 from blueprints.user_auth import login_required, permission_required
 from services.mysql_service import get_db_connection
 from services.cron_tasks.execution import resource_guard
+from services.sku_inventory_decision import attach_decisions, unknown as unknown_inventory_decision
 from services.report_generator import (
     generate_business_daily,
     generate_sku_profit,
@@ -1148,6 +1149,14 @@ def list_sku_sales():
                 cursor.execute(sql, params + [page_size, offset])
                 rows = cursor.fetchall()
 
+            # 当前页附加只读经营判断；失败不影响原报表金额/分页，不触发任何生成。
+            try:
+                with conn.cursor() as cursor:
+                    attach_decisions(cursor, rows)
+            except Exception:
+                for row in rows:
+                    row['inventory_decision'] = unknown_inventory_decision('经营判断暂不可用，请稍后重新查询')
+
             for row in rows:
                 for k in ('report_date', 'created_at', 'updated_at'):
                     if k in row and row[k] is not None:
@@ -1251,6 +1260,7 @@ def sku_sales_trend():
 
     简介: 按天返回指定 SKU 在日期范围内的销售、广告费、利润、ACOS、TACOS，
           数据来源于 sku_profit 每日聚合表，缺失日期补零保证折线连续。
+          每行额外返回 has_report 区分真实日报与补零行，新每日窗口据此显示空值。
           传 shop_id 时返回单个店铺数据；不传 shop_id 时返回该 SKU 跨全部店铺
           按日聚合的数据（ACOS/TACOS 用当日求和值重新计算，不取平均）。
 
@@ -1260,6 +1270,7 @@ def sku_sales_trend():
         start_date    (可选) 起始日期 YYYY-MM-DD
         end_date      (可选) 结束日期 YYYY-MM-DD
         days          (可选) 快捷天数（7/14/30/60），与 start_date/end_date 互斥，默认 30，最大 90
+        end_at_latest (可选) 1=以同店铺/SKU最新日报截至，必须传shop_id且不可传显式日期
     """
     try:
         sku = request.args.get('sku', '').strip()
@@ -1267,6 +1278,7 @@ def sku_sales_trend():
         start_date = request.args.get('start_date', '').strip() or None
         end_date = request.args.get('end_date', '').strip() or None
         days_raw = request.args.get('days', '').strip() or None
+        end_at_latest = request.args.get('end_at_latest', '').strip() == '1'
 
         if not sku:
             return jsonify({"status": "error", "message": "缺少必要参数：sku"}), 400
@@ -1277,6 +1289,9 @@ def sku_sales_trend():
                 shop_id = int(shop_id_raw)
             except (TypeError, ValueError):
                 return jsonify({"status": "error", "message": "shop_id 格式错误"}), 400
+
+        if end_at_latest and (shop_id is None or start_date or end_date):
+            return jsonify({"status": "error", "message": "按最新日报查询必须指定店铺，且不能同时指定起止日期"}), 400
 
         today = datetime.now().date()
         if start_date or end_date:
@@ -1321,6 +1336,17 @@ def sku_sales_trend():
                     currency = _marketplace_currency(
                         (default_shop.get('marketplace_id') if default_shop else None) or
                         (default_shop.get('region') if default_shop else None))
+
+                if end_at_latest:
+                    # 仅按当前店铺和SKU的源日报确定截至，不能使用其他SKU或汇总生成日期。
+                    cursor.execute('SELECT MAX(report_date) AS latest_date FROM sku_profit WHERE shop_id=%s AND sku=%s', (shop_id, sku))
+                    latest_date = cursor.fetchone()['latest_date']
+                    if latest_date is None:
+                        return jsonify({"status": "success", "message": "ok", "data": {
+                            "sku": sku, "shop_id": shop_id, "currency": currency,
+                            "start_date": None, "end_date": None, "last_report_date": None, "list": []}})
+                    end_d = latest_date
+                    start_d = end_d - timedelta(days=days - 1)
 
                 if shop_id is None:
                     cursor.execute("""
@@ -1413,6 +1439,8 @@ def sku_sales_trend():
                     if shop_id is not None:
                         item['sell_price'] = 0
                         item['stock'] = stock
+                # 兼容旧补零响应，同时让每日明细区分真实零值与没有日报。
+                item['has_report'] = r is not None
                 list_data.append(item)
                 cur_date += timedelta(days=1)
 
@@ -1425,6 +1453,7 @@ def sku_sales_trend():
                     "currency": currency,
                     "start_date": str(start_d),
                     "end_date": str(end_d),
+                    "last_report_date": str(end_d) if end_at_latest else None,
                     "list": list_data,
                 }
             })
