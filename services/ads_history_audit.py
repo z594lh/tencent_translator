@@ -270,7 +270,7 @@ def instrument(client, shop):
             # 平台已经返回；历史补写失败不能把广告操作伪装成未发送。
             g.ads_history_warning = '平台已返回结果，但历史保存待核实；请先同步，不要重复操作'
             return result
-        if not all_success and 'Negative' not in resource and not resource.startswith('negative'):
+        if not all_success and not g.get('ads_creation_partial_results', False) and 'Negative' not in resource and not resource.startswith('negative'):
             raise repo.HistoryError('平台部分操作失败或结果待确认，请先同步核实，不要整批重试', 502)
         return result
     client._request = audited

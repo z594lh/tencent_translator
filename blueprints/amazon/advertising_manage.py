@@ -23,11 +23,13 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 
 import openpyxl
+import requests
 from flask import Blueprint, request, jsonify, g
 
 from services.mysql_service import get_db_connection
 from services import ads_negative_service as ads_negatives
 from services import ads_history_service as ads_history
+from services import ads_creation_service as ads_creation
 from services.ads_history_audit import track_write
 from blueprints.user_auth import login_required
 from services.cron_tasks.execution import resource_guard
@@ -2180,6 +2182,7 @@ def structure_tree():
 # =================================================================
 
 @advertising_manage_bp.route('/create/portfolios', methods=['GET'])
+@login_required
 def create_portfolios():
     shop_id = request.args.get("shop_id", "").strip()
     if not shop_id:
@@ -2193,6 +2196,7 @@ def create_portfolios():
 
 
 @advertising_manage_bp.route('/create/products', methods=['GET'])
+@login_required
 def create_search_products():
     shop_id = request.args.get("shop_id", "").strip()
     search = request.args.get("search", "").strip()
@@ -2226,173 +2230,80 @@ def create_search_products():
 
 
 @advertising_manage_bp.route('/create-campaign', methods=['POST'])
-@track_write
+@login_required
 def create_campaign_wizard():
-    body = request.get_json() or {}
-    shop_id = body.get("shop_id")
-    if not shop_id:
-        return jsonify({"status": "error", "message": "缺少 shop_id"}), 400
+    # 旧页面不能再进入不可恢复的串行创建；新版先保存创建记录，再逐步推进。
+    return jsonify({'status': 'error', 'message': '创建流程已升级，请刷新页面后使用新版创建向导；未发送广告创建请求'}), 409
 
+
+def _creation_response(callback):
     try:
-        client = get_ads_api_client(int(shop_id))
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
+        return jsonify({'status': 'success', 'data': callback()})
+    except ads_creation.Error as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), exc.code
+    except (requests.RequestException, ads_negatives.NegativeError):
+        return jsonify({'status': 'error', 'message': 'Amazon读取失败或限流，已有进度保留，请稍后重读；不要重复创建'}), 502
+    except Exception:
+        return jsonify({'status': 'error', 'message': '创建处理未完成，原进度保留；请先读取原记录，不要新建重复提交'}), 503
 
-    data1 = body.get("data1", {})
-    data2 = body.get("data2", {})
-    data3 = body.get("data3", {})
-    campaign_id = body.get("campaign_id") or None
 
-    result = []
-    ad_ids = []
-    ad_group_id = None
-    has_error = False
+@advertising_manage_bp.route('/creation/meta', methods=['GET'])
+@login_required
+def creation_meta():
+    return _creation_response(lambda: ads_creation.v.metadata(request.args.get('shop_id'), request.args.get('campaign_id')))
 
-    if not campaign_id and data1 and data2:
-        try:
-            campaign_req = {
-                "name": data1.get("name") or f"Auto Campaign {datetime.now().strftime('%Y%m%d%H%M')}",
-                "campaignType": "sponsoredProducts",
-                "targetingType": data1.get("targetingType", "AUTO"),
-                "state": "enabled",
-                "dynamicBidding": {
-                    "strategy": data1.get("biddingStrategy", "LEGACY_FOR_SALES"),
-                },
-                "dailyBudget": float(data1.get("dailyBudget", 1)),
-                "startDate": data1.get("startDate", datetime.now().strftime("%Y-%m-%d")),
-            }
-            if data1.get("endDate"):
-                campaign_req["endDate"] = data1["endDate"]
-            if data1.get("portfolioId"):
-                campaign_req["portfolioId"] = int(data1["portfolioId"])
 
-            placement_bidding = []
-            for key, placement_name in [("topPer", "PLACEMENT_TOP_OF_SEARCH"),
-                                         ("restPer", "PLACEMENT_REST_OF_SEARCH"),
-                                         ("productPer", "PLACEMENT_PRODUCT_PAGE")]:
-                val = data1.get(key)
-                if val is not None and val != "" and int(val) != 0:
-                    placement_bidding.append({"placement": placement_name, "percentage": int(val)})
-            if placement_bidding:
-                campaign_req["dynamicBidding"]["placementBidding"] = placement_bidding
+@advertising_manage_bp.route('/creation/products', methods=['GET'])
+@login_required
+def creation_products():
+    return _creation_response(lambda: ads_creation.v.products(ads_creation.v.account(request.args.get('shop_id')),
+                              request.args.get('search', ''), request.args.get('page', 1)))
 
-            camp_resp = client.create_campaigns([campaign_req])
-            first = (camp_resp.get("campaigns") or [{}])[0]
-            campaign_id = int(first.get("campaignId", 0))
-            if not campaign_id:
-                raise ValueError(f"创建活动失败: {camp_resp}")
-            result.append({"type": "campaign", "id": campaign_id, "status": "success"})
-        except Exception as e:
-            has_error = True
-            result.append({"type": "campaign", "status": "error", "error": str(e)})
-            _log_operation(shop_id, 0, "campaign", 0, "创建失败", status=0, error_message=str(e))
-            return jsonify({"status": "error", "message": str(e), "details": result}), 500
 
-        ad_group_id = None
-        if campaign_id:
-            try:
-                ag_req = {
-                    "name": data2.get("name") or f"AdGroup {datetime.now().strftime('%H%M%S')}",
-                    "campaignId": campaign_id,
-                    "state": "enabled",
-                    "defaultBid": float(data2.get("defaultBid", 0.02)),
-                }
-                ag_resp = client.create_ad_groups([ag_req])
-                first_ag = (ag_resp.get("adGroups") or [{}])[0]
-                ad_group_id = int(first_ag.get("adGroupId", 0))
-                result.append({"type": "ad_group", "id": ad_group_id, "status": "success"})
-            except Exception as e:
-                has_error = True
-                result.append({"type": "ad_group", "status": "error", "error": str(e)})
+@advertising_manage_bp.route('/creation/jobs', methods=['POST'])
+@login_required
+def creation_start():
+    return _creation_response(lambda: ads_creation.start(request.get_json() or {}, request.current_user['id']))
 
-        products = data2.get("products", [])
-        ad_ids = []
-        if ad_group_id and products:
-            try:
-                pa_list = []
-                for p in products:
-                    pa_list.append({
-                        "campaignId": campaign_id,
-                        "adGroupId": ad_group_id,
-                        "sku": p.get("sku", ""),
-                        "asin": p.get("asin", ""),
-                        "state": "enabled",
-                    })
-                pa_resp = client.create_product_ads(pa_list)
-                pa = pa_resp.get("productAds", {})
-                if isinstance(pa, dict):
-                    for s in pa.get("success", []):
-                        ad_ids.append(int(s.get("adId", 0)))
-                else:
-                    for pa_item in pa:
-                        ad_ids.append(int(pa_item.get("adId", 0)))
-                result.append({"type": "product_ads", "count": len(pa_list), "status": "success"})
-            except Exception as e:
-                has_error = True
-                result.append({"type": "product_ads", "status": "error", "error": str(e)})
 
-    if data3 and campaign_id:
-        targeting_type = data1.get("targetingType", "")
-        if targeting_type == "AUTO":
-            auto_targets = data3.get("autoTargets", [])
-            for at in auto_targets:
-                try:
-                    client.update_target(int(at["targetId"]), {
-                        "state": at.get("state", "enabled"),
-                        "bid": float(at.get("bid", 0.02)),
-                    })
-                except Exception as e:
-                    result.append({"type": "auto_target", "targetId": at.get("targetId"),
-                                   "status": "error", "error": str(e)})
-        else:
-            keywords = data3.get("keywords", [])
-            if keywords:
-                try:
-                    kw_list = []
-                    for k in keywords:
-                        kw_list.append({
-                            "campaignId": campaign_id,
-                            "adGroupId": ad_group_id,
-                            "keywordText": k["keywordText"],
-                            "matchType": k.get("matchType", "EXACT"),
-                            "state": "enabled",
-                            "bid": float(k.get("bid", data2.get("defaultBid", 0.02))),
-                        })
-                    client.create_keywords(kw_list)
-                    result.append({"type": "keywords", "count": len(kw_list), "status": "success"})
-                except Exception as e:
-                    result.append({"type": "keywords", "status": "error", "error": str(e)})
+@advertising_manage_bp.route('/creation/jobs', methods=['GET'])
+@login_required
+def creation_list():
+    def query():
+        shop = ads_creation.v.account(request.args.get('shop_id'))
+        with ads_creation.repo.transaction() as c:
+            c.execute('SELECT id,status,campaign_id,ad_group_id,created_at FROM amazon_ads_creation_jobs '
+                      'WHERE shop_id=%s AND operator_id=%s ORDER BY created_at DESC LIMIT 20',
+                      (shop['shop_id'], request.current_user['id']))
+            return c.fetchall()
+    return _creation_response(query)
 
-            neg_keywords = data3.get("negativeKeywords", [])
-            if neg_keywords:
-                try:
-                    client.create_negative_keywords(neg_keywords)
-                    result.append({"type": "negative_keywords", "count": len(neg_keywords), "status": "success"})
-                except Exception as e:
-                    result.append({"type": "negative_keywords", "status": "error", "error": str(e)})
 
-            targets = data3.get("targets", [])
-            if targets:
-                try:
-                    client.create_targets(targets)
-                    result.append({"type": "targets", "count": len(targets), "status": "success"})
-                except Exception as e:
-                    result.append({"type": "targets", "status": "error", "error": str(e)})
+@advertising_manage_bp.route('/creation/jobs/<job_id>', methods=['GET'])
+@login_required
+def creation_get(job_id):
+    return _creation_response(lambda: ads_creation.view(ads_creation.load(job_id,request.args.get('shop_id'),request.current_user['id'])[0]))
 
-            neg_targets = data3.get("negativeTargets", [])
-            if neg_targets:
-                try:
-                    client.create_negative_targets(neg_targets)
-                    result.append({"type": "negative_targets", "count": len(neg_targets), "status": "success"})
-                except Exception as e:
-                    result.append({"type": "negative_targets", "status": "error", "error": str(e)})
 
-    _log_operation(shop_id, campaign_id or 0, "campaign", campaign_id or 0,
-                   f"创建向导完成: {json.dumps(result, ensure_ascii=False)[:500]}")
-    return jsonify({
-        "status": "success",
-        "data": {"campaign_id": campaign_id, "ad_group_id": ad_group_id, "ad_ids": ad_ids, "results": result},
-    }), (200 if not has_error else 200)
+@advertising_manage_bp.route('/creation/jobs/<job_id>/run', methods=['POST'])
+@track_write
+def creation_run(job_id):
+    body = request.get_json() or {}
+    return _creation_response(lambda: ads_creation.run(job_id,body.get('shop_id'),request.current_user['id'],body.get('retry_failed') is True))
+
+
+@advertising_manage_bp.route('/creation/jobs/<job_id>/repair', methods=['POST'])
+@login_required
+def creation_repair(job_id):
+    body = request.get_json() or {}
+    return _creation_response(lambda: ads_creation.repair(job_id,body.get('shop_id'),request.current_user['id'],body))
+
+
+@advertising_manage_bp.route('/creation/jobs/<job_id>/resolve', methods=['POST'])
+@login_required
+def creation_resolve(job_id):
+    body = request.get_json() or {}
+    return _creation_response(lambda: ads_creation.resolve(job_id,body.get('shop_id'),request.current_user['id'],body))
 
 
 # =================================================================
