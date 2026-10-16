@@ -133,7 +133,7 @@ def get_ads_api_client(shop_id: int, region: str = None) -> AmazonAdsApiClient:
 
     creds = get_ads_app_credentials(shop["credential_group_id"])
 
-    return AmazonAdsApiClient(
+    client = AmazonAdsApiClient(
         client_id=creds["client_id"],
         client_secret=creds["client_secret"],
         refresh_token=shop["ads_refresh_token"],
@@ -141,3 +141,6 @@ def get_ads_api_client(shop_id: int, region: str = None) -> AmazonAdsApiClient:
         region=region or shop["region"],
         proxies=creds["proxies"],
     )
+    # 仅显式登录广告写入口启用留痕；后台任务及只读请求完全沿用原客户端。
+    from services.ads_history_audit import instrument
+    return instrument(client, shop)

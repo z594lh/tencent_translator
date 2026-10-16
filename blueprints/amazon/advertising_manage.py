@@ -26,6 +26,10 @@ import openpyxl
 from flask import Blueprint, request, jsonify, g
 
 from services.mysql_service import get_db_connection
+from services import ads_negative_service as ads_negatives
+from services import ads_history_service as ads_history
+from services.ads_history_audit import track_write
+from blueprints.user_auth import login_required
 from services.cron_tasks.execution import resource_guard
 from services.shop_service import get_ads_api_client, get_shop_by_id, get_all_active_shops
 
@@ -531,6 +535,7 @@ def campaign_detail(campaign_id):
 
 
 @advertising_manage_bp.route('/campaigns/<int:campaign_id>', methods=['PUT'])
+@track_write
 def update_campaign(campaign_id):
     body = request.get_json() or {}
     print(f"[CPC] PUT /campaigns/{campaign_id} body keys={list(body.keys())} dailyBudget={body.get('dailyBudget')!r} state={body.get('state')!r} bidding_keys={list(body.get('bidding',{}).keys())}")
@@ -762,6 +767,7 @@ def ad_group_detail(ad_group_id):
 
 
 @advertising_manage_bp.route('/groups/<int:ad_group_id>', methods=['PUT'])
+@track_write
 def update_ad_group(ad_group_id):
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -908,6 +914,7 @@ def list_placements():
 
 
 @advertising_manage_bp.route('/campaigns/<int:campaign_id>/placement', methods=['PUT'])
+@track_write
 def update_placement_bid(campaign_id):
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -1127,6 +1134,7 @@ def list_product_ads():
 
 
 @advertising_manage_bp.route('/product-ads/<int:ad_id>', methods=['PUT'])
+@track_write
 def update_product_ad(ad_id):
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -1298,6 +1306,7 @@ def list_keywords():
 
 
 @advertising_manage_bp.route('/keywords/<int:keyword_id>', methods=['PUT'])
+@track_write
 def update_keyword(keyword_id):
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -1392,6 +1401,7 @@ def keyword_bid_recommendations():
 
 
 @advertising_manage_bp.route('/keywords/batch', methods=['POST'])
+@track_write
 def create_keywords():
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -1434,6 +1444,7 @@ def create_keywords():
 
 
 @advertising_manage_bp.route('/keywords/upload', methods=['POST'])
+@track_write
 def upload_keywords():
     shop_id = request.form.get("shop_id")
     campaign_id = request.form.get("campaign_id")
@@ -1580,6 +1591,7 @@ def list_auto_targets():
 
 
 @advertising_manage_bp.route('/targets/<int:target_id>', methods=['PUT'])
+@track_write
 def update_target(target_id):
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -1639,6 +1651,7 @@ def target_bid_recommendations():
 
 
 @advertising_manage_bp.route('/targets/batch', methods=['POST'])
+@track_write
 def create_targets():
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -1656,205 +1669,145 @@ def create_targets():
 
 
 # =================================================================
+#  前端路由 — 更改历史（本地查询，显式刷新采集平台）
+# =================================================================
+
+@advertising_manage_bp.route('/history', methods=['GET'])
+@login_required
+def get_change_history():
+    try:
+        data = ads_history.query(request.args)
+        response = jsonify({'status': 'success', 'data': data})
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except ads_history.HistoryError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), exc.code
+    except Exception:
+        # 不向浏览器泄露凭证、连接信息或底层响应。
+        return jsonify({'status': 'error', 'message': '读取更改历史失败，请稍后重试'}), 502
+
+
+@advertising_manage_bp.route('/history/sync', methods=['POST'])
+@login_required
+def sync_change_history():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'status': 'error', 'message': '请求须为JSON对象'}), 400
+    try:
+        data = ads_history.sync_scope(body)
+        return jsonify({'status': 'success', 'data': data})
+    except ads_history.HistoryError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), exc.code
+    except Exception:
+        return jsonify({'status': 'error', 'message': '历史采集未启动，请核对迁移或稍后重试，原记录保留'}), 502
+
+
+# =================================================================
 #  前端路由 — 否定关键词
 # =================================================================
 
+def _negative_failed_audit(ctx, kind, action, entity_id, message):
+    """只记录已验证归属的写请求失败，审计异常不覆盖原错误。"""
+    if ctx is None or action not in ("create", "update"):
+        return
+    try:
+        _log_operation(ctx["shop_id"], ctx["campaign_id"],
+                       "negative_keyword" if kind == "keywords" else "negative_target", entity_id or 0,
+                       f'{ctx["scope"]} {action}: 失败或结果待确认', status=0, error_message=message[:2000])
+    except Exception:
+        pass
+
+
+def _negative_http(kind, action, entity_id=None):
+    """否定投放只处理 HTTP，身份、批次和持久化交由 Service。"""
+    body = request.get_json(silent=True) if request.method != 'GET' else request.args
+    if body is None or (request.method != 'GET' and not isinstance(body, dict)):
+        return jsonify({"status": "error", "message": "请求须为 JSON 对象"}), 400
+    ctx = None
+    try:
+        g.user_id = request.current_user["id"]
+        items = body.get("keywords" if kind == "keywords" else "targets", [])
+        first = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+        ctx = ads_negatives.context(
+            body.get("shop_id"), body.get("campaign_id") or first.get("campaignId"),
+            body.get("ad_group_id") or first.get("adGroupId"), body.get("scope"))
+        if action == "list":
+            data = ads_negatives.list_local(kind, ctx, body.get("search", ""), body.get("state", "unarchived"),
+                                           body.get("page", 1), body.get("page_size", 20))
+        elif action == "refresh":
+            data = {"synced": ads_negatives.refresh(kind, ctx)}
+        else:
+            data = (ads_negatives.create(kind, ctx, items) if action == "create" else
+                    ads_negatives.update(kind, ctx, entity_id, body.get("state")))
+            # 审计失败不能把已在 Amazon 成功的操作误报成“未执行”。
+            try:
+                _log_operation(ctx["shop_id"], ctx["campaign_id"],
+                               "negative_keyword" if kind == "keywords" else "negative_target", entity_id or 0,
+                               f'{ctx["scope"]} {action}: 成功 {data["success_count"]}，失败 {data["error_count"]}',
+                               status=0 if data["error_count"] else 1,
+                               error_message=json.dumps(data.get("errors", []), ensure_ascii=False)[:2000] or None)
+            except Exception:
+                data["audit_warning"] = "操作已执行，但本地审计保存失败"
+        errors = data.get("error_count", 0)
+        status = ("partial" if data.get("success_count") else "error") if errors else "success"
+        return jsonify({"status": status, "data": data}), (422 if status == "error" else 200)
+    except ads_negatives.NegativeError as exc:
+        _negative_failed_audit(ctx, kind, action, entity_id, str(exc))
+        return jsonify({"status": "error", "message": str(exc)}), exc.code
+    except Exception:
+        # 超时/未知异常不可诱导重发写操作，也不暴露连接或凭证细节。
+        message = ("请求失败，请稍后同步核实；写操作结果可能尚未确认，请勿重复提交"
+                   if action in ("create", "update") else "读取或同步失败，请稍后重试")
+        _negative_failed_audit(ctx, kind, action, entity_id, message)
+        return jsonify({"status": "error", "message": message}), 502
+
+
 @advertising_manage_bp.route('/negative-keywords', methods=['GET'])
+@login_required
 def list_negative_keywords():
-    campaign_id = request.args.get("campaign_id", "").strip()
-    ad_group_id = request.args.get("ad_group_id", "").strip()
-    state = request.args.get("state", "").strip()
-    if not campaign_id:
-        return jsonify({"status": "error", "message": "缺少 campaign_id"}), 400
-
-    conn = _get_conn()
-    try:
-        where = ["campaign_id = %s"]
-        params = [campaign_id]
-        if ad_group_id:
-            where.append("ad_group_id = %s"); params.append(ad_group_id)
-        if state:
-            if state == "unarchived":
-                where.append("state != %s"); params.append("archived")
-            else:
-                where.append("state = %s"); params.append(state)
-        where_sql = "WHERE " + " AND ".join(where)
-        with conn.cursor() as c:
-            c.execute(f"""
-                SELECT keyword_id, campaign_id, ad_group_id, keyword_text,
-                       match_type, state, last_update_datetime
-                FROM amazon_ads_negative_keywords
-                {where_sql}
-                ORDER BY keyword_id DESC
-            """, params)
-            rows = c.fetchall()
-        list_data = [_map_entity_row(dict(r)) for r in rows]
-        return jsonify({"status": "success", "data": {"list": list_data}})
-    finally:
-        conn.close()
-
-
-@advertising_manage_bp.route('/negative-keywords/<int:keyword_id>', methods=['PUT'])
-def update_negative_keyword(keyword_id):
-    body = request.get_json() or {}
-    shop_id = body.get("shop_id")
-    state = body.get("state")
-    if not shop_id or not state:
-        return jsonify({"status": "error", "message": "缺少 shop_id 或 state"}), 400
-    # Amazon v3 API 不支持 ARCHIVED 状态（PUT 只接受 ENABLED/PAUSED，DELETE 端点 403 不可用）
-    # 降级：对 Amazon 发 PAUSED，本地 DB 仍存 archived
-    api_state = state.upper()
-    if api_state == "ARCHIVED":
-        api_state = "PAUSED"
-    try:
-        client = get_ads_api_client(int(shop_id))
-        client.update_negative_keyword(keyword_id, {"state": api_state})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    conn = _get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("UPDATE amazon_ads_negative_keywords SET state = %s WHERE keyword_id = %s", (state, keyword_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-    _log_operation(shop_id, 0, "negative_keyword", keyword_id, f"状态 -> {state}")
-    return jsonify({"status": "success", "message": "更新成功"})
+    return _negative_http("keywords", "list")
 
 
 @advertising_manage_bp.route('/negative-keywords', methods=['POST'])
+@track_write
 def create_negative_keywords():
-    body = request.get_json() or {}
-    shop_id = body.get("shop_id")
-    keywords = body.get("keywords", [])
-    if not shop_id or not keywords:
-        return jsonify({"status": "error", "message": "缺少 shop_id 或 keywords"}), 400
-    try:
-        client = get_ads_api_client(int(shop_id))
-        resp = client.create_negative_keywords(keywords)
-    except Exception as e:
-        campaign_id = keywords[0].get("campaignId", 0) if keywords else 0
-        _log_operation(shop_id, campaign_id, "negative_keyword", 0,
-                       "添加失败", status=0, error_message=str(e))
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    # 写本地表
-    conn = _get_conn()
-    try:
-        with conn.cursor() as c:
-            success = resp.get("negativeKeywords", {}).get("success", [])
-            for s in success:
-                kid = int(s.get("negativeKeywordId", 0))
-                if not kid:
-                    continue
-                idx = s.get("index", 0)
-                kw = keywords[idx] if idx < len(keywords) else {}
-                c.execute("""
-                    INSERT INTO amazon_ads_negative_keywords
-                        (campaign_id, ad_group_id, keyword_id, keyword_text, match_type, state, synced_at)
-                    VALUES (%s, %s, %s, %s, %s, 'ENABLED', NOW())
-                    ON DUPLICATE KEY UPDATE state='ENABLED', keyword_text=VALUES(keyword_text),
-                        match_type=VALUES(match_type), synced_at=NOW()
-                """, (
-                    int(kw.get("campaignId", 0)),
-                    int(kw["adGroupId"]) if kw.get("adGroupId") else None,
-                    kid, kw.get("keywordText", ""), kw.get("matchType", ""),
-                ))
-        conn.commit()
-    finally:
-        conn.close()
-
-    campaign_id = keywords[0].get("campaignId", 0) if keywords else 0
-    _log_operation(shop_id, campaign_id, "negative_keyword", 0,
-                   f"批量添加 {len(keywords)} 个否定关键词")
-    return jsonify({"status": "success", "data": resp})
+    return _negative_http("keywords", "create")
 
 
-# =================================================================
-#  前端路由 — 否定投放
-# =================================================================
+@advertising_manage_bp.route('/negative-keywords/<int:keyword_id>', methods=['PUT'])
+@track_write
+def update_negative_keyword(keyword_id):
+    return _negative_http("keywords", "update", keyword_id)
+
+
+@advertising_manage_bp.route('/negative-keywords/refresh', methods=['POST'])
+@login_required
+def refresh_negative_keywords():
+    return _negative_http("keywords", "refresh")
+
 
 @advertising_manage_bp.route('/negative-targets', methods=['GET'])
+@login_required
 def list_negative_targets():
-    campaign_id = request.args.get("campaign_id", "").strip()
-    ad_group_id = request.args.get("ad_group_id", "").strip()
-    state = request.args.get("state", "").strip()
-    if not campaign_id:
-        return jsonify({"status": "error", "message": "缺少 campaign_id"}), 400
-
-    conn = _get_conn()
-    try:
-        where = ["campaign_id = %s"]
-        params = [campaign_id]
-        if ad_group_id:
-            where.append("ad_group_id = %s"); params.append(ad_group_id)
-        if state:
-            if state == "unarchived":
-                where.append("state != %s"); params.append("archived")
-            else:
-                where.append("state = %s"); params.append(state)
-        where_sql = "WHERE " + " AND ".join(where)
-        with conn.cursor() as c:
-            c.execute(f"""
-                SELECT target_id, campaign_id, ad_group_id, resolved_expression,
-                       state, last_update_datetime
-                FROM amazon_ads_negative_targets
-                {where_sql}
-                ORDER BY target_id DESC
-            """, params)
-            rows = c.fetchall()
-        list_data = [dict(r) for r in rows]
-        return jsonify({"status": "success", "data": {"list": list_data}})
-    finally:
-        conn.close()
-
-
-@advertising_manage_bp.route('/negative-targets/<int:target_id>', methods=['PUT'])
-def update_negative_target(target_id):
-    body = request.get_json() or {}
-    shop_id = body.get("shop_id")
-    state = body.get("state")
-    if not shop_id or not state:
-        return jsonify({"status": "error", "message": "缺少 shop_id 或 state"}), 400
-    # Amazon v3 API 不支持 ARCHIVED（PUT 只接受 ENABLED/PAUSED，DELETE 端点 403）
-    api_state = state.upper()
-    if api_state == "ARCHIVED":
-        api_state = "PAUSED"
-    try:
-        client = get_ads_api_client(int(shop_id))
-        client.update_negative_target(target_id, {"state": api_state})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    conn = _get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("UPDATE amazon_ads_negative_targets SET state = %s WHERE target_id = %s", (state, target_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-    _log_operation(shop_id, 0, "negative_target", target_id, f"状态 -> {state}")
-    return jsonify({"status": "success", "message": "更新成功"})
+    return _negative_http("targets", "list")
 
 
 @advertising_manage_bp.route('/negative-targets', methods=['POST'])
+@track_write
 def create_negative_targets():
-    body = request.get_json() or {}
-    shop_id = body.get("shop_id")
-    targets = body.get("targets", [])
-    if not shop_id or not targets:
-        return jsonify({"status": "error", "message": "缺少 shop_id 或 targets"}), 400
-    try:
-        client = get_ads_api_client(int(shop_id))
-        resp = client.create_negative_targets(targets)
-        campaign_id = targets[0].get("campaignId", 0) if targets else 0
-        _log_operation(shop_id, campaign_id, "negative_target", 0, f"批量添加 {len(targets)} 个否定投放")
-        return jsonify({"status": "success", "data": resp})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    return _negative_http("targets", "create")
+
+
+@advertising_manage_bp.route('/negative-targets/<int:target_id>', methods=['PUT'])
+@track_write
+def update_negative_target(target_id):
+    return _negative_http("targets", "update", target_id)
+
+
+@advertising_manage_bp.route('/negative-targets/refresh', methods=['POST'])
+@login_required
+def refresh_negative_targets():
+    return _negative_http("targets", "refresh")
 
 
 # =================================================================
@@ -2273,6 +2226,7 @@ def create_search_products():
 
 
 @advertising_manage_bp.route('/create-campaign', methods=['POST'])
+@track_write
 def create_campaign_wizard():
     body = request.get_json() or {}
     shop_id = body.get("shop_id")
@@ -2699,63 +2653,11 @@ def _sync_targets(cursor, client, shop_id):
 
 
 def _sync_negative_keywords(cursor, client, shop_id):
-    neg_kws = _paginate_all(client, client.list_negative_keywords, max_results=100)
-    for item in neg_kws:
-        cursor.execute("""
-            INSERT INTO amazon_ads_negative_keywords
-                (campaign_id, ad_group_id, keyword_id, keyword_text, match_type,
-                 state, last_update_datetime, synced_at)
-            VALUES (%s,%s,%s,%s,%s, %s,%s, NOW())
-            ON DUPLICATE KEY UPDATE
-                campaign_id=VALUES(campaign_id), ad_group_id=VALUES(ad_group_id),
-                keyword_text=VALUES(keyword_text), match_type=VALUES(match_type),
-                state=VALUES(state),
-                last_update_datetime=VALUES(last_update_datetime), synced_at=NOW()
-        """, (
-            int(item["campaignId"]),
-            int(item["adGroupId"]) if item.get("adGroupId") else None,
-            int(item["keywordId"]),
-            _safe_str(item.get("keywordText")),
-            _safe_str(item.get("matchType")),
-            _safe_str(item.get("state")),
-            _safe_date(item.get("lastUpdateDateTime")),
-        ))
-    return len(neg_kws)
+    return ads_negatives.sync_kind(cursor, client, shop_id, "keywords")
 
 
 def _sync_negative_targets(cursor, client, shop_id):
-    neg_targets = _paginate_all(client, client.list_negative_targets, max_results=100)
-    for item in neg_targets:
-        expr = item.get("expression") or []
-        resolved = item.get("resolvedExpression") or ""
-        if isinstance(resolved, (list, tuple)):
-            resolved = ", ".join(
-                (x.get("type") or x.get("name") or json.dumps(x))
-                if isinstance(x, dict) else str(x) for x in resolved
-            )
-        elif isinstance(resolved, dict):
-            resolved = resolved.get("type") or resolved.get("name") or json.dumps(resolved)
-        cursor.execute("""
-            INSERT INTO amazon_ads_negative_targets
-                (campaign_id, ad_group_id, target_id, expression,
-                 resolved_expression, state, last_update_datetime, synced_at)
-            VALUES (%s,%s,%s,%s, %s,%s,%s, NOW())
-            ON DUPLICATE KEY UPDATE
-                campaign_id=VALUES(campaign_id), ad_group_id=VALUES(ad_group_id),
-                expression=VALUES(expression),
-                resolved_expression=VALUES(resolved_expression),
-                state=VALUES(state),
-                last_update_datetime=VALUES(last_update_datetime), synced_at=NOW()
-        """, (
-            int(item["campaignId"]),
-            int(item["adGroupId"]) if item.get("adGroupId") else None,
-            int(item["targetId"]),
-            _safe_json(expr),
-            _safe_str(resolved),
-            _safe_str(item.get("state")),
-            _safe_date(item.get("lastUpdateDateTime")),
-        ))
-    return len(neg_targets)
+    return ads_negatives.sync_kind(cursor, client, shop_id, "targets")
 
 
 def sync_shop_entities(shop_id):
@@ -2790,6 +2692,12 @@ def sync_shop_entities(shop_id):
             result["neg_keywords"] = _sync_negative_keywords(cursor, client, shop_id)
             result["neg_targets"] = _sync_negative_targets(cursor, client, shop_id)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        # 任一层分页失败不能将半份事务当作成功；保留上次完整实体。
+        for key in ("campaigns", "ad_groups", "product_ads", "keywords", "targets", "neg_keywords", "neg_targets"):
+            result[key] = 0
+        result["error"] = "广告实体同步失败，已回滚本批数据，请稍后重试"
     finally:
         conn.close()
 
@@ -2826,30 +2734,21 @@ def sync_all_shops():
 # =================================================================
 
 @advertising_manage_bp.route('/entities/sync', methods=['POST'])
+@login_required
 @resource_guard('ads_entities')
 def trigger_entity_sync():
-    """一键同步指定店铺的全量广告实体（campaign/group/product-ad/keyword/target/negative）"""
-    body = request.get_json() or {}
-    shop_id = body.get("shop_id")
-    if not shop_id:
-        return jsonify({"status": "error", "message": "缺少 shop_id"}), 400
-    try:
-        shop_id = int(shop_id)
-    except (ValueError, TypeError):
-        return jsonify({"status": "error", "message": "shop_id 必须是整数"}), 400
-
+    """同步当前页面明确选择的店铺/活动/组实体，不生成效果报表。"""
+    from services.ads_entity_sync_service import sync
     t0 = time.time()
-    result = sync_shop_entities(shop_id)
-    elapsed = time.time() - t0
-    total = (result["campaigns"] + result["ad_groups"] + result["product_ads"] +
-             result["keywords"] + result["targets"] + result["neg_keywords"] + result["neg_targets"])
-    print(f"[EntitySync] shop={shop_id} 完成: {total} 实体, 耗时 {elapsed:.1f}s")
-    return jsonify({
-        "status": "error" if result["error"] else "success",
-        "data": result,
-        "total": total,
-        "elapsed": round(elapsed, 1),
-    })
+    try:
+        result = sync(request.get_json(silent=True))
+        return jsonify({"status": "success", "data": result, "total": result["total"],
+                        "elapsed": round(time.time() - t0, 1)})
+    except ads_negatives.NegativeError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), exc.code
+    except Exception:
+        return jsonify({"status": "error",
+                        "message": "Amazon 实体读取未完成，本批数据未保存。请稍后重试；曝光、点击、花费报表不受影响。"}), 502
 
 
 @advertising_manage_bp.route('/entities/sync-all', methods=['POST'])

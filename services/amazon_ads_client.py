@@ -221,13 +221,26 @@ class AmazonAdsApiClient:
         """
         return self._request("GET", "/v2/profiles", with_scope=False)
 
+    def get_change_history(self, event_types: dict, from_ms: int, to_ms: int,
+                           count: int = 50, page_offset: int = 0) -> dict:
+        """只读更改历史；pageOffset 是页号，不是记录偏移量。"""
+        return self._request("POST", "/history", json_data={
+            "eventTypes": event_types, "fromDate": from_ms, "toDate": to_ms,
+            "count": count, "pageOffset": page_offset,
+            "sort": {"key": "DATE", "direction": "DESC"},
+        }, headers={"Content-Type": "application/json",
+                    "Accept": "application/vnd.historyresponse.v1.1+json"})
+
     # -------------------- Sponsored Products (v3) --------------------
 
     _V3_SP_CAMPAIGN_CT = "application/vnd.spcampaign.v3+json"
 
-    def list_sp_campaigns(self, state_filter: list = None, max_results: int = 100, next_token: str = None) -> dict:
+    def list_sp_campaigns(self, state_filter: list = None, max_results: int = 100, next_token: str = None,
+                          campaign_id=None) -> dict:
         """获取 Sponsored Products 广告活动列表 (v3)"""
         body = {"maxResults": max(1, min(max_results, 100))}
+        if campaign_id:
+            body["campaignIdFilter"] = {"include": [str(campaign_id)]}
         if state_filter:
             body["stateFilter"] = {"include": state_filter}
         if next_token:
@@ -407,11 +420,13 @@ class AmazonAdsApiClient:
     _V3_SP_ADGROUP_CT = "application/vnd.spadgroup.v3+json"
 
     def list_ad_groups(self, campaign_id: int = None, state_filter: list = None,
-                       max_results: int = 100, next_token: str = None) -> dict:
+                       max_results: int = 100, next_token: str = None, ad_group_id=None) -> dict:
         """获取 SP 广告组列表"""
         body = {"maxResults": max(1, min(max_results, 100))}
         if campaign_id:
             body["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if ad_group_id:
+            body["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
         if state_filter:
             body["stateFilter"] = {"include": state_filter}
         if next_token:
@@ -452,13 +467,10 @@ class AmazonAdsApiClient:
                          next_token: str = None) -> dict:
         """获取 SP 产品广告列表"""
         body = {"maxResults": max(1, min(max_results, 100))}
-        filters = {}
         if campaign_id:
-            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+            body["campaignIdFilter"] = {"include": [str(campaign_id)]}
         if ad_group_id:
-            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
-        if filters:
-            body["filters"] = filters
+            body["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
         if state_filter:
             body["stateFilter"] = {"include": state_filter}
         if next_token:
@@ -498,13 +510,10 @@ class AmazonAdsApiClient:
                       next_token: str = None) -> dict:
         """获取 SP 关键词列表"""
         body = {"maxResults": max(1, min(max_results, 100))}
-        filters = {}
         if campaign_id:
-            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+            body["campaignIdFilter"] = {"include": [str(campaign_id)]}
         if ad_group_id:
-            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
-        if filters:
-            body["filters"] = filters
+            body["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
         if state_filter:
             body["stateFilter"] = {"include": state_filter}
         if next_token:
@@ -552,13 +561,10 @@ class AmazonAdsApiClient:
                      next_token: str = None) -> dict:
         """获取 SP 投放列表 (手动 + 自动)"""
         body = {"maxResults": max(1, min(max_results, 100))}
-        filters = {}
         if campaign_id:
-            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
+            body["campaignIdFilter"] = {"include": [str(campaign_id)]}
         if ad_group_id:
-            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
-        if filters:
-            body["filters"] = filters
+            body["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
         if state_filter:
             body["stateFilter"] = {"include": state_filter}
         if next_token:
@@ -631,101 +637,101 @@ class AmazonAdsApiClient:
 
     # ==================== 否定关键词 (Negative Keywords) v3 ====================
 
-    _V3_SP_NEG_KEYWORD_CT = "application/vnd.spnegativekeyword.v3+json"
+    _V3_SP_NEG_KEYWORD_CT = "application/vnd.spNegativeKeyword.v3+json"
+
+    def _negative_resource(self, kind, campaign_level=False):
+        """两级否定资源必须使用各自的路径、容器和媒体类型。"""
+        if kind == "keywords":
+            return (("campaignNegativeKeywords", "campaignNegativeKeywords",
+                     "application/vnd.spCampaignNegativeKeyword.v3+json", "campaignNegativeKeywordIdFilter")
+                    if campaign_level else
+                    ("negativeKeywords", "negativeKeywords", self._V3_SP_NEG_KEYWORD_CT, "negativeKeywordIdFilter"))
+        return (("campaignNegativeTargets", "campaignNegativeTargetingClauses",
+                 "application/vnd.spCampaignNegativeTargetingClause.v3+json", "campaignNegativeTargetIdFilter")
+                if campaign_level else
+                ("negativeTargets", "negativeTargetingClauses", self._V3_SP_NEG_TARGET_CT, "negativeTargetIdFilter"))
+
+    def _list_negatives(self, kind, campaign_id=None, ad_group_id=None,
+                        state_filter=None, max_results=100, next_token=None, campaign_level=False):
+        path, _, media, _ = self._negative_resource(kind, campaign_level)
+        body = {"maxResults": max(1, min(max_results, 100)), "includeExtendedDataFields": True}
+        if campaign_id:
+            body["campaignIdFilter"] = {"include": [str(campaign_id)]}
+        if ad_group_id is not None:
+            if campaign_level:
+                raise ValueError("活动级否定不能传 ad_group_id")
+            body["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
+        if state_filter:
+            body["stateFilter"] = {"include": [_upper(s) for s in state_filter]}
+        if next_token:
+            body["nextToken"] = next_token
+        return self._request("POST", f"/sp/{path}/list", json_data=body,
+                             headers=self._media_type_headers(media))
+
+    def _write_negatives(self, kind, items, method="POST", campaign_level=False):
+        path, key, media, _ = self._negative_resource(kind, campaign_level)
+        # 复制输入，避免修改调用者保存的批次/索引信息。
+        payload = [dict(item) for item in items]
+        self._stringify_ids(payload)
+        for item in payload:
+            if "state" in item:
+                item["state"] = _upper(item["state"])
+        return self._request(method, f"/sp/{path}", json_data={key: payload},
+                             headers={**self._media_type_headers(media), "Prefer": "return=representation"})
+
+    def _archive_negative(self, kind, entity_id, campaign_level=False):
+        path, _, media, filter_key = self._negative_resource(kind, campaign_level)
+        return self._request("POST", f"/sp/{path}/delete",
+                             json_data={filter_key: {"include": [str(entity_id)]}},
+                             headers=self._media_type_headers(media))
 
     def list_negative_keywords(self, campaign_id: int = None, ad_group_id: int = None,
                                state_filter: list = None, max_results: int = 100,
-                               next_token: str = None) -> dict:
+                               next_token: str = None, campaign_level: bool = False) -> dict:
         """获取 SP 否定关键词列表"""
-        body = {"maxResults": max(1, min(max_results, 100))}
-        filters = {}
-        if campaign_id:
-            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
-        if ad_group_id is not None:
-            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
-        if filters:
-            body["filters"] = filters
-        if state_filter:
-            body["stateFilter"] = {"include": state_filter}
-        if next_token:
-            body["nextToken"] = next_token
-        return self._request(
-            "POST", "/sp/negativeKeywords/list", json_data=body,
-            headers=self._media_type_headers(self._V3_SP_NEG_KEYWORD_CT),
-        )
+        return self._list_negatives("keywords", campaign_id, ad_group_id, state_filter,
+                                    max_results, next_token, campaign_level)
 
-    def update_negative_keyword(self, keyword_id: int, updates: dict) -> dict:
+    def update_negative_keyword(self, keyword_id: int, updates: dict, campaign_level=False) -> dict:
         """更新 SP 否定关键词状态"""
         body = {"keywordId": str(keyword_id)}
         if "state" in updates:
             body["state"] = _upper(updates["state"])
-        return self._request(
-            "PUT", "/sp/negativeKeywords",
-            json_data={"negativeKeywords": [body]},
-            headers=self._media_type_headers(self._V3_SP_NEG_KEYWORD_CT),
-        )
+        return self._write_negatives("keywords", [body], "PUT", campaign_level)
 
-    def create_negative_keywords(self, keywords: list) -> dict:
+    def create_negative_keywords(self, keywords: list, campaign_level=False) -> dict:
         """批量创建 SP 否定关键词"""
-        self._stringify_ids(keywords)
-        return self._request(
-            "POST", "/sp/negativeKeywords",
-            json_data={"negativeKeywords": keywords},
-            headers=self._media_type_headers(self._V3_SP_NEG_KEYWORD_CT),
-        )
+        return self._write_negatives("keywords", keywords, campaign_level=campaign_level)
 
-    def archive_negative_keyword(self, keyword_id: int) -> dict:
-        """归档 SP 否定关键词（直连 DELETE，不送 Content-Type）"""
-        return self._archive_without_content_type(f"/sp/negativeKeywords/{keyword_id}")
+    def archive_negative_keyword(self, keyword_id: int, campaign_level=False) -> dict:
+        """通过 v3 正式批量删除接口归档，不以暂停冒充删除。"""
+        return self._archive_negative("keywords", keyword_id, campaign_level)
 
     # ==================== 否定投放 (Negative Targets) v3 ====================
 
-    _V3_SP_NEG_TARGET_CT = "application/vnd.spnegativeTargetingClause.v3+json"
+    _V3_SP_NEG_TARGET_CT = "application/vnd.spNegativeTargetingClause.v3+json"
 
     def list_negative_targets(self, campaign_id: int = None, ad_group_id: int = None,
                               state_filter: list = None, max_results: int = 100,
-                              next_token: str = None) -> dict:
+                              next_token: str = None, campaign_level: bool = False) -> dict:
         """获取 SP 否定投放列表"""
-        body = {"maxResults": max(1, min(max_results, 100))}
-        filters = {}
-        if campaign_id:
-            filters["campaignIdFilter"] = {"include": [str(campaign_id)]}
-        if ad_group_id is not None:
-            filters["adGroupIdFilter"] = {"include": [str(ad_group_id)]}
-        if filters:
-            body["filters"] = filters
-        if state_filter:
-            body["stateFilter"] = {"include": state_filter}
-        if next_token:
-            body["nextToken"] = next_token
-        return self._request(
-            "POST", "/sp/negativeTargets/list", json_data=body,
-            headers=self._media_type_headers(self._V3_SP_NEG_TARGET_CT),
-        )
+        return self._list_negatives("targets", campaign_id, ad_group_id, state_filter,
+                                    max_results, next_token, campaign_level)
 
-    def update_negative_target(self, target_id: int, updates: dict) -> dict:
+    def update_negative_target(self, target_id: int, updates: dict, campaign_level=False) -> dict:
         """更新 SP 否定投放状态"""
         body = {"targetId": str(target_id)}
         if "state" in updates:
             body["state"] = _upper(updates["state"])
-        return self._request(
-            "PUT", "/sp/negativeTargets",
-            json_data={"negativeTargetingClauses": [body]},
-            headers=self._media_type_headers(self._V3_SP_NEG_TARGET_CT),
-        )
+        return self._write_negatives("targets", [body], "PUT", campaign_level)
 
-    def create_negative_targets(self, targets: list) -> dict:
+    def create_negative_targets(self, targets: list, campaign_level=False) -> dict:
         """批量创建 SP 否定投放"""
-        self._stringify_ids(targets)
-        return self._request(
-            "POST", "/sp/negativeTargets",
-            json_data={"negativeTargetingClauses": targets},
-            headers=self._media_type_headers(self._V3_SP_NEG_TARGET_CT),
-        )
+        return self._write_negatives("targets", targets, campaign_level=campaign_level)
 
-    def archive_negative_target(self, target_id: int) -> dict:
-        """归档 SP 否定投放（直连 DELETE，不送 Content-Type）"""
-        return self._archive_without_content_type(f"/sp/negativeTargets/{target_id}")
+    def archive_negative_target(self, target_id: int, campaign_level=False) -> dict:
+        """通过 v3 正式批量删除接口归档。"""
+        return self._archive_negative("targets", target_id, campaign_level)
 
     # ==================== 广告组合 (Portfolios) ====================
 
