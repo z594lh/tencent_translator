@@ -34,6 +34,7 @@ from blueprints.product_board import product_board_bp
 from blueprints.reports import reports_bp
 from blueprints.cron import cron_bp
 from blueprints.permissions import permissions_bp
+from blueprints.ui_config import ui_config_bp
 from blueprints.options import options_bp
 from blueprints.asin_bsr import asin_bsr_bp
 
@@ -133,6 +134,7 @@ BLUEPRINTS = (
     reports_bp,
     cron_bp,
     permissions_bp,
+    ui_config_bp,
     options_bp,
     asin_bsr_bp,
 )
