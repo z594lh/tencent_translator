@@ -37,6 +37,7 @@ from blueprints.permissions import permissions_bp
 from blueprints.ui_config import ui_config_bp
 from blueprints.options import options_bp
 from blueprints.asin_bsr import asin_bsr_bp
+from blueprints.sellersprite import sellersprite_bp
 
 import services.notification_handlers
 
@@ -137,6 +138,7 @@ BLUEPRINTS = (
     ui_config_bp,
     options_bp,
     asin_bsr_bp,
+    sellersprite_bp,
 )
 
 
