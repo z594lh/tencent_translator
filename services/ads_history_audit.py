@@ -106,11 +106,9 @@ def _changes(item, known, creating):
             before = strategies.get(old.get('strategy'), old.get('strategy'))
             after = strategies.get(dynamic['strategy'], dynamic['strategy'])
             if before != after: result.append(('SMART_BIDDING_STRATEGY', before, after, {}))
-        aliases = {'PLACEMENT_TOP': 'TOP_OF_SEARCH', 'PLACEMENT_TOP_OF_SEARCH': 'TOP_OF_SEARCH',
-                   'PLACEMENT_PRODUCT_PAGE': 'DETAIL_PAGE', 'PLACEMENT_REST_OF_SEARCH': 'REST_OF_SEARCH'}
-        old_places = {aliases.get(x.get('placement'), x.get('placement')): x.get('percentage') for x in old.get('placementBidding', [])}
+        old_places = {repo.placement_position(x.get('placement')): x.get('percentage') for x in old.get('placementBidding', [])}
         for placement in dynamic.get('placementBidding', []):
-            position = aliases.get(placement.get('placement'), placement.get('placement'))
+            position = repo.placement_position(placement.get('placement'))
             before, after = old_places.get(position), placement.get('percentage')
             if before != after: result.append(('PLACEMENT_GROUP', before, after, {'placementGroupPosition': position}))
     return result

@@ -138,6 +138,16 @@ def comparable(value, change):
     return ('value', dumps(value))
 
 
+def placement_position(value):
+    """写入API与历史接口使用不同广告位枚举；只归一已知别名，不改原始证据。"""
+    aliases = {'TOP': 'TOP_OF_SEARCH', 'PLACEMENT_TOP': 'TOP_OF_SEARCH',
+               'PLACEMENT_TOP_OF_SEARCH': 'TOP_OF_SEARCH', 'PRODUCT_PAGE': 'DETAIL_PAGE',
+               'PLACEMENT_PRODUCT_PAGE': 'DETAIL_PAGE', 'PLACEMENT_REST_OF_SEARCH': 'REST_OF_SEARCH'}
+    if not isinstance(value, str) or not value:
+        return None
+    return aliases.get(value, value)
+
+
 def compatible(local, event):
     """仅规则关联，不推断平台操作人；前值未知、并发歧义一律不强合。"""
     if local['change_type'] != event['change_type']:
@@ -151,6 +161,9 @@ def compatible(local, event):
         return False
     lm = loads(local.get('metadata')) or {}
     em = event.get('metadata') or {}
+    if change == 'PLACEMENT_GROUP':
+        position = placement_position(lm.get('placementGroupPosition'))
+        return position is not None and position == placement_position(em.get('placementGroupPosition'))
     return lm.get('placementGroupPosition') == em.get('placementGroupPosition')
 
 

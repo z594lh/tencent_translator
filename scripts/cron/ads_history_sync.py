@@ -15,7 +15,8 @@ def run():
     if not results:
         print('没有到期的广告历史采集需求，本轮不调用Amazon。', flush=True)
     for item in results:
-        print(f"历史采集：{item['status']}；{item.get('message', '')}；保存{item.get('saved', 0)}条", flush=True)
+        print(f"历史采集：{item['status']}；{item.get('message', '')}；保存{item.get('saved', 0)}条；"
+              f"本地已有记录补关联{item.get('reconciled', 0)}条", flush=True)
     return 1 if any(item['status'] == 'failed' for item in results) else 0
 
 

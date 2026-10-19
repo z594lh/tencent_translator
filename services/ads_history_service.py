@@ -208,12 +208,43 @@ def _root(ctx):
     return {**ctx, 'scope': 'shop', 'campaign_id': None, 'ad_group_id': None}
 
 
+def reconcile_saved(c, ctx):
+    """只用本地已有证据补关联，冷却/过期窗口不应阻止已到达的历史补全。"""
+    where = ''
+    args = [ctx['region'], ctx['profile_id']]
+    if ctx['scope'] != 'shop':
+        where += ' AND p.campaign_id=%s'
+        args.append(str(ctx['campaign_id']))
+    if ctx['scope'] == 'group':
+        where += ' AND p.ad_group_id=%s'
+        args.append(str(ctx['ad_group_id']))
+    # 只重读有未关联ERP候选的事件，不扫描/改写所有平台历史。
+    c.execute('''SELECT p.platform_event FROM amazon_ads_history p
+                 WHERE p.region=%s AND p.profile_id=%s AND p.source='PLATFORM'
+                 AND p.merged_into_id IS NULL AND p.platform_event IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM amazon_ads_history e
+                   WHERE e.region=p.region AND e.profile_id=p.profile_id AND e.entity_type=p.entity_type
+                   AND e.entity_id=p.entity_id AND e.change_type=p.change_type AND e.source='ERP'
+                   AND e.write_status='accepted' AND e.platform_time_ms IS NULL AND e.merged_into_id IS NULL
+                   AND e.local_started_ms BETWEEN p.platform_time_ms-300000 AND p.platform_time_ms+300000)
+                 '''+where+' ORDER BY p.id', args)
+    events = c.fetchall()
+    merged = 0
+    for row in events:
+        # 与采集相同的身份、父级及双向唯一校验；不绕过原匹配规则。
+        raw = repo.loads(row['platform_event'])
+        event = normalize_event(c, _root(ctx), raw, 0, repo.now_ms()+1000)
+        merged += repo.save_event(c, ctx, event, allow_merge=True)
+    return merged
+
+
 def sync_scope(params, budget=25):
     ctx = context(params, allow_shop=True)
     clock = repo.now_ms()
     lock_conn = repo.get_db_connection()
     lock_name = 'ads_hist_' + repo.digest([ctx['region'], ctx['profile_id']])[:40]
     acquired = False
+    reconciled = 0
     try:
         lock_conn.autocommit(True)
         with lock_conn.cursor() as lock:
@@ -223,11 +254,15 @@ def sync_scope(params, budget=25):
             with repo.transaction() as c: repo.mark_dirty(c, ctx)
             return {'status': 'pending', 'message': '历史正在同步，已合并补采需求', 'saved': 0}
         with repo.transaction() as c:
+            local_matches = reconcile_saved(c, ctx)
+        # 本地补关联单独提交；后面的采集状态或网络失败不能回滚已确认的证据。
+        reconciled = local_matches
+        with repo.transaction() as c:
             account_state = repo.ensure_state(c, _root(ctx))
             state = repo.ensure_state(c, ctx)
             if account_state['next_retry_ms'] > clock:
                 repo.mark_dirty(c, ctx)
-                return {'status': 'pending', 'message': '历史采集冷却中，已保留补采需求', 'saved': 0,
+                return {'status': 'pending', 'message': '历史采集冷却中，已保留补采需求', 'saved': 0, 'reconciled': reconciled,
                         'next_retry_ms': account_state['next_retry_ms']}
             work = repo.loads(state['work_json'])
             if not work:
@@ -304,7 +339,7 @@ def sync_scope(params, budget=25):
                 c.execute("UPDATE amazon_ads_history SET sync_status='pending',error_message='' "
                           "WHERE region=%s AND profile_id=%s AND source='ERP' AND write_status='accepted' "
                           "AND platform_time_ms IS NULL"+where, args)
-        return {'status': 'success' if finished else 'partial', 'saved': saved,
+        return {'status': 'success' if finished else 'partial', 'saved': saved, 'reconciled': reconciled,
                 'message': '历史已更新' if finished else '历史已部分保存，余下窗口待自动续采'}
     except Exception as exc:
         status = exc.response.status_code if isinstance(exc, requests.HTTPError) and exc.response is not None else None
@@ -333,7 +368,7 @@ def sync_scope(params, budget=25):
             if ctx['scope'] == 'group': where += ' AND ad_group_id=%s'; values.append(str(ctx['ad_group_id']))
             c.execute("UPDATE amazon_ads_history SET sync_status='failed',error_message=%s WHERE region=%s AND profile_id=%s "
                       "AND source='ERP' AND platform_time_ms IS NULL AND write_status='accepted'"+where, [message]+values)
-        return {'status': 'failed', 'message': message, 'saved': 0}
+        return {'status': 'failed', 'message': message, 'saved': 0, 'reconciled': reconciled}
     finally:
         if acquired:
             try:
