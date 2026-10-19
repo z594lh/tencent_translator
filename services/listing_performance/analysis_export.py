@@ -21,12 +21,9 @@ from services.listing_performance import analysis_service as analysis
 from services.listing_performance import analysis_history as history
 from services.listing_performance.common import DomainError, parse_date, utc_now
 from services import profit_calculator
+from services.ads_display import AUTO_LABELS, AUTO_ALIASES
 
 
-AUTO_LABELS = {'QUERY_HIGH_REL_MATCHES': '紧密匹配', 'QUERY_BROAD_REL_MATCHES': '宽泛匹配',
-               'ASIN_ACCESSORY_RELATED': '关联商品', 'ASIN_SUBSTITUTE_RELATED': '同类商品'}
-AUTO_ALIASES = {'close-match': 'QUERY_HIGH_REL_MATCHES', 'loose-match': 'QUERY_BROAD_REL_MATCHES',
-                'complements': 'ASIN_ACCESSORY_RELATED', 'substitutes': 'ASIN_SUBSTITUTE_RELATED'}
 PLACEMENTS = {'Top of Search on-Amazon': ('搜索结果顶部（首页）', 'PLACEMENT_TOP'),
               'Other on-Amazon': ('搜索结果其余位置', 'PLACEMENT_REST_OF_SEARCH'),
               'Detail Page on-Amazon': ('商品页面', 'PLACEMENT_PRODUCT_PAGE'),

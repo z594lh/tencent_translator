@@ -10,10 +10,24 @@
 """
 import os
 import uuid
+import hashlib
+import io
+import re
+import base64
 from datetime import datetime
+from urllib.parse import quote
 
+from PIL import Image, ImageOps, UnidentifiedImageError
 import oss2
 
+
+def image_signature(image):
+    """轻量图像特征只用于候选图相似比对，不作为Amazon官方处理状态。"""
+    image = ImageOps.exif_transpose(image).convert('RGB')
+    colors = base64.b64encode(image.resize((8, 8)).tobytes()).decode('ascii')
+    values = list(image.convert('L').resize((17, 16)).tobytes())
+    bits = ''.join('1' if values[y * 17 + x] > values[y * 17 + x + 1] else '0' for y in range(16) for x in range(16))
+    return {'colors': colors, 'dhash': f'{int(bits, 2):064x}'}
 
 # ==================== 读取环境变量 ====================
 ALI_ACCESS_KEY_ID = os.getenv("ALI_ACCESS_KEY_ID", "")
@@ -49,7 +63,7 @@ def _build_url(oss_key: str) -> str:
         endpoint = endpoint[7:]
     elif endpoint.startswith("https://"):
         endpoint = endpoint[8:]
-    return f"https://{ALI_BUCKET_NAME}.{endpoint}/{oss_key}"
+    return f"https://{ALI_BUCKET_NAME}.{endpoint}/{quote(oss_key, safe='/')}"
 
 
 def generate_oss_key(filename: str, prefix: str = "amazon/listing/") -> str:
@@ -136,7 +150,21 @@ def upload_stream(file_obj, oss_key: str = None, filename: str = "upload.bin") -
         }
 
 
-def upload_image_for_listing(file_obj, filename: str = None) -> dict:
+def listing_image_prefix(shop_id, marketplace_id, sku, position):
+    """SKU保持可辨识，特殊字符编码，避免多店或目录穿越碰撞。"""
+    if not str(shop_id).isdigit() or int(shop_id) < 1:
+        raise ValueError('上传图片必须指定有效店铺')
+    if not isinstance(marketplace_id, str) or not re.fullmatch(r'[A-Z0-9]{8,30}', marketplace_id):
+        raise ValueError('图片站点无效')
+    if not isinstance(sku, str) or not sku.strip() or len(sku) > 200:
+        raise ValueError('图片SKU无效')
+    if position not in ('MAIN', 'SWCH', *[f'PT{i:02d}' for i in range(1, 9)]):
+        raise ValueError('图片位置须为MAIN、PT01～PT08或SWCH')
+    sku_folder = quote(sku, safe='-_').replace('.', '%2E')
+    return f'amazon/listing/images/managed/{int(shop_id)}/{marketplace_id}/{sku_folder}/{position}/'
+
+
+def upload_image_for_listing(file_obj, filename: str = None, *, shop_id=None, marketplace_id=None, sku=None, position=None) -> dict:
     """
     专用于亚马逊 Listing 图片上传的快捷方法
     自动添加 amazon/listing/images/ 前缀
@@ -145,8 +173,40 @@ def upload_image_for_listing(file_obj, filename: str = None) -> dict:
         filename = file_obj.filename
     if not filename:
         filename = "image.jpg"
-    oss_key = generate_oss_key(filename, prefix="amazon/listing/images/")
-    return upload_stream(file_obj, oss_key=oss_key, filename=filename)
+    prefix = listing_image_prefix(shop_id, marketplace_id, sku, position)
+    data = file_obj.read(10 * 1024 * 1024 + 1)
+    if not data or len(data) > 10 * 1024 * 1024:
+        raise ValueError('图片须大于0且不超过10MB')
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format not in ('JPEG', 'PNG') or getattr(image, 'n_frames', 1) != 1:
+                raise ValueError('本版仅支持静态JPEG和PNG图片')
+            if image.width * image.height > 40000000 or min(image.size) < 100:
+                raise ValueError('图片尺寸须至少100像素，且不超过4000万像素；平台类目规则另行校验')
+            extension = '.jpg' if image.format == 'JPEG' else '.png'
+            mime = 'image/jpeg' if extension == '.jpg' else 'image/png'
+            width, height = image.size
+            # 原图字节不转换；只为ERP生成独立小预览，避免反复下载原图。
+            preview = ImageOps.exif_transpose(image).convert('RGB')
+            signature = image_signature(preview)
+            preview.thumbnail((320, 320))
+            buffer = io.BytesIO()
+            preview.save(buffer, 'JPEG', quality=72, optimize=True)
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+        raise ValueError('无法读取图片，文件损坏或不是有效图片') from None
+    version = datetime.now().strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:12]
+    directory = prefix + version + '/'
+    key, preview_key = directory + 'original' + extension, directory + 'preview.jpg'
+    bucket = _get_bucket()
+    headers = {'Content-Type': mime, 'Cache-Control': 'public, max-age=31536000, immutable', 'x-oss-forbid-overwrite': 'true'}
+    # 两对象任一失败不重试、不删除原图，保留可排查证据。
+    bucket.put_object(key, data, headers=headers)
+    bucket.put_object(preview_key, buffer.getvalue(), headers={**headers, 'Content-Type': 'image/jpeg'})
+    return {'success': True, 'url': _build_url(key), 'oss_key': key, 'filename': filename,
+            'preview_url': _build_url(preview_key), 'position': position, 'sha256': hashlib.sha256(data).hexdigest(),
+            'width': width, 'height': height, 'size': len(data), 'preview_size': len(buffer.getvalue()), 'signature': signature}
 
 
 def delete_object(oss_key: str) -> dict:
@@ -248,6 +308,9 @@ def cleanup_orphan_listing_images(dry_run: bool = True) -> dict:
 
             for obj in result.object_list:
                 scanned += 1
+                # 新管理目录保留处理中和历史版本，不能因平台改写地址而当作孤儿删除。
+                if obj.key.startswith(prefix + 'managed/'):
+                    continue
                 url = _build_url(obj.key)
 
                 if url not in referenced_urls:

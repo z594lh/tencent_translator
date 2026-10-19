@@ -14,6 +14,7 @@ import pymysql
 from services.mysql_service import get_db_connection
 from services.listing_performance import analysis_service as sku_analysis
 from services.listing_performance.common import DomainError, json_data, parse_date, positive_id, utc_now
+from services import daily_report_operations as operation_records, ads_display
 
 MAX_SKUS = 1000
 MAX_FEATURED = 10
@@ -233,7 +234,17 @@ def preview(params, owner):
 def report_result(row):
     """组装完整历史日报；读取保存快照，不查询最新SKU或重新计算历史内容。"""
     return {**{k: v for k, v in row.items() if k not in ('snapshot_json', 'selected_skus_json')},
-            'snapshot': decoded(row['snapshot_json'], dict), 'selected_skus': decoded(row['selected_skus_json'], list)}
+            'snapshot': ads_display.decorate_snapshot(decoded(row['snapshot_json'], dict)), 'selected_skus': decoded(row['selected_skus_json'], list)}
+
+
+def operations(params, actor):
+    """按本人/店铺/北京时间工作日分页，只读本地ERP证据。"""
+    day = work_day(params.get('work_date'))
+    page = sku_analysis.integer(params.get('page',1),'page',1,10000)
+    size = sku_analysis.integer(params.get('page_size',20),'page_size',1,50)
+    with session(params) as (cursor, shop, market, _):
+        rows,total = operation_records.rows(cursor,params.get('kind'),shop,market,actor,day,page,size)
+        return {'list':rows,'total':total,'page':page,'page_size':size,'work_date':day,'timezone':'Asia/Shanghai'}
 
 
 def save(params, actor):
@@ -270,10 +281,13 @@ def save(params, actor):
                 or (version == 0 and expected_id is not None)):
             raise DomainError('日报已保存或被其他窗口修改，请重新打开后编辑', 409)
         status = 'submitted' if old and old['status'] == 'submitted' else status
-        if status == 'submitted' and (not actions or (not no_issues and not issues)):
-            raise DomainError('提交前请填写今日调整优化，以及问题协助（或勾选暂无）')
+        old_snapshot = decoded(old['snapshot_json'],dict) if old else {}
+        sections,reported = operation_records.resolve(cursor,shop,market,actor,day,params,old_snapshot,status=='submitted')
+        if status == 'submitted' and ((not actions and not reported) or (not no_issues and not issues)):
+            raise DomainError('提交前请勾选汇报操作，或补充实际工作；同时填写问题协助（或勾选暂无）')
         snapshot = (build_snapshot(cursor, shop, market, actor, day, info, params.get('data_date'))
                     if not old or refresh else decoded(old['snapshot_json'], dict))
+        snapshot['operation_sections'], snapshot['reported_operations'] = sections,reported
         available = {r['seller_sku'] for r in snapshot['rows']}
         if any(sku not in available for sku in selected):
             raise DomainError('重点SKU不在本次经营快照中，可能已转交，请重新整理或取消选择', 409)
@@ -378,10 +392,15 @@ def listing(params, actor, can_all):
         total = cursor.fetchone()['total']
         cursor.execute('''SELECT r.id,r.owner_user_id,r.work_date,r.status,r.version,r.submitted_at,r.updated_at,
             LEFT(r.actions_text,180) AS actions_summary,LEFT(r.issues_text,180) AS issues_summary,r.no_issues,
+            COALESCE(JSON_LENGTH(JSON_EXTRACT(r.snapshot_json,'$.reported_operations')),0) AS reported_operation_count,
             COALESCE(NULLIF(u.nickname,''),u.username) AS owner_name
             FROM operations_daily_reports r LEFT JOIN users u ON u.id=r.owner_user_id WHERE ''' + where +
             ' ORDER BY r.work_date DESC,r.updated_at DESC,r.id DESC LIMIT %s OFFSET %s', (*args, size, (page - 1) * size))
-        return {'list': cursor.fetchall(), 'total': total, 'page': page, 'page_size': size}
+        reports = cursor.fetchall()
+        for report in reports:
+            if not report['actions_summary'] and report['reported_operation_count']:
+                report['actions_summary'] = f"已汇报 {report['reported_operation_count']} 条ERP操作及调整理由"
+        return {'list': reports, 'total': total, 'page': page, 'page_size': size}
 
 
 def configuration(actor, can_all, can_write, can_delete=False):

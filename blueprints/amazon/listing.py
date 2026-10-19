@@ -18,6 +18,10 @@ from services.oss_uploader import upload_image_for_listing
 from services.mysql_service import get_db_connection
 from services.cron_tasks.execution import resource_guard
 from services.deepseekAI import generate_declaration_info
+from services import listing_pricing_service as pricing
+from services import listing_text_service as text_editor
+from services import listing_image_service as image_editor
+from services import listing_history_service as listing_history
 from blueprints.asin_bsr import attach_bsr_info, get_bsr_trend
 
 amazon_listing_bp = Blueprint('amazon_listing', __name__, url_prefix='/api')
@@ -48,6 +52,13 @@ def _require_shop_id_from_body(data: dict) -> int:
 # ========================
 # 路由：数据库查询（前端展示用）
 # ========================
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/change-history', methods=['GET'])
+@amazon_listing_bp.route('/amazon/listings/<sku>/change-history/<int:history_id>', methods=['GET'])
+@login_required
+@permission_required('amazon_listings:page')
+def get_listing_change_history(sku, history_id=None):
+    return _pricing_response(lambda: listing_history.query(_require_shop_id(), sku, request.args, history_id))
 
 @amazon_listing_bp.route('/amazon/listings', methods=['GET'])
 @login_required
@@ -800,6 +811,11 @@ def patch_listing(sku):
         if not patches or not isinstance(patches, list):
             return jsonify({"status": "error", "message": "缺少必填字段: patches（必须为数组）"}), 400
 
+        if any(not isinstance(patch, dict) or not isinstance(patch.get('path'), str) for patch in patches):
+            return jsonify({"status": "error", "message": "patches结构无效"}), 400
+        if any(patch['path'] == '/attributes' or patch['path'].startswith('/attributes/purchasable_offer') for patch in patches):
+            return jsonify({"status": "error", "message": "价格请使用独立价格编辑面板，避免覆盖或误清除现有报价"}), 400
+
         client = get_sp_api_client(shop_id=shop_id)
         seller_id = client.seller_id or ''
         marketplace_id = client.marketplace_id
@@ -808,6 +824,7 @@ def patch_listing(sku):
             patches=patches,
             product_type=product_type
         )
+        submission = pricing.accepted_submission(result)
 
         fetched = client.get_listings_item(sku=sku, included_data=["summaries", "attributes", "issues"])
         if fetched and isinstance(fetched, dict) and fetched.get('sku'):
@@ -821,15 +838,121 @@ def patch_listing(sku):
 
         return jsonify({
             "status": "success",
-            "message": "Listing 部分更新成功",
-            "data": detail
+            "message": "Amazon已接受Listing修改提交；最终生效以平台处理及回读为准",
+            "data": detail,
+            "submission": submission
         })
 
+    except pricing.PricingError as e:
+        return jsonify({"status": "error", "message": str(e), "data": e.details}), e.code
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         print(f"[Amazon Listing] 部分更新异常: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/text-editor', methods=['GET', 'POST'])
+@login_required
+@permission_required('amazon_listings:edit')
+def listing_text_editor(sku):
+    if request.method == 'GET':
+        return _pricing_response(text_editor.get_editor, request.args.get('shop_id'), sku)
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'status': 'error', 'message': '文字编辑请求须为JSON对象'}), 400
+    return _pricing_response(text_editor.submit_editor, data.get('shop_id'), sku, data)
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/text-editor/verify', methods=['POST'])
+@login_required
+@permission_required('amazon_listings:edit')
+def verify_listing_text(sku):
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'status': 'error', 'message': '文字核对请求须为JSON对象'}), 400
+
+    def verify():
+        result, raw, ctx = text_editor.verify_editor(data.get('shop_id'), sku, data.get('verification_token'))
+        try:
+            text_editor.cache_text(ctx, raw)
+        except Exception:
+            result['cache_warning'] = '平台回读已完成，但本地文字缓存更新失败；请稍后重读核对，勿重复提交'
+        return result
+
+    return _pricing_response(verify)
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/image-editor', methods=['GET', 'POST'])
+@login_required
+@permission_required('amazon_listings:edit')
+def listing_image_editor(sku):
+    if request.method == 'GET':
+        return _pricing_response(image_editor.get_editor, request.args.get('shop_id'), sku)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'status': 'error', 'message': '图片编辑请求须为JSON对象'}), 400
+    return _pricing_response(image_editor.submit_editor, data.get('shop_id'), sku, data)
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/image-editor/verify', methods=['POST'])
+@login_required
+@permission_required('amazon_listings:edit')
+def verify_listing_images(sku):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'status': 'error', 'message': '图片核对请求须为JSON对象'}), 400
+    return _pricing_response(image_editor.verify_editor, data.get('shop_id'), sku, data.get('verification_token'))
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/image-editor/catalog', methods=['GET'])
+@login_required
+@permission_required('amazon_listings:edit')
+def listing_catalog_images(sku):
+    return _pricing_response(image_editor.get_catalog, request.args.get('shop_id'), sku)
+
+
+def _pricing_response(function, *args):
+    """编辑业务错误单独响应，禁止向页面输出上游认证信息或原始请求。"""
+    try:
+        body, code = {'status': 'success', 'data': function(*args)}, 200
+    except (pricing.PricingError, listing_history.HistoryError) as exc:
+        body, code = {'status': 'error', 'message': str(exc), 'data': exc.details}, exc.code
+    except ValueError:
+        body, code = {'status': 'error', 'message': '编辑请求参数无效，请核对店铺及请求格式'}, 400
+    except Exception:
+        body, code = {'status': 'error', 'message': '平台读取或核对未完成，请稍后只读核对；不要重复提交修改'}, 502
+    response = jsonify(body)
+    response.status_code = code
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/pricing', methods=['GET'])
+@login_required
+@permission_required('amazon_listings:edit')
+def get_listing_pricing(sku):
+    return _pricing_response(lambda: pricing.get_pricing(_require_shop_id(), sku))
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/pricing', methods=['POST'])
+@login_required
+@permission_required('amazon_listings:edit')
+def submit_listing_pricing(sku):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'status': 'error', 'message': '价格请求须为JSON对象'}), 400
+    return _pricing_response(lambda: pricing.submit_pricing(data.get('shop_id'), sku, data))
+
+
+@amazon_listing_bp.route('/amazon/listings/<sku>/pricing/verify', methods=['POST'])
+@login_required
+@permission_required('amazon_listings:edit')
+def verify_listing_pricing(sku):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'status': 'error', 'message': '核对请求须为JSON对象'}), 400
+    return _pricing_response(lambda: pricing.verify_pricing(data.get('shop_id'), sku, data.get('verification_token')))
 
 
 @amazon_listing_bp.route('/amazon/listings/<sku>/sync-to-variants', methods=['POST'])
@@ -923,7 +1046,8 @@ def sync_fields_to_variants(sku):
 
                 product_type = target.get('product_type', '')
 
-                client.patch_listings_item(sku=tgt_name, patches=patches, product_type=product_type)
+                result = client.patch_listings_item(sku=tgt_name, patches=patches, product_type=product_type)
+                pricing.accepted_submission(result)
 
                 fetched = client.get_listings_item(sku=tgt_name, included_data=["summaries", "attributes", "issues"])
                 if fetched and isinstance(fetched, dict) and fetched.get('sku'):
@@ -937,7 +1061,7 @@ def sync_fields_to_variants(sku):
 
         return jsonify({
             "status": "success",
-            "message": f"已同步 {updated_count} 个变体" if failed_count == 0 else "部分同步成功",
+            "message": f"Amazon已接受 {updated_count} 个变体的修改提交，最终属性需回读核实" if failed_count == 0 else "部分变体未完成，请核对失败详情；已接受不等于最终生效",
             "data": {
                 "source_sku": sku,
                 "target_skus": target_skus,
@@ -993,106 +1117,8 @@ def delete_listing(sku):
 @login_required
 @permission_required('amazon_listings:edit')
 def switch_listing_language(sku):
-    """
-    切换 Listing 所有节点的 language_tag 并提交到 SP-API
-    先从 SP-API 拉取最新数据，统一修改所有 language_tag，再推送回亚马逊
-    请求体（必填）:
-        shop_id       - 店铺ID
-        language_tag  - 目标语言标签 (zh_CN 或 en_US)
-    """
-    try:
-        data = request.get_json() or {}
-        shop_id = _require_shop_id_from_body(data)
-        language_tag = data.get('language_tag', '').strip()
-
-        if language_tag not in ('zh_CN', 'en_US'):
-            return jsonify({"status": "error", "message": "language_tag 必须是 zh_CN 或 en_US"}), 400
-
-        client = get_sp_api_client(shop_id=shop_id)
-        seller_id = client.seller_id or ''
-        marketplace_id = client.marketplace_id
-        included_data = ["summaries", "attributes", "issues"]
-
-        result = client.get_listings_item(sku=sku, included_data=included_data)
-        if not result or not isinstance(result, dict) or not result.get('sku'):
-            return jsonify({
-                "status": "error",
-                "message": f"SP-API 未返回 Listing {sku} 数据"
-            }), 404
-
-        summaries = result.get('summaries', [])
-        summary = summaries[0] if summaries and isinstance(summaries, list) else {}
-        product_type = summary.get('productType', '')
-        condition_type = summary.get('conditionType')
-
-        attributes = result.get('attributes', {})
-        if not attributes or not isinstance(attributes, dict):
-            return jsonify({"status": "error", "message": "SP-API 返回数据缺少 attributes"}), 400
-
-        attrs_updated = _normalize_attributes_language(attributes, language_tag)
-
-        sp_result = client.put_listings_item(
-            sku=sku,
-            product_type=product_type,
-            attributes=attributes,
-            requirements="LISTING",
-            condition_type=condition_type
-        )
-
-        synced_count, error, _ = sync_listings_to_db(
-            shop_id, marketplace_id, seller_id, [result]
-        )
-        if error:
-            return jsonify({"status": "error", "message": f"同步到数据库失败: {error}"}), 500
-
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    UPDATE amazon_listing_bullets
-                    SET language_tag = %s
-                    WHERE shop_id = %s AND sku = %s
-                """, (language_tag, shop_id, sku))
-                bullets_updated = cursor.rowcount
-
-                cursor.execute("""
-                    SELECT attributes_json FROM amazon_listings
-                    WHERE shop_id = %s AND sku = %s AND is_deleted = 0
-                """, (shop_id, sku))
-                row = cursor.fetchone()
-
-                if row:
-                    db_attributes = json.loads(row.get('attributes_json', '{}')) if row.get('attributes_json') else {}
-                    _normalize_attributes_language(db_attributes, language_tag)
-                    cursor.execute("""
-                        UPDATE amazon_listings
-                        SET attributes_json = %s
-                        WHERE shop_id = %s AND sku = %s
-                    """, (json.dumps(db_attributes, ensure_ascii=False), shop_id, sku))
-
-                conn.commit()
-        finally:
-            conn.close()
-
-        detail = _get_listing_detail_from_db(shop_id=shop_id, sku=sku)
-
-        return jsonify({
-            "status": "success",
-            "message": f"语言切换成功，共更新 {bullets_updated + attrs_updated} 个节点，已同步至亚马逊",
-            "data": {
-                "bullets_updated": bullets_updated,
-                "attributes_updated": attrs_updated,
-                "language_tag": language_tag,
-                "sp_api_result": sp_result,
-                "listing": detail
-            }
-        })
-
-    except ValueError as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-    except Exception as e:
-        print(f"[Amazon Listing] 语言切换异常: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    # 旧入口曾PUT整份属性并伪造本地语言；改走有版本和回读保护的文字编辑。
+    return jsonify({"status": "error", "message": "请使用新版文字语言编辑，逐项核对后提交；旧整份覆盖入口已停止"}), 409
 
 
 @amazon_listing_bp.route('/amazon/listings/upload-image', methods=['POST'])
@@ -1102,7 +1128,7 @@ def upload_listing_image():
     """
     上传 Listing 图片到阿里云 OSS，返回可用于亚马逊 SP-API 的 HTTPS URL
     请求方式: multipart/form-data
-    字段: image - 图片文件
+    字段: image、shop_id、sku、position；不自动提交Amazon。
     """
     try:
         if 'image' not in request.files:
@@ -1112,7 +1138,13 @@ def upload_listing_image():
         if file.filename == '':
             return jsonify({"status": "error", "message": "未选择文件"}), 400
 
-        result = upload_image_for_listing(file, filename=file.filename)
+        shop_id = request.form.get('shop_id')
+        sku = request.form.get('sku', '')
+        position = request.form.get('position', '')
+        client, context = pricing.account(shop_id, sku)
+        result = upload_image_for_listing(file, filename=file.filename, shop_id=context['shop_id'],
+                                          marketplace_id=context['marketplace_id'], sku=sku, position=position)
+        result['asset_token'] = image_editor.upload_proof(client, context, result)
 
         if not result.get('success'):
             return jsonify({
@@ -1124,15 +1156,17 @@ def upload_listing_image():
             "status": "success",
             "message": "图片上传成功",
             "data": {
-                "url": result['url'],
-                "oss_key": result['oss_key'],
-                "filename": result['filename']
+                **result
             }
         })
 
+    except pricing.PricingError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), e.code
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
     except Exception as e:
-        print(f"[Amazon Listing] 图片上传异常: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"[Amazon Listing] 图片上传异常类型: {type(e).__name__}")
+        return jsonify({"status": "error", "message": "图片上传未完成，请核对上传记录，勿反复重传"}), 502
 
 
 @amazon_listing_bp.route('/amazon/listings/delete-image', methods=['DELETE'])
@@ -1150,6 +1184,26 @@ def delete_listing_image():
         data = request.get_json() or {}
         oss_key = data.get('oss_key', '').strip()
         url = data.get('url', '').strip()
+
+        # Listing槽位移除不等于删源文件；新版管理目录保留处理中及历史版本。
+        from urllib.parse import unquote, urlparse
+        from services.oss_uploader import _build_url
+        if url and urlparse(url).netloc != urlparse(_build_url('')).netloc:
+            return jsonify({'status': 'error', 'message': '只允许删除当前OSS来源的旧图片文件'}), 409
+        candidate = oss_key or unquote(urlparse(url).path.lstrip('/'))
+        if any(part in ('.', '..') for part in unquote(candidate).replace('\\', '/').split('/')):
+            return jsonify({'status': 'error', 'message': '图片文件路径无效'}), 400
+        if not candidate.startswith('amazon/listing/images/') or candidate.startswith('amazon/listing/images/managed/'):
+            return jsonify({'status': 'error', 'message': '不能从此入口删除管理目录原图或其他业务文件；移除图片请在图片编辑区保存'}), 409
+
+        check = get_db_connection()
+        try:
+            with check.cursor() as cursor:
+                cursor.execute('SELECT 1 FROM amazon_listing_images WHERE media_location IN (%s,%s) LIMIT 1', (url, _build_url(candidate)))
+                if cursor.fetchone():
+                    return jsonify({'status': 'error', 'message': '该旧图片仍被Listing引用，未删除源文件'}), 409
+        finally:
+            check.close()
 
         if not oss_key and not url:
             return jsonify({"status": "error", "message": "缺少参数: 请提供 oss_key 或 url"}), 400
@@ -1775,9 +1829,7 @@ def _parse_listing_item(item, shop_id, marketplace_id, seller_id):
                 })
 
     images = []
-    img_keys = ['main_product_image_locator', 'other_product_image_locator_1',
-                'other_product_image_locator_2', 'other_product_image_locator_3',
-                'other_product_image_locator_4', 'other_product_image_locator_5']
+    img_keys = ['main_product_image_locator'] + [f'other_product_image_locator_{index}' for index in range(1, 9)]
     for sort_idx, key in enumerate(img_keys):
         if key in attributes:
             loc = _extract_first_media_location(attributes[key])

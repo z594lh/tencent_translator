@@ -79,6 +79,15 @@ def preview():
     return service.preview(request.args, actor)
 
 
+@daily_reports_bp.get('/operations')
+@login_required
+@domain_response
+def operation_candidates():
+    """操作人只取当前登录身份，全员查看权限也不能代选他人操作。"""
+    actor, _, _, _ = access(write=True)
+    return service.operations(request.args, actor)
+
+
 @daily_reports_bp.put('')
 @login_required
 @domain_response

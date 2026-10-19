@@ -30,6 +30,7 @@ from services.mysql_service import get_db_connection
 from services import ads_negative_service as ads_negatives
 from services import ads_history_service as ads_history
 from services import ads_creation_service as ads_creation
+from services import ads_display
 from services.ads_history_audit import track_write
 from blueprints.user_auth import login_required
 from services.cron_tasks.execution import resource_guard
@@ -1581,6 +1582,9 @@ def list_targets(only_auto=False):
         return jsonify({"status": "error", "message": str(e)}), 500
 
     list_data = [_map_entity_row(r) for r in rows]
+    for item in list_data:
+        item['resolved_expression_label'] = ads_display.auto_label(item.get('resolved_expression')) or item.get('resolved_expression')
+        item['state_label'] = ads_display.STATES.get(str(item.get('state') or '').upper(), item.get('state'))
     return jsonify({
         "status": "success",
         "data": {"list": list_data, "total": total or len(list_data)},

@@ -93,7 +93,7 @@ def get_sp_api_client(shop_id: int, marketplace_id: str = None, region: str = No
 
     creds = get_sp_app_credentials(shop["credential_group_id"])
 
-    return AmazonSpApiClient(
+    client = AmazonSpApiClient(
         client_id=creds["client_id"],
         client_secret=creds["client_secret"],
         refresh_token=shop["sp_refresh_token"],
@@ -104,6 +104,9 @@ def get_sp_api_client(shop_id: int, marketplace_id: str = None, region: str = No
         seller_id=shop["seller_id"],
         proxies=creds["proxies"],
     )
+    # 只为已认证的Listing网页请求启用操作留痕，其他业务及定时读取保持原样。
+    from services.listing_history_service import instrument
+    return instrument(client, shop)
 
 
 def get_ads_api_client(shop_id: int, region: str = None) -> AmazonAdsApiClient:
