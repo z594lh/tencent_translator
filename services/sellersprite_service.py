@@ -45,34 +45,12 @@ def storage_root():
 
 
 def candidates():
-    """沿用BSR库存和最新报表七天销量口径，仅选择美国站并按ASIN合并来源。"""
-    conn = get_db_connection()
+    """人工启用配置决定待抓范围；店铺/SKU仅补来源，不按库存销量过滤。"""
+    from services.sellersprite_portal import configured_candidates, PortalError
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT UPPER(TRIM(l.asin)) AS asin,l.sku,l.shop_id,l.marketplace_id
-                FROM amazon_listings l JOIN amazon_shops s ON s.id=l.shop_id AND s.status=1
-                WHERE l.is_deleted=0 AND l.marketplace_id=%s AND s.marketplace_id=%s
-                  AND l.asin IS NOT NULL AND TRIM(l.asin)<>''
-                  AND EXISTS (SELECT 1 FROM amazon_inventory inv
-                    WHERE inv.shop_id=l.shop_id
-                      AND inv.seller_sku=l.sku COLLATE utf8mb4_unicode_ci
-                      AND inv.fulfillable_quantity>0)
-                  AND EXISTS (SELECT 1 FROM report_sku_sales rs
-                    WHERE rs.shop_id=l.shop_id AND rs.sku=l.sku COLLATE utf8mb4_unicode_ci
-                      AND rs.sales_7d>0 AND rs.report_date=(
-                        SELECT MAX(rs2.report_date) FROM report_sku_sales rs2
-                        WHERE rs2.shop_id=rs.shop_id AND rs2.sku=rs.sku COLLATE utf8mb4_unicode_ci))
-                ORDER BY asin,l.shop_id,l.sku
-            """, (US_MARKETPLACE, US_MARKETPLACE))
-            rows = cur.fetchall()
-        result = {}
-        for row in rows:
-            if re.fullmatch(r'[A-Z0-9]{10}', row['asin']):
-                result.setdefault(row['asin'], []).append({key: row[key] for key in ('shop_id', 'sku', 'marketplace_id')})
-        return result
-    finally:
-        conn.close()
+        return configured_candidates()
+    except PortalError as exc:
+        raise PipelineError(str(exc),exc.code) from None
 
 
 def pending_asins(day=None, limit=50):
@@ -103,7 +81,8 @@ def claim_task(asin, day, worker_id):
     if not worker_id or len(worker_id) > 100:
         raise PipelineError('worker_id必填且不超过100字符')
     day = record_date(day)
-    sources = candidates().get(asin)
+    eligible = candidates()
+    sources = eligible.get(asin)
     # 已领取的历史任务允许恢复上传，即使SKU此时已不再符合筛选条件。
     conn = get_db_connection()
     now = utcnow()
@@ -112,7 +91,7 @@ def claim_task(asin, day, worker_id):
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM sellersprite_keyword_tasks WHERE marketplace='US' AND asin=%s AND record_date=%s AND period='last30days'", (asin, day))
             existing = cur.fetchone()
-            if not existing and not sources:
+            if not existing and asin not in eligible:
                 raise PipelineError('该ASIN不在美国站待抓取范围', 404)
             cur.execute("""INSERT INTO sellersprite_keyword_tasks
                 (asin,marketplace,record_date,period,sources_json,status,created_at,updated_at)
