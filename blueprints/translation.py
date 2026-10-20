@@ -3,6 +3,7 @@
 """
 from functools import wraps
 from flask import Blueprint, request, jsonify, current_app
+from blueprints.user_auth import login_required
 from services.baidu_translator import translate, translate_image, TranslationError
 from services.geminiAi import (
     generate_ai_response,
@@ -48,6 +49,7 @@ def machine_payload(limit):
 
 
 @translation_bp.route('/translate', methods=['POST'])
+@login_required
 @machine_response
 def api_translate():
     """百度文本翻译接口；路径及成功字段保持不变。"""
@@ -69,6 +71,7 @@ def api_translate():
 
 
 @translation_bp.route('/translate-image', methods=['POST'])
+@login_required
 @machine_response
 def api_translate_image():
     """百度图片翻译接口；需要百度账号单独开通图片服务。"""
@@ -89,6 +92,7 @@ def api_translate_image():
 
 
 @translation_bp.route('/translate-ai', methods=['POST'])
+@login_required
 def api_translate_ai():
     """AI文本翻译接口"""
     data = request.get_json()
@@ -112,6 +116,7 @@ def api_translate_ai():
 
 
 @translation_bp.route('/translate-ai-image', methods=['POST'])
+@login_required
 def api_translate_ai_image():
     """AI图片翻译接口"""
     data = request.get_json()

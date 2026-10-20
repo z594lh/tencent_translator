@@ -6,6 +6,9 @@ from flask import Blueprint, jsonify, request
 from blueprints.user_auth import login_required, permission_required
 from services.permissions_service import get_user_permission_codes
 from services.cron_tasks import service, repository
+from services import translation_management
+from services.baidu_translator import TranslationError
+from blueprints.permissions import _check_admin_role
 
 cron_bp = Blueprint('cron', __name__, url_prefix='/api/cron')
 logger = logging.getLogger(__name__)
@@ -19,7 +22,7 @@ def response(function):
             result = jsonify(payload[0]) if isinstance(payload, tuple) else jsonify(payload)
             if isinstance(payload, tuple):
                 result.status_code = payload[1]
-        except repository.TaskError as exc:
+        except (repository.TaskError, TranslationError) as exc:
             result = jsonify({'success': False, 'message': str(exc)})
             result.status_code = exc.status
         except ValueError:
@@ -74,3 +77,29 @@ def task_history(task_id):
 @response
 def run_detail(run_id):
     return service.detail(run_id)
+
+
+@cron_bp.get('/translation/status')
+@login_required
+@permission_required('tasks:page')
+@response
+def translation_status():
+    data = translation_management.snapshot()
+    data['can_resume'] = (_check_admin_role(request.current_user['id']) and
+                          'tasks:execute' in get_user_permission_codes(request.current_user['id']))
+    return {'success':True,'data':data}
+
+
+@cron_bp.post('/translation/resume')
+@login_required
+@permission_required('tasks:page')
+@permission_required('tasks:execute')
+@response
+def resume_translation():
+    if not _check_admin_role(request.current_user['id']):
+        return {'success':False,'message':'只有管理员可以恢复翻译账户'},403
+    if (request.content_length or 0)>2048:
+        return {'success':False,'message':'请求体过大'},413
+    result = translation_management.resume(request.get_json(silent=True))
+    logger.info('翻译账户人工恢复：用户ID=%s，恢复任务数=%s',request.current_user['id'],result['restored'])
+    return {'success':True,**result}

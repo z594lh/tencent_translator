@@ -57,7 +57,7 @@ def account_request(appid, characters):
                 raise TranslationError('百度翻译达到本地每日安全预算，等待次日或管理员调整', 429,
                                        retry_after=math.ceil((midnight-now).total_seconds()))
             wait = max(0, (state['next_allowed_at']-now).total_seconds()) if state['next_allowed_at'] else 0
-            if wait > 3:
+            if wait > max(3, interval):
                 raise TranslationError('百度翻译账户尚未到下次请求时间，本次未请求平台', 429,
                                        retry_after=math.ceil(wait))
             # 进程若在发送中崩溃，至少留下30秒保护；正常完成后改为响应结束+间隔。

@@ -184,7 +184,8 @@ def discover(account, scan_limit=1000):
             ('sprite','sellersprite_keyword_rows','id,keyword AS phrase,translation',1,100),
             ('ads','amazon_ads_raw_reports','id,customer_search_term AS phrase,report_type',2,50)]:
             cur.execute('SELECT COALESCE(MAX(id),0) AS mid FROM '+table)
-            maximum = cur.fetchone()['mid']
+            # 聚合表达式可能返回Decimal，进入JSON游标前转整数，避免序列化失败且不损失大主键精度。
+            maximum = int(cur.fetchone()['mid'])
             mark = state.get(name)
             if not isinstance(mark,dict):
                 mark = {'forward':maximum,'before':maximum+1,'day':today}
@@ -195,14 +196,14 @@ def discover(account, scan_limit=1000):
                         (int(mark.get('forward',0)),scan_limit))
             forward = list(cur.fetchall())
             if forward:
-                mark['forward'] = forward[-1]['id']
+                mark['forward'] = int(forward[-1]['id'])
                 candidates.extend(forward)
             if mark.get('before',0):
                 cur.execute('SELECT '+columns+' FROM '+table+' WHERE id<%s ORDER BY id DESC LIMIT %s',
                             (int(mark['before']),scan_limit))
                 backfill = list(cur.fetchall())
                 candidates.extend(backfill)
-                mark['before'] = backfill[-1]['id'] if len(backfill) == scan_limit else 0
+                mark['before'] = int(backfill[-1]['id']) if len(backfill) == scan_limit else 0
             phrases = [row['phrase'] for row in candidates if
                        (not (row.get('translation') or '').strip() if name=='sprite' else row['report_type']=='spSearchTerm')]
             discovered[name] = enqueue(cur,phrases,flag,priority)

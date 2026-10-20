@@ -163,6 +163,7 @@ class BaiduTranslator:
                 for row, original in zip(rows, lines)):
             error = TranslationError('百度翻译分段结果不完整或原文不对应，未使用错位译文', 502)
             error.request_sent = True
+            error.batch_mismatch = True
             raise error
         return [row['dst'] for row in rows]
 
