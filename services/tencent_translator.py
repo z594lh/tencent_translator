@@ -1,3 +1,4 @@
+"""原腾讯翻译实现，保留供明确选择腾讯的调用方使用；默认入口已切换百度。"""
 import json
 from bs4 import BeautifulSoup, NavigableString
 from tencentcloud.common import credential

@@ -31,6 +31,7 @@ from services import ads_negative_service as ads_negatives
 from services import ads_history_service as ads_history
 from services import ads_creation_service as ads_creation
 from services import ads_display
+from services.keyword_translation_service import enrich_rows as enrich_search_translations
 from services.ads_history_audit import track_write
 from blueprints.user_auth import login_required
 from services.cron_tasks.execution import resource_guard
@@ -1980,6 +1981,8 @@ def list_search_terms():
                         item[k] = float(v) if "." in str(v) or k in ("cpc", "ctr", "cvr", "cpa", "acos") else int(float(v))
                     except (ValueError, TypeError):
                         pass
+        with conn.cursor() as translation_cursor:
+            enrich_search_translations(list_data,field='customer_search_term',cursor=translation_cursor)
         return jsonify({"status": "success", "data": {"list": list_data, "total": total}})
     finally:
         conn.close()

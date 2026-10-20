@@ -4,6 +4,7 @@ from flask import Blueprint, jsonify, request, current_app
 from blueprints.user_auth import login_required
 from blueprints.permissions import require_permission
 from services import sellersprite_portal as service
+from services import sellersprite_reverse
 
 sellersprite_web_bp=Blueprint('sellersprite_web',__name__,url_prefix='/api')
 
@@ -58,3 +59,17 @@ def update(identifier): return service.update_config(identifier,payload(),reques
 @require_permission('amazon_listings:page')
 @response
 def keywords(sku): return service.listing_data(request.args.get('shop_id'),sku,request.args)
+
+
+@sellersprite_web_bp.get('/tools/keyword-reverse/options')
+@login_required
+@require_permission('amazon_listings:page')
+@response
+def reverse_options(): return sellersprite_reverse.asin_options(request.args)
+
+
+@sellersprite_web_bp.get('/tools/keyword-reverse/<asin>')
+@login_required
+@require_permission('amazon_listings:page')
+@response
+def reverse_keywords(asin): return sellersprite_reverse.reverse_data(asin,request.args)

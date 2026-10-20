@@ -8,15 +8,23 @@ from services.mysql_service import get_db_connection
 from services.sellersprite_excel import ALIASES, INTEGER_FIELDS, DECIMAL_FIELDS, TEXT_FIELDS
 
 US = 'ATVPDKIKX0DER'
-ROW_FIELDS = sorted(INTEGER_FIELDS | DECIMAL_FIELDS | TEXT_FIELDS | {'keyword','suggested_bid_min','suggested_bid_max'})
-SORT_FIELDS = set(INTEGER_FIELDS | DECIMAL_FIELDS | {'keyword','source_row'})
+# MySQL 5.7无REGEXP_REPLACE；关键词最长500字符，九次折叠足以合并连续空格。
+WORD_TEXT_SQL = "COALESCE(keyword,'')"
+for _ in ('CHAR(9)', 'CHAR(10)', 'CHAR(13)'):
+    WORD_TEXT_SQL = "REPLACE("+WORD_TEXT_SQL+","+_+",' ')"
+for _ in range(9):
+    WORD_TEXT_SQL = "REPLACE("+WORD_TEXT_SQL+",'  ',' ')"
+WORD_TEXT_SQL = 'TRIM('+WORD_TEXT_SQL+')'
+WORD_COUNT_SQL = "(CASE WHEN "+WORD_TEXT_SQL+"='' THEN 0 ELSE 1+CHAR_LENGTH("+WORD_TEXT_SQL+")-CHAR_LENGTH(REPLACE("+WORD_TEXT_SQL+",' ','')) END)"
+ROW_FIELDS = sorted(INTEGER_FIELDS | DECIMAL_FIELDS | TEXT_FIELDS | {'keyword','suggested_bid_min','suggested_bid_max','word_count'})
+SORT_FIELDS = set(INTEGER_FIELDS | DECIMAL_FIELDS | {'keyword','source_row','suggested_bid_min','suggested_bid_max','word_count'})
 RATIOS = {'traffic_share','organic_share','sponsored_share','search_growth_mom','search_growth_yoy','purchase_rate','total_click_share','total_conversion_share'}
-EXTRA_LABELS={'organic_updated_text':'自然排名更新时间（来源原文）','sponsored_updated_text':'广告排名更新时间（来源原文）','suggested_bid_min':'建议竞价下限','suggested_bid_max':'建议竞价上限'}
+EXTRA_LABELS={'organic_updated_text':'自然排名更新时间（来源原文）','sponsored_updated_text':'广告排名更新时间（来源原文）','suggested_bid_min':'建议竞价下限','suggested_bid_max':'建议竞价上限','word_count':'单词个数'}
 
 
 def columns():
     return [{'key':key,'label':EXTRA_LABELS.get(key) or ALIASES.get(key,(key,))[0],
-             'type':'ratio' if key in RATIOS else 'money' if key in ('ppc','suggested_bid_min','suggested_bid_max') else 'number' if key in INTEGER_FIELDS or key=='demand_supply_ratio' else 'text',
+             'type':'ratio' if key in RATIOS else 'money' if key in ('ppc','suggested_bid_min','suggested_bid_max') else 'number' if key in INTEGER_FIELDS or key in ('demand_supply_ratio','word_count') else 'text',
              'sortable':key in SORT_FIELDS} for key in ROW_FIELDS]
 
 
@@ -79,13 +87,65 @@ def configured_candidates():
         return result
 
 
+def config_identities(cur, rows):
+    """按当前页批量补商品身份，保留同一ASIN的所有店铺和SKU。"""
+    if not rows:
+        return
+    asins = [row['asin'] for row in rows]
+    placeholders = ','.join(['%s'] * len(asins))
+    related = {asin: [] for asin in asins}
+    cur.execute('''SELECT UPPER(TRIM(l.asin)) AS asin,l.shop_id,l.sku,l.item_name,
+        l.main_image_url AS image_url,s.shop_name,s.status AS shop_enabled,
+        (SELECT p.product_name FROM products p WHERE BINARY p.seller_sku=BINARY l.sku ORDER BY p.id LIMIT 1) AS product_name
+        FROM amazon_listings l JOIN amazon_shops s ON s.id=l.shop_id
+        AND BINARY s.marketplace_id=BINARY l.marketplace_id
+        WHERE l.is_deleted=0 AND l.marketplace_id=%s AND UPPER(TRIM(l.asin)) IN ('''+placeholders+''')
+        ORDER BY l.shop_id,l.sku,l.id''', (US, *asins))
+    for item in cur.fetchall():
+        items = related[item.pop('asin')]
+        if not any(existing['shop_id'] == item['shop_id'] and existing['sku'] == item['sku'] for existing in items):
+            items.append(item)
+    # 商品资料中的ASIN不等于已关联店铺，不擅自推定店铺归属。
+    cur.execute('''SELECT UPPER(TRIM(asin)) AS asin,seller_sku AS sku,product_name,image_url
+        FROM products WHERE UPPER(TRIM(asin)) IN ('''+placeholders+') ORDER BY id', asins)
+    catalog = {asin: [] for asin in asins}
+    for item in cur.fetchall():
+        catalog[item.pop('asin')].append(item)
+    for row in rows:
+        items = related[row['asin']]
+        row['ownership'] = 'owned' if items else 'catalog' if catalog[row['asin']] else 'external'
+        row['related_products'] = items or catalog[row['asin']]
+        primary = next((item for item in row['related_products'] if item.get('product_name')), {})
+        row['product_name'] = primary.get('product_name') or ''
+        row['item_name'] = primary.get('item_name') or next((item.get('item_name') for item in items if item.get('item_name')), '')
+        row['image_url'] = next((item['image_url'] for item in row['related_products'] if item.get('image_url')), '')
+
+
 def config_list(params):
     page, size = integer(params.get('page',1),'页码'), integer(params.get('page_size',20),'每页数量',1,100)
     search = str(params.get('search') or '').strip()
     if len(search)>100: raise PortalError('搜索词过长')
     where, args = "c.marketplace='US'", []
+    # 与批量身份补充采用相同美国站/未删除Listing口径，店铺停用不改变商品归属。
+    listing_match = '''FROM amazon_listings l JOIN amazon_shops s ON s.id=l.shop_id
+        AND BINARY s.marketplace_id=BINARY l.marketplace_id
+        WHERE l.is_deleted=0 AND l.marketplace_id='ATVPDKIKX0DER'
+        AND BINARY UPPER(TRIM(l.asin))=BINARY c.asin'''
+    catalog_match = 'FROM products p WHERE BINARY UPPER(TRIM(p.asin))=BINARY c.asin'
+    ownership = params.get('ownership') or ''
+    if ownership not in ('', 'owned', 'catalog', 'external'):
+        raise PortalError('商品归属无效')
+    if ownership == 'owned':
+        where += ' AND EXISTS (SELECT 1 '+listing_match+')'
+    elif ownership in ('catalog', 'external'):
+        where += ' AND NOT EXISTS (SELECT 1 '+listing_match+')'
+        where += (' AND EXISTS' if ownership == 'catalog' else ' AND NOT EXISTS')+' (SELECT 1 '+catalog_match+')'
     if search:
-        where += ' AND (c.asin LIKE %s OR c.remark LIKE %s)'; args += ['%'+search+'%']*2
+        where += ''' AND (CONVERT(c.asin USING utf8mb4) LIKE %s OR c.remark LIKE %s OR EXISTS (SELECT 1 '''+listing_match+'''
+            AND (l.sku LIKE %s OR l.item_name LIKE %s OR s.shop_name LIKE %s OR EXISTS
+            (SELECT 1 FROM products p WHERE BINARY p.seller_sku=BINARY l.sku AND p.product_name LIKE %s)))
+            OR EXISTS (SELECT 1 '''+catalog_match+' AND (p.seller_sku LIKE %s OR p.product_name LIKE %s)))'
+        args += ['%'+search+'%']*8
     enabled = params.get('enabled')
     if enabled not in (None,''):
         where += ' AND c.enabled=%s'; args.append(integer(enabled,'启用状态',0,1))
@@ -95,7 +155,9 @@ def config_list(params):
         cur.execute('''SELECT c.*,(SELECT t.status FROM sellersprite_keyword_tasks t
             WHERE t.asin=c.asin AND t.marketplace=c.marketplace ORDER BY t.record_date DESC,t.id DESC LIMIT 1) AS latest_status
             FROM sellersprite_asin_config c WHERE '''+where+' ORDER BY c.priority DESC,c.id DESC LIMIT %s OFFSET %s',args+[size,(page-1)*size])
-        return {'list':[{key:iso(value) for key,value in row.items()} for row in cur.fetchall()], 'total':total,'page':page,'page_size':size}
+        rows = [{key:iso(value) for key,value in row.items()} for row in cur.fetchall()]
+        config_identities(cur, rows)
+        return {'list':rows, 'total':total,'page':page,'page_size':size}
 
 
 def fields(data):
@@ -152,6 +214,12 @@ def listing_context(cur, shop, sku):
 
 
 def listing_data(shop, sku, params):
+    with session() as cur:
+        return keyword_data(cur, listing_context(cur, shop, sku), params)
+
+
+def keyword_data(cur, asin, params, condition=None, facets=False):
+    """共享的成功快照查询；调用者负责校验Listing或ASIN上下文。"""
     page,size=integer(params.get('page',1),'页码'),integer(params.get('page_size',20),'每页数量',1,100)
     search=str(params.get('search') or '').strip()
     if len(search)>200: raise PortalError('关键词搜索最多200字')
@@ -159,38 +227,51 @@ def listing_data(shop, sku, params):
     if sort not in SORT_FIELDS or direction not in ('asc','desc'): raise PortalError('排序字段或方向无效')
     task_id=params.get('task_id')
     if task_id not in (None,''): task_id=integer(task_id,'快照编号',1,922337203685)
-    with session() as cur:
-        asin=listing_context(cur,shop,sku)
-        cur.execute('''SELECT t.id,t.record_date,t.row_count,t.completed_at,t.latest_file_id
+    cur.execute('''SELECT t.id,t.record_date,t.row_count,t.completed_at,t.latest_file_id
             FROM sellersprite_keyword_tasks t JOIN sellersprite_keyword_files f ON f.id=t.latest_file_id AND f.task_id=t.id AND f.status='imported'
             WHERE t.asin=%s AND t.marketplace='US' AND t.period='last30days' AND t.status='completed'
             ORDER BY t.record_date DESC,t.id DESC LIMIT 100''',(asin,))
-        snapshots=[{key:(str(value) if key=='id' else iso(value)) for key,value in row.items() if key!='latest_file_id'} for row in cur.fetchall()]
-        cur.execute("SELECT status,record_date FROM sellersprite_keyword_tasks WHERE asin=%s AND marketplace='US' ORDER BY record_date DESC,id DESC LIMIT 1",(asin,))
-        latest=cur.fetchone()
-        if latest: latest={key:iso(value) for key,value in latest.items()}
-        result={'asin':asin,'marketplace':'US','period':'last30days','snapshots':snapshots,'latest_attempt':latest,'snapshot':None,'list':[],'total':0,'page':page,'page_size':size,'columns':columns()}
-        selected=task_id or (snapshots[0]['id'] if snapshots else None)
-        if selected is None: return result
-        cur.execute('''SELECT t.id,t.record_date,t.completed_at,t.latest_file_id,f.metadata_json
+    snapshots=[{key:(str(value) if key=='id' else iso(value)) for key,value in row.items() if key!='latest_file_id'} for row in cur.fetchall()]
+    cur.execute("SELECT status,record_date FROM sellersprite_keyword_tasks WHERE asin=%s AND marketplace='US' ORDER BY record_date DESC,id DESC LIMIT 1",(asin,))
+    latest=cur.fetchone()
+    if latest: latest={key:iso(value) for key,value in latest.items()}
+    result={'asin':asin,'marketplace':'US','period':'last30days','snapshots':snapshots,'latest_attempt':latest,'snapshot':None,'list':[],'total':0,'page':page,'page_size':size,'columns':columns()}
+    selected=task_id or (snapshots[0]['id'] if snapshots else None)
+    if facets:
+        result.update(source_total=0, facet_options={}, word_frequency=[])
+    if selected is None: return result
+    cur.execute('''SELECT t.id,t.record_date,t.row_count,t.completed_at,t.latest_file_id,f.metadata_json
             FROM sellersprite_keyword_tasks t JOIN sellersprite_keyword_files f ON f.id=t.latest_file_id AND f.task_id=t.id AND f.status='imported'
             WHERE t.id=%s AND t.asin=%s AND t.marketplace='US' AND t.period='last30days' AND t.status='completed' ''',(selected,asin))
-        snapshot=cur.fetchone()
-        if not snapshot: raise PortalError('所选快照不属于当前Listing或尚未成功入库',404)
-        file_id=snapshot.pop('latest_file_id')
-        try: metadata=json.loads(snapshot.pop('metadata_json') or '{}')
-        except (ValueError,TypeError): metadata={}
-        result['word_frequency']=(metadata.get('word_frequency') or [])[:100]
-        result['snapshot']={key:(str(value) if key=='id' else iso(value)) for key,value in snapshot.items()}
-        where,args='file_id=%s',[file_id]
-        if search:
-            where+=' AND (keyword LIKE %s OR translation LIKE %s)';args+=['%'+search+'%']*2
-        cur.execute('SELECT COUNT(*) AS n FROM sellersprite_keyword_rows WHERE '+where,args);result['total']=cur.fetchone()['n']
-        cur.execute('SELECT id,source_row,'+','.join(ROW_FIELDS)+',top_asins_json FROM sellersprite_keyword_rows WHERE '+where+
+    snapshot=cur.fetchone()
+    if not snapshot: raise PortalError('所选快照不属于当前Listing或尚未成功入库',404)
+    file_id=snapshot.pop('latest_file_id')
+    try: metadata=json.loads(snapshot.pop('metadata_json') or '{}')
+    except (ValueError,TypeError): metadata={}
+    result['word_frequency']=(metadata.get('word_frequency') or [])[:100]
+    result['snapshot']={key:(str(value) if key=='id' else iso(value)) for key,value in snapshot.items()}
+    if facets:
+        cur.execute('''SELECT keyword_type,traffic_type,conversion_label,COUNT(*) AS n
+            FROM sellersprite_keyword_rows WHERE file_id=%s GROUP BY keyword_type,traffic_type,conversion_label''',(file_id,))
+        groups=cur.fetchall()
+        result['source_total']=sum(row['n'] for row in groups)
+        result['facet_options']={key:sorted({part.strip() for row in groups for part in
+            (str(row[key]).split('/') if key=='traffic_type' else [str(row[key])]) if row[key] and part.strip()})
+            for key in ('keyword_type','traffic_type','conversion_label')}
+    where,args='file_id=%s',[file_id]
+    if condition and condition[0]:
+        where+=' AND '+condition[0];args+=condition[1]
+    if search:
+        where+=' AND (keyword LIKE %s OR translation LIKE %s)';args+=['%'+search+'%']*2
+    cur.execute('SELECT COUNT(*) AS n FROM sellersprite_keyword_rows WHERE '+where,args);result['total']=cur.fetchone()['n']
+    selected_fields=','.join(WORD_COUNT_SQL+' AS word_count' if field=='word_count' else field for field in ROW_FIELDS)
+    cur.execute('SELECT id,source_row,'+selected_fields+',top_asins_json FROM sellersprite_keyword_rows WHERE '+where+
             f' ORDER BY {sort} IS NULL,{sort} {direction},source_row ASC LIMIT %s OFFSET %s',args+[size,(page-1)*size])
-        for row in cur.fetchall():
-            row['id']=str(row['id'])
-            try: row['top_asins']=json.loads(row.pop('top_asins_json') or '[]')
-            except (ValueError,TypeError): row['top_asins']=[]
-            result['list'].append(row)
-        return result
+    for row in cur.fetchall():
+        row['id']=str(row['id'])
+        try: row['top_asins']=json.loads(row.pop('top_asins_json') or '[]')
+        except (ValueError,TypeError): row['top_asins']=[]
+        result['list'].append(row)
+    from services.keyword_translation_service import enrich_rows
+    enrich_rows(result['list'],cursor=cur)
+    return result
