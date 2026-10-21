@@ -86,7 +86,7 @@ def build(pack,data,management):
         context['observations'].append({'execution_id':record['id'],'plan_id':record['plan_id'],
             'ref':action['ref'],'label':action['label'],'before':action['before'],'after':action['after'],
             'unit':action['unit'],'kind':action['kind'],
-            'changed_at':row['created_at'],'confirmed_at':row['verified_at'],
+            'changed_at':(record['receipt'] or {}).get('submitted_at') or row['created_at'],'confirmed_at':row['verified_at'],
             'reason':action['reason'],'duration_days':duration,'started_on':start,'due_on':end,
             'elapsed_days':elapsed,'remaining_days':remaining,'phase':phase,'progress_note':progress,
             'report_date':pack['time']['report_end'],'observation_plan':action['observation'],

@@ -197,8 +197,11 @@ def cache_ads(identity, action, current):
             table, id_field = {'group': ('amazon_ads_ad_groups', 'ad_group_id'),
                 'keyword': ('amazon_ads_keywords', 'keyword_id'), 'target': ('amazon_ads_targets', 'target_id')}[entity]
             field = 'default_bid' if entity == 'group' else 'bid'
-            cur.execute('UPDATE '+table+' SET '+field+'=%s WHERE shop_id=%s AND campaign_id=%s AND ad_group_id=%s AND '+id_field+'=%s',
-                (current['value'], identity['id'], subject['campaign_id'], subject['ad_group_id'], subject['entity_id']))
+            # 子实体表没有shop_id/profile_id，必须通过活动关联限制账户，不能移除账户过滤。
+            cur.execute('UPDATE '+table+' e JOIN amazon_ads_campaigns c ON c.campaign_id=e.campaign_id '
+                'SET e.'+field+'=%s WHERE c.shop_id=%s AND c.profile_id=%s '
+                'AND e.campaign_id=%s AND e.ad_group_id=%s AND e.'+id_field+'=%s',
+                (current['value'], identity['id'], identity['ads_profile_id'], subject['campaign_id'], subject['ad_group_id'], subject['entity_id']))
         if cur.rowcount > 1: raise DomainError('广告缓存对象重复，已回滚缓存，未提交平台修改', 409)
 
 

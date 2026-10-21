@@ -14,6 +14,10 @@ def serialize(row):
     for name in ('action', 'baseline', 'receipt', 'verification'):
         result[name] = json.loads(row[name+'_json']) if row[name+'_json'] else None
     result['audit_context'] = json.loads(row['audit_context_json']) if row.get('audit_context_json') else None
+    receipt = result['receipt'] or {}
+    result['retry_version'] = len(receipt.get('recovery_attempts') or [])
+    result['can_retry'] = (row['runtime_mode'] == 'real' and row['status'] == 'not_sent' and receipt.get('accepted') is False
+        and result['action']['kind'].startswith('ads_') and result['retry_version'] < 3 and not receipt.get('history_ids'))
     return result
 
 

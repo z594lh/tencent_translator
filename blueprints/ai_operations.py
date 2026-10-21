@@ -5,7 +5,7 @@ import pymysql
 from blueprints.user_auth import login_required
 from services.permissions_service import get_user_permission_codes
 from services.listing_performance.common import DomainError, positive_id
-from services.ai_operations import repository, managed_store, daily_runner
+from services.ai_operations import repository, managed_store, daily_runner, execution_recovery
 from services.ai_operations.metrics import dumps
 
 ai_operations_bp = Blueprint('ai_operations', __name__, url_prefix='/api/ai-operations')
@@ -114,3 +114,11 @@ def run_managed(managed_id):
 def managed_run_detail(run_id):
     """只读返回优化详情弹框所需的保存会话与执行资料。"""
     return daily_runner.detail(run_id)
+
+
+@ai_operations_bp.post('/runs/<run_id>/retry-ads')
+@login_required
+@endpoint
+def retry_unsent_ads(run_id):
+    """明确确认后，仅补原方案确定未发送的广告；不重新调用AI或重放Listing。"""
+    return execution_recovery.retry_ads(run_id, request_body(), request.current_user['id'], authorize)

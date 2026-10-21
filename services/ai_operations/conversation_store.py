@@ -38,7 +38,7 @@ def open_session(identity):
         session['memory'] = checked(memory, 'memory_json', 'memory_hash') if memory else None
         # 只恢复最近两份终稿/执行反馈；所有旧原文仍按方案编号归档。
         cur.execute('''SELECT * FROM ai_operation_messages WHERE conversation_id=%s
-            AND event_type='execution_feedback' ORDER BY id DESC LIMIT 2''', (sid,))
+            AND event_type IN ('execution_feedback','execution_recovery') ORDER BY id DESC LIMIT 2''', (sid,))
         session['recent_feedback'] = [checked(r, 'payload_json', 'payload_hash') for r in reversed(cur.fetchall())]
         cur.execute('''SELECT * FROM ai_operation_memory WHERE conversation_id=%s
             ORDER BY revision DESC LIMIT 2''', (sid,))
@@ -65,7 +65,7 @@ def open_session(identity):
 
 def append(session_id, plan_id, round_no, event_type, payload):
     """幂等追加不可变会话事件，已登记但内容不同则拒绝覆盖。"""
-    if event_type not in ('model_request','model_response','data_response','validation_feedback','execution_feedback'):
+    if event_type not in ('model_request','model_response','data_response','validation_feedback','execution_feedback','execution_recovery'):
         raise DomainError('会话事件类型无效')
     with plan_store.transaction(True) as cur:
         cur.execute('SELECT * FROM ai_operation_messages WHERE plan_id=%s AND round_no=%s AND event_type=%s',

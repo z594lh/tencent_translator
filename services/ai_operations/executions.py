@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from datetime import datetime
 import re
 from services.listing_performance.common import DomainError, positive_id
-from . import plan_store, execution_store as store, platform_operations as interfaces
+from . import plan_store, execution_store as store, platform_operations as interfaces, execution_diagnostics
 from services.operation_identity import ai_operation
 from .catalog import REPORT_PLACEMENTS
 from .metrics import ADS_FIELDS,totals,ratios
@@ -145,33 +145,58 @@ def _execute_one(plan, action, actor, authorize):
             check_pending(cur, identity, action)
             execution_id = store.insert(cur, plan, action, interfaces.resource_key(identity, action['ref']), actor,
                 baseline(plan, action, {'value': action['before'], 'source': '分析资料缓存，尚未经平台预检'}))
-        try:
-            authorize()
-            current = interfaces.read(identity, action)
-            prepared = interfaces.prepare(identity, action, current)
-            # 原广告日志从真实读取的前值留痕，不能沿用陈旧缓存。
-            if action['kind'].startswith('ads_'): interfaces.cache_ads(identity, action, current)
-            saved_baseline = baseline(plan, action, {'value': current['value'], 'source': current['source']})
-            saved_baseline['prepared'] = prepared
-            with plan_store.transaction(True) as cur: store.prepared(cur, execution_id, saved_baseline)
-            authorize()
-        except Exception as error:
-            receipt = interfaces.failure(error)
-            receipt.update(accepted=False, message=str(error) if isinstance(error, (DomainError, interfaces.pricing.PricingError)) else '平台预检未完成，未发送修改')
-            with plan_store.transaction(True) as cur:
-                store.submitted(cur, execution_id, 'conflict' if getattr(error, 'status', getattr(error, 'code', None)) == 409 else 'not_sent', receipt)
-            return {**read_record(execution_id), 'reused': False}
-        # 此阶段提交成功落库后才能调用写接口；之后的异常一律不得自动重发。
+        return attempt(plan, action, execution_id, authorize)
+
+
+def with_attempt(receipt, recovery):
+    """保留原失败及补执行发起人，避免覆盖历史或递归嵌套旧回执。"""
+    if recovery:
+        receipt.update(recovery_attempts=recovery['attempts'], recovery_context=recovery['context'])
+    receipt['submitted_at'] = datetime.utcnow().isoformat() if receipt.get('accepted') is not False else None
+    return receipt
+
+
+def attempt(plan, action, execution_id, authorize, recovery=None):
+    """复用同一正式提交链，调用方必须持有资源锁及显式AI身份。"""
+    identity = plan['dataset']['content']['identity']
+    stage = 'authorize'
+    try:
+        authorize()
+        stage = 'read_platform'
+        current = interfaces.read(identity, action)
+        stage = 'prepare_action'
+        prepared = interfaces.prepare(identity, action, current)
+        # 原广告日志从真实读取的前值留痕，不能沿用陈旧缓存。
+        stage = 'cache_ads'
+        if action['kind'].startswith('ads_'): interfaces.cache_ads(identity, action, current)
+        saved_baseline = baseline(plan, action, {'value': current['value'], 'source': current['source']})
+        saved_baseline['prepared'] = prepared
+        stage = 'save_baseline'
+        with plan_store.transaction(True) as cur: store.prepared(cur, execution_id, saved_baseline)
+        stage = 'authorize_before_send'
+        authorize()
+    except Exception as error:
+        receipt = interfaces.failure(error)
+        receipt.update(accepted=False, message=str(error) if isinstance(error, (DomainError, interfaces.pricing.PricingError)) else '平台预检未完成，未发送修改')
+        receipt['diagnostic'] = execution_diagnostics.capture(error, stage, execution_id)
+        receipt = with_attempt(receipt, recovery)
         with plan_store.transaction(True) as cur:
-            store.submitted(cur, execution_id, 'submitting', {'accepted': None, 'runtime_mode': interfaces.MODE,
-                'message': '已登记发送阶段，进程中断时只回读核对，不自动重发'})
-        try: receipt = interfaces.submit(identity, action, current, prepared)
-        except Exception as error: receipt = interfaces.failure(error)
-        interfaces.link_history(identity, action, receipt)
-        status = 'unknown' if receipt['accepted'] is None else 'submitted' if receipt['accepted'] else 'rejected'
-        with plan_store.transaction(True) as cur:
-            store.submitted(cur, execution_id, status, receipt)
+            store.submitted(cur, execution_id, 'conflict' if getattr(error, 'status', getattr(error, 'code', None)) == 409 else 'not_sent', receipt)
         return {**read_record(execution_id), 'reused': False}
+    # 此阶段提交成功落库后才能调用写接口；之后的异常一律不得自动重发。
+    with plan_store.transaction(True) as cur:
+        store.submitted(cur, execution_id, 'submitting', with_attempt({'accepted': None, 'runtime_mode': interfaces.MODE,
+            'message': '已登记发送阶段，进程中断时只回读核对，不自动重发'}, recovery))
+    try: receipt = interfaces.submit(identity, action, current, prepared)
+    except Exception as error:
+        receipt = interfaces.failure(error)
+        receipt['diagnostic'] = execution_diagnostics.capture(error, 'submit_platform', execution_id)
+    interfaces.link_history(identity, action, receipt)
+    receipt = with_attempt(receipt, recovery)
+    status = 'unknown' if receipt['accepted'] is None else 'submitted' if receipt['accepted'] else 'rejected'
+    with plan_store.transaction(True) as cur:
+        store.submitted(cur, execution_id, status, receipt)
+    return {**read_record(execution_id), 'reused': False}
 
 
 def history(plan_id):
@@ -185,13 +210,13 @@ def verify(execution_id):
     record = read_record(execution_id)
     if record['status'] in ('rejected', 'conflict', 'not_sent', 'superseded', 'confirmed'): return record
     identity, action = record['baseline']['identity'], record['action']
-    proof = record['audit_context']
+    proof = (record['receipt'] or {}).get('recovery_context') or record['audit_context']
     if not proof: raise DomainError('执行身份缺失，不能核对其他操作', 409)
     with resource_lock(identity, action):
         record = read_record(execution_id)
         if record['status'] == 'preparing':
             with plan_store.transaction(True) as cur:
-                store.submitted(cur, execution_id, 'not_sent', {'accepted': False, 'runtime_mode': interfaces.MODE,
+                store.submitted(cur, execution_id, 'not_sent', {**(record['receipt'] or {}), 'accepted': False, 'runtime_mode': interfaces.MODE,
                     'message': '发送前流程中断，未进入平台发送阶段；不会自动接续旧行动'})
             return read_record(execution_id)
         operation = {'listing_text_update': 'text', 'listing_price_update': 'price'}.get(action['kind'], 'update')
@@ -199,8 +224,9 @@ def verify(execution_id):
             try:
                 result = interfaces.verify(identity, action, record['baseline'].get('prepared') or {}, record['receipt'] or {})
                 status = 'confirmed' if result['matched'] else result['state'] if result['state'] in ('issues', 'conflict') else 'pending'
-            except Exception:
+            except Exception as error:
                 result = {'matched': False, 'runtime_mode': interfaces.MODE, 'message': '真实回读未完成，保留原状态；不重新提交'}
+                result['diagnostic'] = execution_diagnostics.capture(error, 'verify_platform', execution_id)
                 status = record['status']
             with plan_store.transaction(True) as cur: store.verified(cur, execution_id, status, result)
         return read_record(execution_id)
