@@ -5,6 +5,7 @@ from functools import wraps
 from flask import g, has_request_context, request, jsonify, make_response
 
 from services import ads_history_repository as repo
+from services import operation_identity
 
 
 RESOURCES = {
@@ -56,8 +57,10 @@ def track_write(function):
 
 
 def _owner(c, acct, kind, eid, item, creating):
+    """核对实体属于指定广告账户及父级；AI与人工使用相同隔离检查。"""
+    state = operation_identity.ads_state()
     known = repo.entity(c, acct, kind, eid) if eid else None
-    cached = g.ads_history_new.get((kind, str(eid))) if eid else None
+    cached = state.ads_history_new.get((kind, str(eid))) if eid else None
     known = known or cached
     if not creating and not known:
         raise repo.HistoryError('实体不属于当前广告账户或尚未同步，未发送操作', 404)
@@ -69,11 +72,11 @@ def _owner(c, acct, kind, eid, item, creating):
         if value and item.get(field) and str(item[field]) != value:
             raise repo.HistoryError('写入实体父级不一致，未发送操作', 409)
     if creating and kind != 'CAMPAIGN':
-        parent = repo.entity(c, acct, 'CAMPAIGN', campaign) or g.ads_history_new.get(('CAMPAIGN', campaign))
+        parent = repo.entity(c, acct, 'CAMPAIGN', campaign) or state.ads_history_new.get(('CAMPAIGN', campaign))
         if not parent:
             raise repo.HistoryError('新建对象的活动不属于当前广告账户', 404)
         if group:
-            pg = repo.entity(c, acct, 'AD_GROUP', group) or g.ads_history_new.get(('AD_GROUP', group))
+            pg = repo.entity(c, acct, 'AD_GROUP', group) or state.ads_history_new.get(('AD_GROUP', group))
             if not pg or str(pg['campaign_id']) != campaign:
                 raise repo.HistoryError('新建对象的广告组不属于当前活动', 404)
     return known or {}, campaign, group
@@ -115,6 +118,10 @@ def _changes(item, known, creating):
 
 
 def begin(acct, resource, method, path, payload):
+    """提交前逐项写原广告历史，保留实际执行人以及可选AI任务/人工发起上下文。"""
+    state = operation_identity.ads_state()
+    actor = operation_identity.user()
+    proof = operation_identity.metadata()
     kind, key, id_key = RESOURCES[resource]
     deleting = path.endswith('/delete')
     creating = method == 'POST' and not deleting
@@ -125,8 +132,8 @@ def begin(acct, resource, method, path, payload):
         items = payload.get(key)
     if not isinstance(items, list) or not items or len(items)>1000:
         raise repo.HistoryError('无法审计无效的广告写入批次，未发送操作')
-    g.ads_history_calls += 1
-    call_index = g.ads_history_calls
+    state.ads_history_calls += 1
+    call_index = state.ads_history_calls
     started = repo.now_ms()
     plans = []
     with repo.transaction() as c:
@@ -148,10 +155,10 @@ def begin(acct, resource, method, path, payload):
                        'entity_name': str(name)[:600], 'change_type': change, 'previous_value': before,
                        'new_value': after, 'metadata': metadata, 'source': 'ERP', 'sync_status': 'pending',
                        'write_status': 'requesting', 'event_time_ms': started, 'local_started_ms': started,
-                       'request_key': g.ads_history_request_key, 'local_before': before, 'local_after': after,
-                       'local_payload': safe_payload, 'operator_id': g.user_id,
-                       'operator_name': str(request.current_user.get('username') or '')[:100],
-                       'local_key': repo.digest([g.user_id, g.ads_history_request_key, call_index, index, change, metadata])}
+                       'request_key': state.ads_history_request_key, 'local_before': before, 'local_after': after,
+                       'local_payload': safe_payload, 'operator_id': actor['id'], 'audit_context_json': proof,
+                       'operator_name': str((actor.get('nickname') or actor.get('username')) if proof else actor.get('username') or '')[:100],
+                       'local_key': repo.digest([actor['id'], state.ads_history_request_key, call_index, index, change, metadata])}
                 ids.append(repo.insert_local(c, row))
             plans.append({'index': index, 'ids': ids, 'item': item, 'eid': eid, 'kind': kind, 'id_key': id_key,
                           'campaign': campaign, 'group': group, 'creating': creating})
@@ -190,6 +197,8 @@ def _response_id(entry, id_key):
 
 
 def finish(acct, resource, plans, response=None, error=None):
+    """保存逐项平台结果并关联既有事件，不修改实际执行人或伪造平台成功。"""
+    state = operation_identity.ads_state()
     key = RESOURCES[resource][1]
     outcome = results(response, key, plans) if response is not None else {}
     accepted = 0
@@ -219,7 +228,7 @@ def finish(acct, resource, plans, response=None, error=None):
                 accepted += 1
                 accepted_entities.append((plan['kind'], eid))
                 if plan['creating']:
-                    g.ads_history_new[(plan['kind'], eid)] = {**plan['item'], 'campaign_id': campaign,
+                    state.ads_history_new[(plan['kind'], eid)] = {**plan['item'], 'campaign_id': campaign,
                                                             'ad_group_id': group, 'entity_name': plan['item'].get('name', '')}
             if campaign and status != 'failed':
                 repo.mark_dirty(c, {**acct, 'scope': 'group' if group else 'campaign', 'campaign_id': campaign, 'ad_group_id': group})
@@ -229,17 +238,22 @@ def finish(acct, resource, plans, response=None, error=None):
             for raw in repo.reconcile(c, acct, kind, eid):
                 event = normalize_event(c, {**acct, 'scope': 'shop', 'campaign_id': None, 'ad_group_id': None}, raw, 0, repo.now_ms()+1000)
                 repo.save_event(c, acct, event, allow_merge=True)
-        g.ads_history_accepted += accepted
+        state.ads_history_accepted += accepted
     return accepted == len(plans)
 
 
 def instrument(client, shop):
-    if not has_request_context() or not g.get('ads_history_active'):
+    """为认证人工或显式后台AI真实写入挂原广告审计，模拟执行不会调用本包装。"""
+    if not operation_identity.explicit() and (not has_request_context() or not g.get('ads_history_active')):
+        return client
+    if getattr(client, '_ads_history_instrumented', False) is True:
         return client
     acct = {k: shop.get(k) for k in ('credential_group_id', 'region', 'marketplace_id')}
     acct.update(shop_id=shop['id'], profile_id=str(shop['ads_profile_id']), region=shop['region'].lower())
     original = client._request
     def audited(method, path, *args, **kwargs):
+        """在原广告调用前留意图、后记回执；上下文不能随任务结束泄漏给人工。"""
+        state = operation_identity.ads_state()
         parts = path.strip('/').split('/')
         resource = parts[1] if len(parts)>=2 and parts[0]=='sp' else None
         writing = resource in RESOURCES and (len(parts)==2 and method in ('PUT', 'POST') or len(parts)==3 and parts[2]=='delete' and method=='POST')
@@ -256,20 +270,21 @@ def instrument(client, shop):
             result = original(method, path, *args, **kwargs)
         except Exception as exc:
             try: finish(acct, resource, plans, error=exc)
-            except Exception: g.ads_history_warning = '写入结果及本地历史待核实，请勿重复提交'
+            except Exception: state.ads_history_warning = '写入结果及本地历史待核实，请勿重复提交'
             raise
         try:
             all_success = finish(acct, resource, plans, response=result)
         except repo.HistoryError:
             # 响应索引/结构不可信时不能放行旧路由更新缓存并显示成功。
-            g.ads_history_warning = '平台返回结果无法逐项核实，请先同步，不要重复提交'
+            state.ads_history_warning = '平台返回结果无法逐项核实，请先同步，不要重复提交'
             raise
         except Exception:
             # 平台已经返回；历史补写失败不能把广告操作伪装成未发送。
-            g.ads_history_warning = '平台已返回结果，但历史保存待核实；请先同步，不要重复操作'
+            state.ads_history_warning = '平台已返回结果，但历史保存待核实；请先同步，不要重复操作'
             return result
-        if not all_success and not g.get('ads_creation_partial_results', False) and 'Negative' not in resource and not resource.startswith('negative'):
+        if not all_success and not state.get('ads_creation_partial_results', False) and 'Negative' not in resource and not resource.startswith('negative'):
             raise repo.HistoryError('平台部分操作失败或结果待确认，请先同步核实，不要整批重试', 502)
         return result
     client._request = audited
+    client._ads_history_instrumented = True
     return client

@@ -137,23 +137,26 @@ def day_bounds(day, tz):
 def effective_time(day, tz, now=None):
     """校验常规交接日期并返回该日站点零点对应UTC。
 
-    day必须晚于站点今天且不超过90天；now可注入无tzinfo的UTC供验证。
+    day不得早于北京时间15点政策的最早交接日，且不超过北京时间今天后90天。
     不允许经常规分配接口追溯修改过去，非法日期抛出业务异常。"""
+    from .assignment_policy import default_date, beijing_now
     now = now or utc_now()
-    today = now.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(tz)).date()
-    if day <= today:
-        raise DomainError('常规分配只能从站点次日或更晚的零点生效')
+    today = beijing_now(now).date()
+    earliest = default_date(now)
+    if day < earliest:
+        raise DomainError(f'按北京时间15:00交接规则，最早从 {earliest.isoformat()} 生效；请重新预览')
     if day > today + timedelta(days=90):
-        raise DomainError('交接日期不能超过站点当前日期后 90 天')
+        raise DomainError('交接日期不能超过北京时间当前日期后 90 天')
     return day_bounds(day, tz)[0]
 
 
 def next_business_date(tz, now=None):
-    """返回指定时区tz的明天日期字符串。
+    """返回负责人交接政策的默认日期字符串，保留时区参数供现有调用方兼容。
 
-    now按UTC解释；用于分配未填写日期时冻结默认次日，不写归属。"""
-    now = now or utc_now()
-    return (now.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(tz)).date() + timedelta(days=1)).isoformat()
+    now按UTC解释；北京时间15点前+1日、15点起+2日，不写归属。"""
+    from .assignment_policy import default_date
+    ZoneInfo(tz)
+    return default_date(now).isoformat()
 
 
 def identity(shop_id, marketplace_id, sku):

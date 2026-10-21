@@ -12,7 +12,7 @@ def candidates(cursor):
     """查询users中status=1的候选负责人，按ID返回用户记录列表。
 
     使用调用方cursor只读；用户是否能分配由HTTP权限控制，不在此处授权。"""
-    cursor.execute('SELECT id, username, nickname, status FROM users WHERE status = 1 ORDER BY id')
+    cursor.execute('SELECT id, username, nickname, status, account_type FROM users WHERE status = 1 ORDER BY id')
     return cursor.fetchall()
 
 

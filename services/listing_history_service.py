@@ -1,4 +1,7 @@
-"""只记录ERP认证请求发起的Listing写操作，历史与平台生效状态严格分开。"""
+"""记录认证人工或显式AI身份的Listing真实写操作，历史与平台生效状态严格分开。
+
+模拟执行不调用本模块；后台真实适配须建立operation_identity.ai_operation上下文。
+"""
 import copy
 import json
 import uuid
@@ -10,6 +13,7 @@ import requests
 from flask import has_request_context, request
 
 from services.mysql_service import get_db_connection
+from services import operation_identity
 
 TABLE = 'amazon_listing_change_history'
 OPERATIONS = {'price', 'text', 'images', 'variants', 'create', 'update', 'delete'}
@@ -116,25 +120,29 @@ def changes_for(method, body, attrs, market, known):
 
 
 def begin(ctx, sku, method, body, snapshot):
-    user = request.current_user
-    operation = {'submit_listing_pricing': 'price', 'listing_text_editor': 'text', 'listing_image_editor': 'images',
-                 'sync_fields_to_variants': 'variants', 'create_listing': 'create', 'delete_listing': 'delete'}.get(request.endpoint.rsplit('.', 1)[-1], 'update')
+    """提交前保存原业务日志，执行人来自认证人工或显式AI，同时保留AI任务与人工来源。"""
+    user = operation_identity.user()
+    explicit = operation_identity.explicit()
+    endpoint = (request.endpoint or '') if has_request_context() else ''
+    operation = explicit['operation_type'] if explicit else {'submit_listing_pricing': 'price', 'listing_text_editor': 'text', 'listing_image_editor': 'images',
+                 'sync_fields_to_variants': 'variants', 'create_listing': 'create', 'delete_listing': 'delete'}.get(endpoint.rsplit('.', 1)[-1], 'update')
     attrs, source = snapshot if snapshot else cached_before(ctx, sku)
     changes = changes_for(method, body, attrs, ctx['marketplace_id'], source != 'unavailable')
     encoded = dumps(changes)
     if len(encoded.encode('utf-8')) > 2 * 1024 * 1024:
         raise HistoryError('本次修改记录过大，未向Amazon提交，请分批修改', 400)
-    source_sku = (request.view_args or {}).get('sku') if operation == 'variants' else None
+    source_sku = (request.view_args or {}).get('sku') if operation == 'variants' and has_request_context() else None
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute('''INSERT INTO amazon_listing_change_history
                 (operation_id,shop_id,credential_group_id,region,marketplace_id,sku,source_sku,operation_type,
-                 actor_user_id,actor_name,http_method,before_source,change_summary,changes_json,requested_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(3))''',
+                 actor_user_id,actor_name,http_method,before_source,change_summary,changes_json,audit_context_json,requested_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(3))''',
                 (uuid.uuid4().hex,ctx['shop_id'],ctx['credential_group_id'],ctx['region'],ctx['marketplace_id'],sku,source_sku,operation,
                  user['id'],str(user.get('nickname') or user.get('username') or f"用户#{user['id']}")[:255],method,source,
-                 '、'.join(dict.fromkeys(change['label'] for change in changes))[:1000] or 'Listing修改',encoded))
+                 '、'.join(dict.fromkeys(change['label'] for change in changes))[:1000] or 'Listing修改',encoded,
+                 dumps(operation_identity.metadata()) if explicit else None))
             row_id = cursor.lastrowid
         connection.commit()
         return row_id
@@ -172,15 +180,17 @@ def finish(row_id, result=None, error=None):
 
 
 def instrument(client, shop):
-    """仅认证Listing网页请求启用；客户端只包装一次，不影响cron或其他SP接口。"""
-    if (not has_request_context() or not getattr(request, 'current_user', None) or
-            not (request.endpoint or '').startswith('amazon_listing.') or getattr(client, '_listing_history_instrumented', False) is True):
+    """认证Listing网页或显式AI真实执行启用；普通cron读同步和模拟接口不触发。"""
+    manual = (has_request_context() and getattr(request, 'current_user', None) and
+              (request.endpoint or '').startswith('amazon_listing.'))
+    if ((not manual and not operation_identity.explicit()) or getattr(client, '_listing_history_instrumented', False) is True):
         return client
     ctx = identity(shop, client)
     original = client._request
     prefix = '/listings/2021-08-01/items/' + client.seller_id + '/'
     snapshots = {}
     def audited(method, path, *args, **kwargs):
+        """在真实Listing写入前后留痕，读取保存前值；不执行模拟操作。"""
         if not path.startswith(prefix) or not path[len(prefix):]: return original(method, path, *args, **kwargs)
         sku = path[len(prefix):]
         if method not in ('PATCH', 'PUT', 'DELETE'):
@@ -214,7 +224,8 @@ def instrument(client, shop):
 
 def confirm(ctx, result, history_id=None):
     """只更新当前已验签回执的原操作，不调用Amazon，不插入历史。"""
-    if not has_request_context() or not getattr(request, 'current_user', None) or not result.get('submission_id') or not history_id: return result
+    authenticated = operation_identity.explicit() or (has_request_context() and getattr(request, 'current_user', None))
+    if not authenticated or not result.get('submission_id') or not history_id: return result
     connection = None
     try:
         connection = get_db_connection()
@@ -239,6 +250,7 @@ def utc_iso(value):
 
 
 def query(shop_id, sku, params, row_id=None):
+    """只读返回指定Listing历史与AI来源，详情原值不触发平台或付费请求。"""
     from services.shop_service import get_shop_by_id
     shop = get_shop_by_id(shop_id)
     if not shop: raise HistoryError('店铺不存在或已停用', 404)
@@ -266,14 +278,16 @@ def query(shop_id, sku, params, row_id=None):
                 row['changes'] = json.loads(row.pop('changes_json'))
                 row['issues'] = json.loads(row.pop('issues_json') or '[]')
                 row['verification'] = json.loads(row.pop('verification_json') or '{}')
+                row['audit_context'] = json.loads(row.pop('audit_context_json') or 'null')
                 for key in ('requested_at','responded_at','verified_at'): row[key] = utc_iso(row[key])
                 return row
             cursor.execute('SELECT COUNT(*) AS total FROM ' + TABLE + ' WHERE ' + where, values)
             total = cursor.fetchone()['total']
             cursor.execute('''SELECT id,operation_type,actor_name,source_sku,before_source,change_summary,write_status,
-                verification_status,submission_id,error_message,requested_at,responded_at,verified_at FROM ''' + TABLE + ' WHERE ' + where + ' ORDER BY id DESC LIMIT %s OFFSET %s', values + [size,(page-1)*size])
+                verification_status,submission_id,error_message,requested_at,responded_at,verified_at,audit_context_json FROM ''' + TABLE + ' WHERE ' + where + ' ORDER BY id DESC LIMIT %s OFFSET %s', values + [size,(page-1)*size])
             rows = cursor.fetchall()
             for row in rows:
+                row['audit_context'] = json.loads(row.pop('audit_context_json') or 'null')
                 for key in ('requested_at','responded_at','verified_at'): row[key] = utc_iso(row[key])
             return {'list': rows, 'total': total, 'page': page, 'page_size': size}
     except pymysql.err.ProgrammingError as exc:

@@ -4,6 +4,8 @@ URL前缀/api/amazon；候选/列表/预览/提交/取消需assign权限，两�
 业务交给listing_performance.ownership_service，事务和并发由Service处理。
 domain_response也被绩效路由复用，统一总开关、安全JSON和业务错误响应；
 本文件不直接实现负责区间SQL、利润计算或外部同步。
+默认交接按固定北京时间15:00：2026-10-26 14:00变更→27日，15:00变更→28日；
+共用assignment_policy，不按浏览器或美国夏令时改变15点分界。
 """
 from functools import wraps
 from flask import Blueprint, Response, jsonify, request
@@ -74,7 +76,7 @@ def assignment_list():
 def preview():
     """POST /listing-assignments/preview返回签名预览及子SKU影响范围。
 
-    JSON包含身份、操作、目标负责人和日期，默认次日由Service冻结；只读不交接。"""
+    JSON包含身份、操作、目标负责人和日期，默认按北京时间15点政策冻结；只读不交接。"""
     return service.preview(request.current_user['id'], request.get_json(silent=True))
 
 

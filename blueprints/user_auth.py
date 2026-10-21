@@ -101,7 +101,7 @@ def get_user_by_token(token):
                        avatar, email, phone, bio,
                        last_login_at, created_at
                 FROM users
-                WHERE login_token = %s AND token_expire > NOW() AND status = 1
+                WHERE login_token = %s AND token_expire > NOW() AND status = 1 AND account_type = 'human'
             """, (token,))
             return cursor.fetchone()
     finally:
@@ -229,7 +229,7 @@ def user_login():
             with conn.cursor() as cursor:
                 # 查询用户
                 cursor.execute("""
-                    SELECT id, uuid, username, nickname, password, status,
+                    SELECT id, uuid, username, nickname, password, status, account_type,
                            avatar, email, phone, bio
                     FROM users WHERE username = %s
                 """, (username,))
@@ -238,6 +238,8 @@ def user_login():
                 if not user:
                     return jsonify({"status": "error", "message": "用户名或密码错误"}), 401
 
+                if user['account_type'] != 'human':
+                    return jsonify({"status": "error", "message": "AI 系统账号不支持登录"}), 403
                 if user['status'] != 1:
                     return jsonify({"status": "error", "message": "账号已被禁用"}), 403
 

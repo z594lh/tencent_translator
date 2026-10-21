@@ -22,6 +22,8 @@ from services.permissions_service import (
     delete_menu,
 )
 from blueprints.user_auth import login_required
+from services import operator_accounts
+from services.listing_performance.common import DomainError
 
 permissions_bp = Blueprint('permissions', __name__, url_prefix='/api')
 
@@ -351,33 +353,29 @@ def update_role_perm_list(role_id):
 @login_required
 @require_permission('system:user_manage')
 def list_users():
-    """获取用户列表（含角色信息）"""
+    """按搜索条件分页获取人员及AI类型，账号查询不返回凭证。"""
     try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT id, uuid, username, nickname, avatar, email, phone,
-                           status, last_login_at, created_at
-                    FROM users ORDER BY id
-                """)
-                users = cursor.fetchall()
+        return jsonify(status='success',data=operator_accounts.listing(request.args))
+    except DomainError as exc:
+        return jsonify(status='error',message=str(exc)),exc.status
+    except Exception:
+        return jsonify(status='error',message='读取人员失败，请核对账号类型迁移'),503
 
-                for u in users:
-                    cursor.execute("""
-                        SELECT r.id, r.name, r.code
-                        FROM roles r
-                        INNER JOIN user_roles ur ON r.id = ur.role_id
-                        WHERE ur.user_id = %s AND r.status = 1
-                    """, (u['id'],))
-                    u['roles'] = cursor.fetchall()
 
-                return jsonify({"status": "success", "data": users})
-        finally:
-            conn.close()
-    except Exception as e:
-        print(f"[Permissions] 获取用户列表异常: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+@permissions_bp.route('/users', methods=['POST'])
+@login_required
+@require_permission('system:user_manage')
+def create_user():
+    """由人员管理员创建普通或不可登录的 AI 账号；不自动分配角色和业务权限。"""
+    if request.content_length is None or request.content_length > 8192:
+        return jsonify(status='error', message='新增人员请求为空或超过8KB'), 400
+    try:
+        data = operator_accounts.create(request.get_json(silent=True), request.current_user['id'])
+        return jsonify(status='success', data=data, message='人员已创建'), 201
+    except DomainError as exc:
+        return jsonify(status='error', message=str(exc)), exc.status
+    except Exception:
+        return jsonify(status='error', message='创建人员失败，请检查账号类型迁移是否已执行'), 503
 
 
 @permissions_bp.route('/users/<int:user_id>/roles', methods=['PUT'])

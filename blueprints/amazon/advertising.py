@@ -24,6 +24,7 @@ from services.mysql_service import get_db_connection
 from services.cron_tasks.execution import resource_guard
 from services.shop_service import get_shop_by_id
 from services.credential_service import get_ads_app_credentials
+from services import ads_report_provenance as provenance
 advertising_bp = Blueprint('advertising', __name__, url_prefix='/api')
 
 
@@ -306,12 +307,18 @@ def _map_row(api_row):
     return db
 
 
-def _write_raw_reports(cursor, shop_id, report_type, rows):
+def _write_raw_reports(cursor, shop_id, report_type, rows, report_import_id=None, currency=None, provenance_enabled=None):
     """幂等写入 amazon_ads_raw_reports（哈希去重）"""
     inserted = 0
     updated = 0
     if not rows:
         return 0, 0
+    if provenance_enabled is None:
+        provenance_enabled = provenance.schema_ready(cursor)
+    extra_column = ',report_import_id' if provenance_enabled else ''
+    extra_value = ',%s' if provenance_enabled else ''
+    extra_update = ',report_import_id=VALUES(report_import_id)' if provenance_enabled else ''
+    currency_update = 'currency=VALUES(currency),' if currency else ''
     for row in rows:
         m = _map_row(row)
         # 计算行指纹: 所有唯一维度列拼接后 SHA-256
@@ -330,7 +337,7 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
         ])
         row_hash = hashlib.sha256(hash_src.encode("utf-8")).hexdigest()
 
-        cursor.execute("""
+        cursor.execute(f"""
             INSERT INTO amazon_ads_raw_reports (
                 shop_id, report_date, report_type,
                 campaign_id, campaign_name, campaign_status, campaign_budget, campaign_budget_type,
@@ -344,8 +351,8 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
                 purchases_7d, purchases_14d, purchases_30d,
                 sales_7d, sales_14d, sales_30d,
                 top_of_search_impression_share,
-                row_hash
-            ) VALUES (%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s, %s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s, %s)
+                currency,row_hash{extra_column}
+            ) VALUES (%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s, %s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s, %s,%s{extra_value})
             ON DUPLICATE KEY UPDATE
                 campaign_name = VALUES(campaign_name),
                 campaign_status = VALUES(campaign_status),
@@ -372,7 +379,7 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
                 sales_14d = VALUES(sales_14d),
                 sales_30d = VALUES(sales_30d),
                 top_of_search_impression_share = VALUES(top_of_search_impression_share),
-                updated_at = NOW()
+                {currency_update} updated_at = NOW(){extra_update}
         """, (
             shop_id, m["report_date"], report_type,
             str(m.get("campaign_id","") or ""), str(m.get("campaign_name","") or ""),
@@ -387,7 +394,8 @@ def _write_raw_reports(cursor, shop_id, report_type, rows):
             int(m.get("purchases_7d",0) or 0), int(m.get("purchases_14d",0) or 0), int(m.get("purchases_30d",0) or 0),
             float(m.get("sales_7d",0) or 0), float(m.get("sales_14d",0) or 0), float(m.get("sales_30d",0) or 0),
             _safe_decimal(m.get("top_of_search_impression_share")),
-            row_hash,
+            currency or 'USD', row_hash,
+            *([report_import_id] if provenance_enabled else []),
         ))
         if cursor.rowcount == 1: inserted += 1
         else: updated += 1
@@ -460,21 +468,24 @@ def _report_cache_set(shop_id, report_type_key, report_date, report_id, status="
             c.execute(
                 "INSERT INTO amazon_ads_report_cache (shop_id, report_type, report_date, report_id, status, insert_flag) "
                 "VALUES (%s,%s,%s,%s,%s, 0) "
-                "ON DUPLICATE KEY UPDATE report_id=VALUES(report_id), status=VALUES(status), updated_at=NOW()",
+                "ON DUPLICATE KEY UPDATE "
+                "insert_flag=IF(report_id<>VALUES(report_id),0,insert_flag), "
+                "created_at=IF(report_id<>VALUES(report_id),NOW(),created_at), "
+                "report_id=VALUES(report_id), status=VALUES(status), updated_at=NOW()",
                 (shop_id, report_type_key, report_date, report_id, status))
         conn.commit()
     finally:
         conn.close()
 
 
-def _cache_set_insert_flag(shop_id, report_type, report_date, flag):
+def _cache_set_insert_flag(shop_id, report_type, report_date, flag, report_id=None):
     """更新 insert_flag"""
     conn = get_db_connection()
     try:
         with conn.cursor() as c:
             c.execute("UPDATE amazon_ads_report_cache SET insert_flag=%s, updated_at=NOW() "
-                       "WHERE shop_id=%s AND report_type=%s AND report_date=%s",
-                       (flag, shop_id, report_type, report_date))
+                       "WHERE shop_id=%s AND report_type=%s AND report_date=%s" + (' AND report_id=%s' if report_id else ''),
+                       (flag, shop_id, report_type, report_date, *([report_id] if report_id else [])))
         conn.commit()
     finally:
         conn.close()
@@ -563,31 +574,24 @@ def _build_report_body(cfg, report_type_key, start_date, end_date):
     }
 
 
-def _write_report_result(shop_id, report_type_key, cfg, date_str, report_id, rows, force_refresh=False):
+def _write_report_result(shop_id, report_type_key, cfg, date_str, report_id, rows, force_refresh=False, evidence=None):
     """写入已下载报告数据到数据库，返回结果字典
     
     force_refresh=True 时先 DELETE 该日期该类型的旧数据，再插入（防止字段缺失/值变更导致 ON DUPLICATE 漏更新）
     """
-    result = {"report_type": report_type_key, "rows": len(rows), "inserted": 0, "updated": 0, "error": None}
-    if rows:
-        if report_type_key == "spCampaignsPlacement":
-            rows = _aggregate_placement_rows(rows)
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if force_refresh:
-                    c.execute("DELETE FROM amazon_ads_raw_reports WHERE shop_id=%s AND report_date=%s AND report_type=%s",
-                              (shop_id, date_str, report_type_key))
-                ins, upd = _write_raw_reports(c, shop_id, report_type_key, rows)
-            conn.commit()
-            result["inserted"], result["updated"] = ins, upd
-        except Exception as e:
-            result["error"] = str(e)
-            return result
-        finally:
-            conn.close()
-    if report_id:
-        _report_cache_set(shop_id, report_type_key, date_str, report_id, "COMPLETED")
+    result = {"report_type": report_type_key, "rows": len(rows) if isinstance(rows, list) else 0, "inserted": 0, "updated": 0, "error": None}
+    if not isinstance(rows, list) or any(not isinstance(r, dict) or r.get('date') != str(date_str) for r in rows):
+        result['error'] = '报告内容含非预期日期或结构，未写入数据'
+        return result
+    if report_type_key == "spCampaignsPlacement":
+        rows = _aggregate_placement_rows(rows)
+    try:
+        ins, upd = provenance.import_report(shop_id, report_type_key, date_str, report_id, rows,
+            writer=_write_raw_reports, force_refresh=force_refresh, evidence=evidence, source_count=result['rows'])
+        result['inserted'], result['updated'] = ins, upd
+    except Exception as error:
+        result['error'] = provenance.failure_hint(error)
+        return result
     print(f"[Ads Sync] shop={shop_id} {report_type_key}: {len(rows)} rows ({result['inserted']} new)")
     return result
 
@@ -693,6 +697,12 @@ def download_ads_reports(shop_id, date_str=None, force_refresh=False):
         print(f"[Ads Download] {date_str}: no pending reports")
         return result
 
+    try:
+        source_context = provenance.context(shop_id, client)
+    except provenance.EvidenceError as error:
+        result['errors'].append({'type': 'account_identity', 'error': str(error)})
+        return result
+
     for row in cached_rows:
         key = row['report_type']
         report_id = row['report_id']
@@ -707,26 +717,30 @@ def download_ads_reports(shop_id, date_str=None, force_refresh=False):
             if state == "COMPLETED":
                 url = status.get("url")
                 if url:
+                    source_metadata = provenance.metadata(status, report_id, cfg, key, date_str) if source_context else None
                     print(f"[Ads Download] -> {key} COMPLETED, downloading...")
                     rows = client._download_report_content(url)
-                    r = _write_report_result(shop_id, key, cfg, date_str, report_id, rows, force_refresh=force_refresh)
+                    evidence = {'context': source_context, 'metadata': source_metadata} if source_context else None
+                    r = _write_report_result(shop_id, key, cfg, date_str, report_id, rows, force_refresh=force_refresh, evidence=evidence)
                     if not r["error"]:
-                        _cache_set_insert_flag(shop_id, key, date_str, 1)
                         result["downloaded"].append(key)
                         result["total_rows"] += r["rows"]
                         _maybe_insert_rebuild_task(shop_id, date_str)
+                    else:
+                        result['errors'].append({'type': key, 'error': r['error']})
 
             elif state in ("PENDING", "PROCESSING"):
                 result["pending"].append(key)
 
             elif state in ("FAILURE", "CANCELLED"):
                 print(f"[Ads Download] -> {key} {state}")
-                _cache_set_insert_flag(shop_id, key, date_str, 2)
+                _cache_set_insert_flag(shop_id, key, date_str, 2, report_id=report_id)
                 result["errors"].append({"type": key, "error": f"Report {state}"})
 
         except Exception as e:
-            print(f"[Ads Download] -> {key} ERROR: {e}")
-            result["errors"].append({"type": key, "error": str(e)})
+            hint = provenance.failure_hint(e)
+            print(f"[Ads Download] -> {key} ERROR: {hint}")
+            result["errors"].append({"type": key, "error": hint})
 
     print(f"[Ads Download] {date_str}: downloaded={len(result['downloaded'])} pending={len(result['pending'])} errors={len(result['errors'])}")
     return result

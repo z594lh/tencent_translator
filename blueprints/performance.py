@@ -105,6 +105,7 @@ def config():
     先检查核心表可读，再读取sku_profit每店最早/最晚日报用于默认15天。
     仅返回时区/币种，绝不返回签名密钥；独立只读连接关闭，不迁移或生成。"""
     from services.listing_performance.common import market_config, configured_marketplaces
+    from services.listing_performance.assignment_policy import default_date, DESCRIPTION
     configured = configured_marketplaces()
     from services.mysql_service import get_db_connection
     conn = get_db_connection()
@@ -122,6 +123,7 @@ def config():
                 shop['sku_report_date_to'] = coverage['last']
         codes = permissions()
         return {'direct_sku_report':True,
+                'assignment_policy': {'default_date': default_date().isoformat(), 'description': DESCRIPTION},
                 'analysis_access': {'user_id': request.current_user['id'],
                     'self': 'performance:analysis_self' in codes and bool(codes.intersection({'performance:view_self','performance:view_all'})),
                     'ads': 'performance:analysis_ads' in codes,

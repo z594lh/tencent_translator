@@ -98,6 +98,7 @@ def safe_issues(issues):
 
 
 def read(client, ctx):
+    """读取指定报价受众；人工编辑默认ALL，托管明确指定B2B时不得替换普通价。"""
     raw = client.get_listings_item(ctx['sku'], included_data=['summaries', 'attributes', 'issues', 'offers'])
     if not isinstance(raw, dict) or raw.get('sku') != ctx['sku']:
         raise PricingError('平台返回的SKU不一致，未执行操作', 502)
@@ -107,9 +108,11 @@ def read(client, ctx):
     offers = (raw.get('attributes') or {}).get('purchasable_offer') or []
     if not isinstance(offers, list) or any(not isinstance(row, dict) for row in offers):
         raise PricingError('平台价格结构异常，未执行操作', 502)
-    primary = [row for row in offers if row.get('marketplace_id') == ctx['marketplace_id'] and row.get('audience', 'ALL') == 'ALL']
+    audience = ctx.get('audience', 'ALL')
+    if audience not in ('ALL', 'B2B'): raise PricingError('报价受众无效')
+    primary = [row for row in offers if row.get('marketplace_id') == ctx['marketplace_id'] and row.get('audience', 'ALL') == audience]
     if len(primary) != 1 or not primary[0].get('currency'):
-        raise PricingError('当前站点没有唯一普通报价，不能使用企业价代替，请在Amazon核对', 409)
+        raise PricingError('当前站点没有唯一指定受众报价，不能使用其他报价代替，请在Amazon核对', 409)
     offer = primary[0]
     snapshot = {key: ctx[key] for key in ('shop_id', 'sku', 'marketplace_id', 'region', 'credential_group_id')}
     snapshot.update(currency=offer['currency'], product_type=summaries[0]['productType'],
@@ -190,10 +193,11 @@ def canonical(value):
 
 
 def preserved(offers, ctx, changed):
+    """对目标受众以外及未修改的报价字段计算摘要，避免ALL/B2B互相覆盖。"""
     result = copy.deepcopy(offers)
     for row in result:
         row.setdefault('audience', 'ALL')
-        if row.get('marketplace_id') == ctx['marketplace_id'] and row.get('audience', 'ALL') == 'ALL':
+        if row.get('marketplace_id') == ctx['marketplace_id'] and row.get('audience', 'ALL') == ctx.get('audience', 'ALL'):
             for key in changed: row.pop(key, None)
     return digest(sorted(canonical(result), key=lambda row: (row.get('marketplace_id', ''), row.get('audience', 'ALL'), row.get('currency', ''))))
 

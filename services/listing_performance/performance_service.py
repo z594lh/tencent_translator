@@ -172,7 +172,8 @@ def owner_options(params, owner=None):
             validate_shop(cursor,shop,market)
             condition = ' AND h.owner_user_id=%s' if owner is not None else ''
             cursor.execute('''SELECT DISTINCT h.owner_user_id AS id,
-                COALESCE(NULLIF(u.nickname,''),u.username,CONCAT('用户 ',h.owner_user_id)) AS name
+                COALESCE(NULLIF(u.nickname,''),u.username,CONCAT('用户 ',h.owner_user_id)) AS name,
+                COALESCE(u.account_type,'human') account_type
                 FROM listing_responsibility_history h
                 JOIN listing_responsibility_scopes s ON s.id=h.scope_id
                 LEFT JOIN users u ON u.id=h.owner_user_id
@@ -216,7 +217,7 @@ def query(params, owner=None, show_costs=False):
             now = utc_now()
             scope_condition = ' AND h.owner_user_id=%s' if owner is not None else ''
             cursor.execute('''SELECT h.owner_user_id,s.id AS scope_id,h.effective_from_utc,h.effective_to_utc,
-                COALESCE(NULLIF(u.nickname,''),u.username) AS owner_name,
+                COALESCE(NULLIF(u.nickname,''),u.username) AS owner_name,COALESCE(u.account_type,'human') account_type,
                 EXISTS(SELECT 1 FROM amazon_listings l WHERE l.shop_id=s.shop_id
                     AND l.marketplace_id COLLATE utf8mb4_unicode_ci=s.marketplace_id COLLATE utf8mb4_unicode_ci
                     AND BINARY l.sku=BINARY s.seller_sku AND l.is_deleted=0
@@ -227,7 +228,7 @@ def query(params, owner=None, show_costs=False):
                            (shop,market,*([owner] if owner is not None else [])))
             counts = {}
             for h in cursor.fetchall():
-                count = counts.setdefault(h['owner_user_id'],{'current':set(),'period':set(),'owner_name':h['owner_name']})
+                count = counts.setdefault(h['owner_user_id'],{'current':set(),'period':set(),'owner_name':h['owner_name'],'account_type':h['account_type']})
                 if h['listing_active'] and h['effective_from_utc']<=now and (h['effective_to_utc'] is None or now<h['effective_to_utc']):
                     count['current'].add(h['scope_id'])
                 if h['effective_from_utc']<finish and (h['effective_to_utc'] is None or h['effective_to_utc']>begin):
@@ -244,6 +245,7 @@ def query(params, owner=None, show_costs=False):
                                     **{name:None for name in AMOUNTS}})
             for row in summary:
                 count=counts.get(row['owner_user_id'],{})
+                row['account_type']=count.get('account_type','human')
                 row['current_listing_count']=len(count.get('current',[]))
                 row['period_listing_count']=len(count.get('period',[]))
             order_index = order_counts.read(cursor,shop,market,first,last,config,basis,

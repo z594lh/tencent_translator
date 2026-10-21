@@ -111,12 +111,13 @@ def mark_dirty(c, ctx):
 
 
 def insert_local(c, row):
+    """保存原ERP广告留痕及可选AI来源，不改变平台事件匹配与合并口径。"""
     fields = ['shop_id', 'credential_group_id', 'region', 'marketplace_id', 'profile_id', 'campaign_id',
               'ad_group_id', 'entity_type', 'entity_id', 'entity_name', 'change_type', 'previous_value',
               'new_value', 'metadata', 'source', 'sync_status', 'write_status', 'event_time_ms', 'local_key',
               'request_key', 'local_before', 'local_after', 'local_payload', 'local_started_ms',
-              'operator_id', 'operator_name']
-    json_fields = {'previous_value', 'new_value', 'metadata', 'local_before', 'local_after', 'local_payload'}
+              'operator_id', 'operator_name', 'audit_context_json']
+    json_fields = {'previous_value', 'new_value', 'metadata', 'local_before', 'local_after', 'local_payload', 'audit_context_json'}
     values = [dumps(row.get(k)) if k in json_fields else row.get(k) for k in fields]
     c.execute(f'''INSERT INTO amazon_ads_history ({','.join(fields)},created_at,updated_at)
                   VALUES ({','.join(['%s'] * len(fields))},UTC_TIMESTAMP(),UTC_TIMESTAMP())''', values)

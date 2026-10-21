@@ -124,7 +124,7 @@ def query(params, now=None):
             'operator_name': row['operator_name'], 'local_started_ms': row['local_started_ms'],
             'platform_time_ms': row['platform_time_ms'], 'match_method': row['match_method'],
             'error_message': row['error_message'], 'local_before': repo.loads(row['local_before']),
-            'local_after': repo.loads(row['local_after'])})
+            'local_after': repo.loads(row['local_after']), 'audit_context': repo.loads(row.get('audit_context_json'))})
         output[-1]['display'] = ads_display.history_display(output[-1], tz_name)
     success = max([s['last_success_ms'] or 0 for s in states] or [0])
     state = max(states, key=lambda s: max(s['last_attempt_ms'] or 0, s['dirty_since_ms'] or 0), default=None)

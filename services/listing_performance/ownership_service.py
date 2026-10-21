@@ -3,11 +3,14 @@
 由blueprints/amazon/listing_ownership.py调用，SQL交给ownership_repository。
 preview只读并签名冻结命令；apply以事务写负责区间、身份版本及审计。
 人员查询实时读取历史归属，交接不再触发SKU/店铺利润重建或生成人员快照。
-常规分配默认站点次日，不允许改过去；预览15分钟有效，提交不能另传可编辑字段。
+交接默认日期遵循固定北京时间15:00：2026-10-26 14:00→27日，15:00→28日；
+15点前日期+1，15点整起+2，具体规则见assignment_policy；不改变过去负责区间。
+预览15分钟有效，跨分界须重新预览；提交不能另传可编辑字段。
 不调用Amazon、不改Listing内容、不自动授权用户；失败整笔回滚。
 """
 import hashlib
 import re
+import uuid
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from services.mysql_service import get_db_connection
 from services.listing_performance.configuration import value as configured_value
@@ -69,7 +72,7 @@ def normalize(payload):
     """校验预览payload并生成可签名的标准命令字典。
 
     items为1~200个店铺/站点/SKU；action为assign/cancel，reason允许空。
-    未填日期按每个站点分别冻结明天；owner_user_id=None代表解除分配。
+    未填日期按北京时间15点政策冻结最早交接日；owner_user_id=None代表解除分配。
     只做参数/配置处理，不写历史，也不将前端任意字段带入签名。"""
     if not isinstance(payload, dict):
         raise DomainError('请求必须为 JSON 对象')
@@ -96,7 +99,7 @@ def normalize(payload):
     owner = payload.get('owner_user_id')
     supplied_date = payload.get('effective_date')
     effective_date = parse_date(supplied_date).isoformat() if action == 'assign' and supplied_date else None
-    # 默认日期也必须写入签名命令；跨站点分别算次日，提交时不重新猜默认值。
+    # 默认日期也必须写入签名命令；提交时仍校验15点分界，不能跨界沿用旧日期。
     now = utc_now()
     default_dates = ({market:next_business_date(market_config(market)['timezone'],now)
                       for market in {i['marketplace_id'] for i in result}}
@@ -224,29 +227,7 @@ def apply(actor, payload, action='assign'):
             items = inspect(cursor, command['data'], now, lock=True)
             if fingerprint(items) != command['versions']:
                 raise DomainError('预览后对象、时区或负责人已变化，请重新预览', 409)
-            before = [dict(i) for i in items]
-            data = command['data']
-            for item in items:
-                if action == 'assign':
-                    cursor.execute('''UPDATE listing_responsibility_history SET effective_to_utc=%s
-                        WHERE scope_id=%s AND voided_at IS NULL AND effective_to_utc IS NULL''',
-                                   (item['effective_from_utc'], item['scope_id']))
-                    cursor.execute('''INSERT INTO listing_responsibility_history
-                        (scope_id,owner_user_id,effective_from_utc,business_timezone,created_by,reason)
-                        VALUES (%s,%s,%s,%s,%s,%s)''',
-                                   (item['scope_id'], data['owner_user_id'], item['effective_from_utc'],
-                                    item['timezone'], actor, data['reason']))
-                else:
-                    future = item['scheduled']
-                    cursor.execute('UPDATE listing_responsibility_history SET voided_at=%s WHERE id=%s',
-                                   (now, future['id']))
-                    cursor.execute('''UPDATE listing_responsibility_history SET effective_to_utc=NULL
-                        WHERE scope_id=%s AND voided_at IS NULL AND effective_to_utc=%s''',
-                                   (item['scope_id'], future['effective_from_utc']))
-                cursor.execute('UPDATE listing_responsibility_scopes SET version=version+1 WHERE id=%s',
-                               (item['scope_id'],))
-            result = {'affected': len(items), 'action': action, 'request_id': request_id}
-            repo.audit(cursor, actor, request_id, request_hash, action, before, data, result, data['reason'])
+            result = write_items(cursor, items, command['data'], actor, request_id, request_hash, now)
         conn.commit()
         return result
     except Exception:
@@ -257,6 +238,68 @@ def apply(actor, payload, action='assign'):
             with conn.cursor() as cursor:
                 cursor.execute('SELECT RELEASE_LOCK(%s)', (lock_name,))
         conn.close()
+
+
+def write_items(cursor, items, data, actor, request_id, request_hash, now):
+    """在调用方事务内写负责区间、身份版本与审计，人工和托管交接共用。"""
+    action = data['action']
+    before = [dict(item) for item in items]
+    for item in items:
+        if action == 'assign':
+            cursor.execute('''UPDATE listing_responsibility_history SET effective_to_utc=%s
+                WHERE scope_id=%s AND voided_at IS NULL AND effective_to_utc IS NULL''',
+                           (item['effective_from_utc'], item['scope_id']))
+            cursor.execute('''INSERT INTO listing_responsibility_history
+                (scope_id,owner_user_id,effective_from_utc,business_timezone,created_by,reason)
+                VALUES (%s,%s,%s,%s,%s,%s)''',
+                           (item['scope_id'], data['owner_user_id'], item['effective_from_utc'],
+                            item['timezone'], actor, data['reason']))
+        else:
+            future = item['scheduled']
+            cursor.execute('UPDATE listing_responsibility_history SET voided_at=%s WHERE id=%s', (now, future['id']))
+            cursor.execute('''UPDATE listing_responsibility_history SET effective_to_utc=NULL
+                WHERE scope_id=%s AND voided_at IS NULL AND effective_to_utc=%s''',
+                           (item['scope_id'], future['effective_from_utc']))
+        cursor.execute('UPDATE listing_responsibility_scopes SET version=version+1 WHERE id=%s', (item['scope_id'],))
+    result = {'affected': len(items), 'action': action, 'request_id': request_id}
+    repo.audit(cursor, actor, request_id, request_hash, action, before, data, result, data['reason'])
+    return result
+
+
+def ensure_ai_owner(cursor, shop_id, market, asin, owner, actor, now=None):
+    """在托管配置事务中预约全部有效子SKU给AI；同AI不重复交接，人工计划冲突则整笔回滚。
+
+    调用方须先锁店铺再锁托管行，与人工分配保持同一店铺→身份加锁顺序。
+    不覆盖人工未来交接，不恢复旧负责人，不调用Amazon或生成绩效报表。
+    """
+    from .assignment_policy import default_date
+    now = now or utc_now()
+    cursor.execute('''SELECT sku FROM amazon_listings WHERE shop_id=%s AND marketplace_id=%s
+        AND BINARY asin=BINARY %s AND is_deleted=0 AND COALESCE(LOWER(parentage_level),'')<>'parent'
+        ORDER BY BINARY sku LIMIT 201''', (shop_id, market, asin))
+    rows = cursor.fetchall()
+    if not 1 <= len(rows) <= 200:
+        raise DomainError('托管ASIN需要1~200个有效子SKU，不能遗漏交接', 422)
+    items = repo.resolve(cursor, [{'shop_id': shop_id, 'marketplace_id': market, 'seller_sku': row['sku']} for row in rows])
+    pending = []
+    for item in items:
+        scope = repo.scope(cursor, item, lock=True)
+        histories = repo.histories(cursor, scope['id'], lock=True)
+        current = repo.active_at(histories, now)
+        future = [row for row in histories if row['effective_from_utc'] > now]
+        if len(future) > 1 or (future and future[0]['owner_user_id'] != owner):
+            raise DomainError(f"SKU {item['seller_sku']} 已有其他未来交接，请在负责人分配处理后再恢复托管", 409)
+        if future or (current and current['owner_user_id'] == owner):
+            continue
+        pending.append({'shop_id': shop_id, 'marketplace_id': market, 'seller_sku': item['seller_sku']})
+    if not pending:
+        return {'affected': 0, 'action': 'assign'}
+    data = {'items': pending, 'action': 'assign', 'owner_user_id': owner, 'reason': f'AI托管开启/恢复：ASIN {asin}',
+            'effective_date': default_date(now).isoformat(), 'effective_dates': {}, 'expand_parents': False}
+    actual = inspect(cursor, data, now, lock=True)
+    request_id = 'ai-ownership-' + uuid.uuid4().hex
+    return write_items(cursor, actual, data, actor, request_id,
+                       hashlib.sha256(json_data(data).encode()).hexdigest(), now)
 
 
 def candidates():
