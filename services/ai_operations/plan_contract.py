@@ -1,10 +1,12 @@
 """主干方案契约：完整内容替换/具体数值/观察项，不生成任意API命令。"""
 from decimal import Decimal
 import re
+from pathlib import Path
+from services import listing_content_policy
 from services.listing_performance.common import DomainError
 from .catalog import number
 
-VERSION = 'operations_plan_v5_live'
+VERSION = 'operations_plan_v6_listing_policy'
 MODEL = 'deepseek-flash'
 MAX_OUTPUT_TOKENS = 24000
 METRICS = {'impressions', 'clicks', 'ctr', 'cpc', 'purchases_7d', 'sales_7d', 'acos',
@@ -26,7 +28,7 @@ action_catalog列出本轮真实对象、字段、before、单位、作用范围
 输出JSON对象，顶层字段summary、actions、notes、history_reviews，history_reviews格式见后文。例子中的ref和证据必须换为输入实际值：
 {"summary":"本轮判断", "actions":[{"ref":"实际action_catalog的ref","mode":"change","after":30,"reason":"结合实际窗口解释10%到30%的理由", "priority":"常规关注", "evidence_refs":["实际证据编号"],"observation":{"metrics":["impressions","acos","net_profit"],"keywords":[],"check_days":[3,7,14],"duration_days":14,"hypothesis":"待验证的影响方向，不把预期当事实","review_when":"什么变化时重新评估"}}],"notes":["需要说明的资料边界"],"history_reviews":[]}
 文本字段after必须是完整字符串数组（标题一条，五点逐条），金额是十进制字符串且美分精度，percent是0到900的整数。observe的after为null。
-除bullet_point外，item_name/title_differentiation/product_description/generic_keyword的after数组严格只有一个元素。例如generic_keyword为["toilet bolt caps decorative turtle bathroom accessories"]，不是多个关键词分别组成的数组；product_description即使多段也合并为一个字符串。bullet_point可为1到10条。以catalog.output_format为准。
+除bullet_point外，item_name/title_differentiation/product_description/generic_keyword的after数组严格只有一个元素。例如generic_keyword为["toilet bolt caps decorative turtle bathroom accessories"]，不是多个关键词分别组成的数组；product_description即使多段也合并为一个字符串。bullet_point须3到5条。以catalog.output_format和constraints更严格值为准。
 mode为change表示修改、observe表示观察任意已提供对象且after为null；kind=observe的catalog对象只支持mode=observe。
 priority只用“优先处理/常规关注/持续观察”。每条都要理由、证据和具体observation，check_days从3/7/14/30选择；keywords只填本资料已出现的完整词组。
 最多12个行动，同一ref不能重复；可以actions为空，但summary解释为何不改。仅返回JSON。'''
@@ -56,6 +58,8 @@ SYSTEM += '\nobservation.metrics只能从此枚举选择：'+','.join(sorted(MET
 特别注意：sessions、unit_session_percentage、自然曝光、转化率等当前未采集的指标禁止放进metrics；不要要求补这些数据才开始运营，可用已给的排名/词流量/经营/广告指标观察。
 返回前核对：非五点文案after只有一个字符串；金额为美分字符串；所有证据编号逐字复制自evidence_index；关键词逐字复制本次资料；history_reviews覆盖每个待观察/待核实执行。
 '''
+# 每次AI请求均携带此专用规范；部署必须包含该MD，旧会话记忆不能覆盖最新规则。
+SYSTEM += '\n' + (Path(__file__).parent / 'policies' / 'listing_copy.md').read_text(encoding='utf-8')
 
 
 def text(value, label, limit=2000, empty=False):
@@ -108,9 +112,12 @@ def validate(value, dataset):
             raise DomainError('行动方式必须是明确修改或观察', 422)
         after = row['after']; kind = 'observe' if row['mode'] == 'observe' else candidate['kind']
         if kind == 'listing_text_update':
-            if not isinstance(after, list) or not 1 <= len(after) <= (10 if candidate['subject']['field'] == 'bullet_point' else 1):
-                raise DomainError('Listing字段'+candidate['subject']['field']+'必须返回完整字符串数组，条数为'+('1到10' if candidate['subject']['field']=='bullet_point' else '1')+'，请查看模型原始回答', 422)
-            for content in after:text(content, '完整Listing文案', 20000)
+            source = next((r for r in dataset['content']['listing'] if r['sku'] == candidate['subject']['sku']), {})
+            rules = source.get('content_policy') or listing_content_policy.policy(candidate['subject'].get('marketplace_id'), source.get('product_type'), source.get('brand'))
+            try:
+                listing_content_policy.validate_field(candidate['subject']['field'], after, rules)
+            except listing_content_policy.ContentError as exc:
+                raise DomainError(str(exc), 422) from None
         elif kind == 'observe':
             if after is not None:raise DomainError('观察行动不能包含修改值', 422)
         elif kind == 'ads_placement_update':
@@ -152,6 +159,17 @@ def validate(value, dataset):
         text(observation['review_when'], '重评条件', 1500)
         output.append({**candidate, **row, 'after':after, 'evidence_refs':refs, 'observation':observation, 'kind': kind, 'action_id': 'a' + str(len(output)+1),
                        'execution_status': 'not_implemented', 'execution_available': False})
+    # 跨字段校验以本方案最终文案为准，标题/亮点不能各自合规却组合触发100476。
+    changed = {}
+    for action in output:
+        if action['kind'] == 'listing_text_update':
+            changed.setdefault(action['subject']['sku'], {})[action['subject']['field']] = action['after']
+    for sku, changes in changed.items():
+        source = next((r for r in dataset['content']['listing'] if r['sku'] == sku), {})
+        try:
+            listing_content_policy.validate_changes(source.get('fields', {}), changes, source.get('content_policy'))
+        except listing_content_policy.ContentError as exc:
+            raise DomainError(str(exc), 422) from None
     reviews=validate_reviews(value['history_reviews'],dataset,output)
     return {'schema_version': VERSION, 'summary': value['summary'], 'actions': output,
             'notes': value['notes'], 'history_reviews':reviews, 'execution_available': False}

@@ -691,6 +691,9 @@ class AmazonSpApiClient:
         :param requirements: LISTING(默认) | LISTING_PRODUCT_ONLY | LISTING_OFFER_ONLY
         :param condition_type: 商品状况，如 "new", "used_like_new" 等
         """
+        # 完整更新与定向PATCH使用同一规则，避免通用PUT绕过文案限制；不改原请求体。
+        from services.listing_content_policy import guard_attributes
+        guard_attributes(self, attributes, product_type)
         params = {"marketplaceIds": self.marketplace_id}
         body = {
             "productType": product_type,
@@ -718,6 +721,10 @@ class AmazonSpApiClient:
         :param patches: JSON Patch 操作列表
         :param product_type: 可选，亚马逊商品类型
         """
+        # 人工通用PATCH、AI及内部脚本共用最后一道文案规范，图片/报价补丁不增加读取。
+        # 规则拒绝发生在_request之前，因此不会产生真实修改或虚假的“已提交”审计。
+        from services.listing_content_policy import guard_patches
+        guard_patches(self, sku, patches, product_type)
         params = {"marketplaceIds": self.marketplace_id}
         body = {"patches": patches}
         if product_type:

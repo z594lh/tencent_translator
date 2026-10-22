@@ -2,6 +2,7 @@
 import json
 from decimal import Decimal, InvalidOperation
 from services.ads_display import auto_label, PLACEMENTS
+from services import listing_content_policy
 from .metrics import digest
 
 TEXT_FIELDS = {'item_name': '商品标题', 'title_differentiation': '商品亮点', 'bullet_point': '五点描述',
@@ -42,12 +43,14 @@ def build(pack):
         sku = product['sku']; resource = 'listing:' + digest(sku)[:16]
         subject = {'sku': sku, 'asin': product['asin'], 'marketplace_id': market}
         name = product.get('product_name') or sku
+        rules = listing_content_policy.policy(market, product.get('product_type'), product.get('brand'))
         for field, label in TEXT_FIELDS.items():
             before = field_values(product, field, market)
             if before is not None:
                 add(resource + ':' + field, 'listing_text_update', name + ' · ' + label,
                     {**subject, 'field': field}, before, 'text_list', [resource],
-                    output_format={'type':'array_of_strings','min_items':1,'max_items':10 if field=='bullet_point' else 1,
+                    constraints=rules['fields'][field], policy_version=rules['version'],
+                    output_format={'type':'array_of_strings','min_items':rules['fields'][field]['min_items'],'max_items':rules['fields'][field]['max_items'],
                                    'note':'五点每条一个字符串，返回完整列表' if field=='bullet_point' else '整个字段仅一个完整字符串；后台搜索词的多个词组也放在同一个字符串里'})
     for pricing in pack.get('pricing', []):
         for offer in pricing['offers']:

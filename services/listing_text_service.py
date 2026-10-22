@@ -5,6 +5,7 @@ import requests
 
 from services import listing_pricing_service as pricing
 from services import listing_history_service as history
+from services import listing_content_policy as content_policy
 
 FIELDS = {'item_name': '商品标题', 'title_differentiation': '商品亮点',
           'product_description': '商品描述', 'bullet_point': '卖点', 'generic_keyword': '搜索关键字'}
@@ -40,6 +41,10 @@ def read(client, ctx):
     snapshot = {**ctx, 'product_type': summaries[0]['productType'], 'fields': fields,
                 'default_language': default_language, 'issues': pricing.safe_issues(raw.get('issues')),
                 'listing_status': summaries[0].get('status', [])}
+    brand = next((r.get('value') for r in attrs.get('brand', []) if r.get('marketplace_id') == ctx['marketplace_id']), '')
+    snapshot['content_policy'] = content_policy.for_client(client, snapshot['product_type'], brand, ctx['marketplace_id'])
+    for name in fields:
+        fields[name]['constraints'] = copy.deepcopy(snapshot['content_policy']['fields'][name])
     snapshot['version'] = pricing.digest([ctx, snapshot['product_type'], {key: attrs.get(key) for key in FIELDS}])
     return snapshot, raw
 
@@ -84,6 +89,7 @@ def cache_text(ctx, raw):
 
 
 def build_patches(snapshot, data):
+    """校验版本、原语言/站点及共享文案规范；不截断，不因旧字段过长而禁止读取。"""
     if data.get('version') != snapshot['version']:
         raise pricing.PricingError('平台文字已变化，请重新读取后编辑，未提交本次修改', 409)
     changes = data.get('changes')
@@ -130,6 +136,11 @@ def build_patches(snapshot, data):
         expected[field] = rows
     if not patches:
         raise pricing.PricingError('没有实际修改，无需提交')
+    try:
+        content_policy.validate_rows({name: info['rows'] for name, info in snapshot['fields'].items()}, expected,
+            snapshot.get('content_policy') or content_policy.policy(snapshot['marketplace_id'], snapshot['product_type']))
+    except content_policy.ContentError as exc:
+        raise pricing.PricingError(str(exc), 422, {'write_state': 'not_sent', 'policy_version': content_policy.VERSION}) from None
     return patches, expected
 
 
@@ -149,6 +160,9 @@ def submit_editor(shop_id, sku, data):
                  'baseline_errors': [pricing.digest(row) for row in snapshot['issues'] if row.get('severity') == 'ERROR']}
         try:
             result = client.patch_listings_item(sku, patches, product_type=snapshot['product_type'])
+        except content_policy.ContentError as exc:
+            # 最终通道重新读取后发现规范变化，确定尚未发送，不能误标为网络结果未知。
+            raise pricing.PricingError(str(exc), 422, {'write_state': 'not_sent', 'policy_version': content_policy.VERSION}) from None
         except requests.RequestException as exc:
             response = getattr(exc, 'response', None)
             if response is not None and response.status_code in (400, 401, 403, 404, 413, 415, 422, 429):

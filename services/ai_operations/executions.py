@@ -108,7 +108,16 @@ def execute(plan_id, body, actor, authorize):
     if any(i not in actions or not interfaces.supports(actions[i]) for i in ids):
         raise DomainError('该行动没有正式适配，未提交', 422)
     results = []
+    # 同SKU如同时改标题/亮点，先提交标题；亮点仍实时回读，不能凭上一接口接受就假设已合规。
+    ordered = []
     for action_id in ids:
+        action = actions[action_id]
+        if action['kind'] == 'listing_text_update' and action['subject']['field'] == 'title_differentiation':
+            ordered.extend(i for i in ids if i not in ordered and actions[i]['kind'] == 'listing_text_update'
+                           and actions[i]['subject'].get('sku') == action['subject'].get('sku') and actions[i]['subject']['field'] == 'item_name')
+        if action_id not in ordered:
+            ordered.append(action_id)
+    for action_id in ordered:
         authorize()
         results.append(_execute_one(plan, actions[action_id], actor, authorize))
     return {'runtime_mode': interfaces.MODE, 'list': results}
@@ -193,7 +202,7 @@ def attempt(plan, action, execution_id, authorize, recovery=None):
         receipt['diagnostic'] = execution_diagnostics.capture(error, 'submit_platform', execution_id)
     interfaces.link_history(identity, action, receipt)
     receipt = with_attempt(receipt, recovery)
-    status = 'unknown' if receipt['accepted'] is None else 'submitted' if receipt['accepted'] else 'rejected'
+    status = 'not_sent' if receipt.get('not_sent') else 'unknown' if receipt['accepted'] is None else 'submitted' if receipt['accepted'] else 'rejected'
     with plan_store.transaction(True) as cur:
         store.submitted(cur, execution_id, status, receipt)
     return {**read_record(execution_id), 'reused': False}

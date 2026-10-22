@@ -4,6 +4,7 @@ from decimal import Decimal, InvalidOperation
 import requests
 from services import listing_pricing_service as pricing, listing_text_service as text
 from services import listing_history_service, operation_identity
+from services.listing_content_policy import ContentError
 from services.shop_service import get_shop_by_id, get_ads_api_client
 from services.listing_performance.common import DomainError
 from . import plan_store
@@ -237,9 +238,10 @@ def failure(error):
     """只公开可控业务错误；网络异常不泄露URL/凭证，也不假定没有发送。"""
     details = getattr(error, 'details', {}) or {}
     response = getattr(error, 'response', None)
-    rejected = details.get('write_state') == 'rejected' or isinstance(error, requests.RequestException) and response is not None and response.status_code in (400, 401, 403, 404, 413, 415, 422, 429)
+    rejected = isinstance(error, ContentError) or details.get('write_state') in ('rejected','not_sent') or isinstance(error, requests.RequestException) and response is not None and response.status_code in (400, 401, 403, 404, 413, 415, 422, 429)
     return {'runtime_mode': MODE, 'accepted': False if rejected else None,
-            'message': str(error) if isinstance(error, (DomainError, pricing.PricingError)) else '提交阶段异常，可能已被平台处理；只读核对，不重复发送',
+            'not_sent': isinstance(error, ContentError) or details.get('write_state') == 'not_sent',
+            'message': str(error) if isinstance(error, (DomainError, pricing.PricingError, ContentError)) else '提交阶段异常，可能已被平台处理；只读核对，不重复发送',
             **{k: details[k] for k in ('issues', 'history_id', 'submission_id', 'history_warning') if k in details}}
 
 

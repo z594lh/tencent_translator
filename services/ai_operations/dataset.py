@@ -2,6 +2,7 @@
 from . import catalog
 from .metrics import ADS_FIELDS, SKU_FIELDS, digest, dumps
 from services.listing_performance.common import DomainError
+from services import listing_content_policy
 
 # 给完整文案与多项历史基线留空间；按官方模型上下文保守控制，超限明确停止而非静默删历史。
 MAX_INPUT_BYTES = 800000
@@ -26,6 +27,7 @@ def build(pack):
         ref = 'listing:' + digest(product['sku'])[:16]
         row = {k: product.get(k) for k in ('sku', 'asin', 'product_name', 'brand', 'product_type', 'status', 'sync_time')}
         row['fields'] = {field: catalog.field_values(product, field, pack['identity']['marketplace_id']) for field in catalog.TEXT_FIELDS}
+        row['content_policy'] = listing_content_policy.policy(pack['identity']['marketplace_id'], product.get('product_type'), product.get('brand'))
         row['pricing_attributes'] = product.get('pricing_attributes', {})
         result['listing'].append(row)
         index[ref] = {'label': (product.get('product_name') or product['sku']) + ' · 当前Listing', 'kind': 'listing', 'data': row}
