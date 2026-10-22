@@ -17,7 +17,7 @@ def content_hash(text):
     return hashlib.sha256(text.encode('utf8')).hexdigest()
 
 
-def parts(messages):
+def parts(messages,mode=None):
     """按真实messages索引和JSON指针拆附件，绝不按文件名猜测发送范围。"""
     for index,message in enumerate(messages):
         text=message['content']
@@ -31,7 +31,8 @@ def parts(messages):
                 yield index,pointer,name,kind,dumps(item),'application/json'
         else:
             kind='rule' if message['role']=='system' else 'message'
-            yield index,'','固定协议与Listing规范.txt' if kind=='rule' else ('AI原回答.txt' if message['role']=='assistant' else 'ERP问题.txt'),kind,text,'text/plain'
+            name='讨论最小事实边界.txt' if mode=='discussion' else '固定协议与Listing规范.txt'
+            yield index,'',name if kind=='rule' else ('AI原回答.txt' if message['role']=='assistant' else 'ERP问题.txt'),kind,text,'text/plain'
 
 
 def register(cur, message_id, session_id, payload, archives):
@@ -40,7 +41,7 @@ def register(cur, message_id, session_id, payload, archives):
     session=cur.fetchone()
     if not session or not session['scope_key']:raise DomainError('附件缺少明确账户范围，未调用AI',503)
     metadata=payload.get('attachment_manifest',{})
-    rows=[(*row,'included') for row in parts(payload['messages'])]
+    rows=[(*row,'included') for row in parts(payload['messages'],metadata.get('chat_mode'))]
     rows.extend((2,'/archive/'+key,LABELS.get(key,key)+'·归档完整模块.json','data',dumps(value),'application/json','archived') for key,value in archives.items())
     for index,pointer,name,kind,text,mime,delivery in rows:
         hashed=content_hash(text)

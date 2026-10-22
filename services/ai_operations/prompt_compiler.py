@@ -1,6 +1,7 @@
 """每日提示唯一编译入口；配置快照随方案固定，预览和实际请求采用同一结构。"""
 from copy import deepcopy
 import json
+from services.listing_performance.common import DomainError
 from . import prompt_configuration as config, conversation_context as context, plan_provider
 from .metrics import dumps, digest
 
@@ -53,21 +54,38 @@ def prepare(data, session, snapshot):
 def messages(prepared, history, remaining, allow_data):
     """构建真实messages数组；内部标记不发给供应商，收尾场景也能免费预览。"""
     human=prepared.get('conversation',{}).get('purpose')=='chat'
+    mode=prepared.get('conversation',{}).get('mode')
+    if mode=='discussion':
+        return [{'role':'system','content':prepared['system']},{'role':'user','content':prepared['question']},
+                {'role':'user','content':prepared['user']},
+                *([{'role':'user','content':dumps({'human_sender':prepared['human_actor']})}] if prepared.get('human_actor') else []),
+                {'role':'user','content':prepared['human_question']}],{'mode':'discussion','remaining_model_calls':1,'data_requests_allowed':False}
+    if mode=='proposal':human=False
     control={'remaining_model_calls':remaining if allow_data else 1,'data_requests_allowed':allow_data,
              'instruction':scene(prepared,('human_reply' if allow_data else 'human_last_call') if human else ('allow_data' if allow_data else 'last_call'))}
     result=[{'role':'system','content':prepared['system']}, {'role':'user','content':prepared['question']},
             {'role':'user','content':prepared['user']},
             *([{'role':'user','content':dumps({'human_sender':prepared['human_actor']})}] if prepared.get('human_actor') else []),
-            *([{'role':'user','content':prepared['human_question']}] if human else []),
+            *([{'role':'user','content':prepared['human_question']}] if 'human_question' in prepared else []),
             *[{k:v for k,v in message.items() if k!='validation_feedback'} for message in history],
             {'role':'user','content':dumps({'task_control':control})}]
     return result,control
 
 
-def prepare_human(data,session,snapshot,question):
+def prepare_human(data,session,snapshot,question,mode=None):
     """人工与每日共用资料、版本及条件，独立提供原话而不强迫生成每日方案。"""
-    from . import human_contract
+    from . import human_contract, discussion
+    if mode not in (None,'discussion','proposal'):raise DomainError('人工对话模式无效，未调用AI',422)
+    if mode=='discussion':return discussion.prepare(data,session,snapshot,question)
     prepared=prepare(data,session,snapshot)
+    if mode=='proposal':
+        prepared['system']=context.SYSTEM+'\n'+discussion.PROPOSAL_BOUNDARY
+        prepared['conversation'].update(purpose='chat',mode='proposal')
+        prepared['human_question']=question
+        selected=['proposal_followup',*prepared['interaction']['matched_scenes'][1:]]
+        prepared['interaction']['matched_scenes']=selected
+        prepared['question']='\n\n'.join(scene(prepared,key) for key in selected)+'\n\n'+config.render(snapshot['config']['business_rules'],prepared['interaction']['variables'])
+        return prepared
     prepared['system']=human_contract.SYSTEM
     prepared['conversation']['purpose']='chat'
     prepared['human_question']=question
@@ -81,6 +99,7 @@ def prepare_human(data,session,snapshot,question):
 def allow_data(prepared, history, remaining, input_bytes, elapsed):
     """预览与实际共用轮次/字节/超时判断，纠错轮不得继续取数。"""
     from .conversation import MAX_TOTAL_INPUT_BYTES, MAX_ELAPSED_SECONDS
+    if prepared.get('conversation',{}).get('mode')=='discussion':return False
     base=[{'role':'system','content':prepared['system']},{'role':'user','content':prepared['question']},
           {'role':'user','content':prepared['user']},
           *([{'role':'user','content':dumps({'human_sender':prepared['human_actor']})}] if prepared.get('human_actor') else []),
@@ -95,6 +114,7 @@ def allow_data(prepared, history, remaining, input_bytes, elapsed):
 def manifest(prepared, data):
     """声明归档边界，避免把完整资料归档或关键词截选说成全部已发送。"""
     return {'config_version_id':prepared['interaction']['version_id'],
+            'chat_mode':prepared.get('conversation',{}).get('mode'),
             'config_hash':prepared['interaction']['hash'],'archive_hash':data['content_hash'],
             'published_config_hash':prepared['interaction'].get('published_hash'),
             'configuration_schema_upgraded':prepared['interaction'].get('schema_migration',False),

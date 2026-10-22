@@ -10,12 +10,23 @@ VERSION = 'deepseek-conversation-real-v1'
 TIMEOUT = 180.0
 
 
-def request_spec():
+def request_spec(mode=None):
     """返回实际DeepSeek请求参数，不包含账户凭据。"""
-    return {'provider':PROVIDER,'model':contract.MODEL,'execution_mode':'real',
+    result={'provider':PROVIDER,'model':contract.MODEL,'execution_mode':'real',
             'endpoint':'https://api.deepseek.com/chat/completions','timeout_seconds':TIMEOUT,
             'max_retries':0,'response_format':{'type':'json_object'},'max_tokens':contract.MAX_OUTPUT_TOKENS,
             'thinking':{'type':'enabled'},'reasoning_effort':'high','stream':False}
+    if mode=='discussion':result.pop('response_format')
+    return result
+
+
+def readable_reply(raw):
+    """格式失败仅提取首个可解码对象的自然回复供阅读，绝不合并JSON或将其变为可执行方案。"""
+    try:
+        value,_=json.JSONDecoder().raw_decode(raw.lstrip())
+        text=value.get('reply') if isinstance(value,dict) else None
+        return text[:20000] if isinstance(text,str) else None
+    except (ValueError,TypeError,RecursionError):return None
 
 
 class Failure(Exception):
@@ -36,11 +47,12 @@ def create_client():
 def generate(client, prepared):
     """发出一轮真实模型请求，记录原回答和实际用量，不自动重发。"""
     usage = {'provider':PROVIDER,'billable':True,'requested_model':contract.MODEL,'execution_mode':'real'}
+    discussion=prepared.get('conversation',{}).get('mode')=='discussion'
     started = time.monotonic()
     try:
         reply = client.chat.completions.create(model=contract.MODEL,
             messages=prepared.get('messages') or [{'role': 'system', 'content': prepared['system']}, {'role': 'user', 'content': prepared['user']}],
-            response_format={'type': 'json_object'}, max_tokens=contract.MAX_OUTPUT_TOKENS,
+            **({} if discussion else {'response_format':{'type':'json_object'}}), max_tokens=contract.MAX_OUTPUT_TOKENS,
             stream=False, extra_body={'thinking': {'type': 'enabled'},'reasoning_effort':'high'})
         usage.update(request_id=str(getattr(reply,'id','') or '')[:200],
                      returned_model=str(getattr(reply,'model','') or '')[:100],
@@ -58,7 +70,8 @@ def generate(client, prepared):
         # 留存模型的最终JSON，不保存或回传隐式思维链；JSON不通过仍能核查原始回答。
         if isinstance(raw,str) and len(raw.encode('utf8'))<=160000:usage['raw_output']=raw
         if choice.finish_reason != 'stop' or not isinstance(raw, str) or not raw.strip() or len(raw.encode('utf8')) > 160000:
-            raise Failure('invalid_output', 'AI输出为空、截断或超限，未生成可用方案；请查看记录，不会自动重发', usage)
+            raise Failure('incomplete_output', 'AI输出为空、截断或超限；原始回答已保留，本次未形成完整结果，不自动重发', usage)
+        if discussion:return raw,usage
         def unique(pairs):
             """解析JSON时拒绝重复键，避免模型覆盖同名字段。"""
             result = {}
@@ -72,8 +85,11 @@ def generate(client, prepared):
         return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid), usage
     except Failure:
         raise
-    except (ValueError, TypeError, AttributeError, IndexError, RecursionError):
-        raise Failure('invalid_output', 'AI返回内容无法解析为完整方案，不会自动重发', usage) from None
+    except (ValueError, TypeError, AttributeError, IndexError, RecursionError) as error:
+        usage['parse_error']=('存在多个JSON或对象外多余内容' if isinstance(error,json.JSONDecodeError) and error.msg=='Extra data' else '返回结构不符合单个完整JSON要求')
+        text=readable_reply(usage.get('raw_output',''))
+        if text:usage['readable_reply']=text
+        raise Failure('invalid_output', '行动清单格式异常，尚不可执行；原始回答已保留，不自动重发', usage) from None
     except APIStatusError as error:
         usage.update(http_status=error.status_code,elapsed_ms=round((time.monotonic()-started)*1000))
         raise Failure('http_error','DeepSeek返回HTTP '+str(error.status_code)+'；请检查账户额度/配置或服务状态，不自动重发',usage) from None

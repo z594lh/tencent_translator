@@ -17,7 +17,7 @@ def source(plan_id):
     if plan['status']!='ready' or plan['runtime_mode']!='real' or not plan.get('task_id'):
         raise DomainError('只能确认已完成的人工对话建议',409)
     task,session,managed=chat_tasks.checked_task(plan['task_id'])
-    if task['task_type']!='chat' or task['status']!='completed' or str(task['plan_id'])!=plan['id']:
+    if task['task_type']!='chat' or task.get('chat_mode')=='discussion' or task['status']!='completed' or str(task['plan_id'])!=plan['id']:
         raise DomainError('原人工建议尚未归档完成',409)
     if conversation_store.scope(plan['dataset']['content']['identity'])[1]!=task['scope_key']:
         raise DomainError('建议账户范围与当前配置不符',409)

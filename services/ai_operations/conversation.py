@@ -46,6 +46,7 @@ def run(data, prepared, session, plan_id, invoke, check_permissions):
     """在同一任务内取数或纠错，最终方案校验通过才交给每日执行流程。"""
     history = []; calls = []; requested = {}; input_bytes = 0; started = time.monotonic()
     human=session.get('purpose')=='chat'
+    mode=prepared.get('conversation',{}).get('mode')
     def emit(round_no,event_type,payload,archives=None):
         """同一编排按每日方案或人工任务绑定消息，均先登记实际请求和附件。"""
         return store.append(session['id'],plan_id,round_no,event_type,payload,archives=archives,
@@ -79,9 +80,21 @@ def run(data, prepared, session, plan_id, invoke, check_permissions):
             emit(round_no,'model_response',{'error_code':error.code,'message':str(error),'usage':calls[-1]})
             raise plan_provider.Failure(error.code,str(error),usage_summary(calls,started,input_bytes)) from None
         calls.append({**usage,'round_no':round_no})
+        if mode=='discussion':
+            from . import discussion
+            result=discussion.response(raw)
+            emit(round_no,'model_response',{'response':result,'usage':calls[-1]})
+            return result,usage_summary(calls,started,input_bytes),discussion.remember(session,prepared['human_question'],result['reply'],session['task_id'])
         emit(round_no,'model_response',{'response':raw,'usage':calls[-1]})
         try:
-            if human and isinstance(raw,dict) and raw.get('type') in ('reply','propose_plan'):
+            if mode=='proposal' and isinstance(raw,dict) and raw.get('type')=='final_plan':
+                plan_contract.fields(raw,('type','plan','memory'),'人工优化方案')
+                state=memory(raw['memory'])
+                from . import human_contract
+                validated=human_contract.validate({'type':'propose_plan','reply':raw['plan'].get('summary','') if isinstance(raw.get('plan'),dict) else '',
+                    'plan':raw['plan'],'memory':raw['memory']},data)
+                return validated,usage_summary(calls,started,input_bytes),state
+            if human and mode!='proposal' and isinstance(raw,dict) and raw.get('type') in ('reply','propose_plan'):
                 from . import human_contract
                 return human_contract.validate(raw,data),usage_summary(calls,started,input_bytes),memory(raw['memory'])
             if not isinstance(raw,dict) or raw.get('type') not in (('request_data',) if human else ('request_data','final_plan')):
@@ -118,14 +131,14 @@ def run(data, prepared, session, plan_id, invoke, check_permissions):
                 'required_final_keys':['type','plan','memory'],
                 'required_plan_keys':['summary','actions','notes','history_reviews'],
                 'required_memory_keys':['strategy','focus','open_questions','lessons'],
-                'instruction':prompt_compiler.scene(prepared,'human_validation_feedback' if human else 'validation_feedback')},
+                'instruction':prompt_compiler.scene(prepared,'human_validation_feedback' if human and mode!='proposal' else 'validation_feedback')},
                 'remaining_model_calls':remaining-1}
-            if human:
+            if human and mode!='proposal':
                 feedback['validation_feedback']['required_final_keys']=['type','reply','memory','plan（仅propose_plan）或evidence_refs（仅reply）']
             candidate = [*history,{'role':'assistant','content':dumps(raw)},
                          {'role':'user','content':dumps(feedback),'validation_feedback':True}]
             future_bytes = context.size(prompt_compiler.messages(prepared,candidate,remaining-1,False)[0])+1000
-            if (remaining>1 and isinstance(raw,dict) and raw.get('type') in (('reply','propose_plan') if human else ('final_plan',))
+            if (remaining>1 and isinstance(raw,dict) and raw.get('type') in (('reply','propose_plan') if human and mode!='proposal' else ('final_plan',))
                 and future_bytes<=context.MAX_CONTEXT_BYTES and input_bytes+future_bytes<=MAX_TOTAL_INPUT_BYTES
                 and time.monotonic()-started+plan_provider.TIMEOUT<=MAX_ELAPSED_SECONDS):
                 emit(round_no,'validation_feedback',feedback)

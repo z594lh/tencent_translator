@@ -69,11 +69,11 @@ def process(task,invoke=None,stopping=None):
             if conversation_store.scope(data['content']['identity'])[1]!=task['scope_key']:raise DomainError('准备资料期间账户变化，未调用AI',409)
             session=conversation_store.peek_session(data['content']['identity'])
             if str(session['id'])!=str(task['conversation_id']):raise DomainError('当前对话已变化，未调用AI',409)
-            session.update(purpose='chat',task_id=task['id'],owner_token=task['owner_token'])
+            session.update(purpose='chat',chat_mode=current.get('chat_mode'),task_id=task['id'],owner_token=task['owner_token'])
             with plan_store.transaction() as cur:
                 cur.execute('SELECT * FROM ai_operation_messages WHERE id=%s AND task_id=%s',(task['user_message_id'],task['id']))
                 question=conversation_store.checked(cur.fetchone(),'payload_json','payload_hash')['text']
-            prepared=prompt_compiler.prepare_human(data,session,prompt_configuration.active(),question)
+            prepared=prompt_compiler.prepare_human(data,session,prompt_configuration.active(),question,current.get('chat_mode'))
             prepared['human_actor']={'user_id':str(task['actor_id']),'name':task['actor_name'],
                                      'question_at_utc':task['created_at'],'source':'人工续聊，非每日自动任务'}
             frozen=[pack,data,prepared]

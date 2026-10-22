@@ -100,6 +100,7 @@ def describe(row,plan,task=None):
     """将一条不可变原事件映射为人可读消息；不重放嵌套历史、不执行模型HTML。"""
     payload=store.checked(row,'payload_json','payload_hash');kind=row['event_type']
     result={'id':str(row['id']),'plan_id':str(row['plan_id']) if row['plan_id'] is not None else None,
+            'event_type':kind,
             'task_id':str(row['task_id']) if row.get('task_id') is not None else None,'role':'erp','round':row['round_no'],
             'created_at':row['created_at'].replace(tzinfo=timezone.utc).isoformat(),'title':'ERP',
             'text':'','has_original':True,'attachment_name':'原始消息与资料.json','actor':plan.get('actor_name')}
@@ -115,10 +116,19 @@ def describe(row,plan,task=None):
     elif kind=='model_response':
         result.update(role='assistant',title='DeepSeek')
         answer=payload.get('response') or {}
+        result['response_type']=answer.get('type') if isinstance(answer,dict) else None
+        result['has_error']=bool(payload.get('error_code'))
         if not isinstance(answer,dict):
             result['text']='模型输出格式无效，未形成可执行方案；可查看完整原文。'
             return result
-        if payload.get('error_code'):result['text']=payload.get('message') or '模型请求未完成，原始结果已保留'
+        if payload.get('error_code'):
+            usage=payload.get('usage') or {}
+            readable=usage.get('readable_reply')
+            if not readable and payload['error_code']=='invalid_output':
+                from .plan_provider import readable_reply
+                readable=readable_reply(usage.get('raw_output',''))
+            result['text']=readable or payload.get('message') or '模型请求未完成，原始结果已保留'
+            result['error_note']=payload.get('message') or '此回答未形成可执行方案'
         elif answer.get('type')=='request_data':
             requests=answer.get('requests')
             result['text']='需要补充以下资料后继续分析：\n'+'\n'.join(str(r.get('reason',''))+'（'+str(r.get('source',''))+' / '+str(r.get('window',''))+'）' for r in requests) if isinstance(requests,list) and all(isinstance(r,dict) for r in requests) else '模型资料请求格式无效，请查看原文'

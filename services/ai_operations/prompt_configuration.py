@@ -26,8 +26,11 @@ SCENES = {
     'human_reply': ('人工对话可继续取数', '需要本次归档明细时按request_data补查；可以直接解释时返回reply，确有具体调整建议时返回propose_plan。所有建议均未执行，不得把建议或用户口头同意说成已修改。'),
     'human_last_call': ('人工对话结束本轮', '请利用已有资料完整回答用户，不再索取资料。无需修改时返回reply；提出具体调整时返回propose_plan。缺证据的部分如实说明，不猜测、不为了凑方案而修改。'),
     'human_validation_feedback': ('人工回复校验纠错', '请按ERP列出的具体错误修正回复或建议，返回完整reply或propose_plan，不再索取资料。保持用户当前问题原意；仅复盘与建议相关的往期改动。'),
+    'discussion_followup': ('人工讨论', '请接着当前ASIN {{ asin }}的对话回答用户，资料截至{{ report_end }}。直接用自然语言解释和讨论，先回答当前问题，不要求全面复盘或形成操作清单。'),
+    'proposal_followup': ('人工生成优化方案', '请根据用户当前要求和共享讨论，为ASIN {{ asin }}生成有依据的优化方案，资料截至{{ report_end }}。需要明细可按request_data补查，最终返回一个完整final_plan对象。允许只观察或零改动；本次只保存建议，须人工选择并确认后才执行。'),
 }
 HUMAN_SCENES=('human_followup','human_reply','human_last_call','human_validation_feedback')
+MODE_SCENES=('discussion_followup','proposal_followup')
 DATA_NOTES = {
     'analysis':'AI提出可执行方案；ERP以实时前值预检后提交，接受不等于属性生效，业绩变化不直接归因于单次改动。',
     'windows':'d1/d3/d7/d14/d30=截止日向前对应天数；p7/p14/p30=前等长区间，互相重叠不可累加',
@@ -69,7 +72,7 @@ DEFAULT_RULES = ('综合Listing、售价成本、经营、广告与关键词资�
 
 def defaults():
     """提供显式标注的系统初始配置；读取不写库，不隐式发布。"""
-    return {'schema': 2, 'scenes': {k: v[1] for k, v in SCENES.items()},
+    return {'schema': 3, 'scenes': {k: v[1] for k, v in SCENES.items()},
             'business_rules': DEFAULT_RULES, 'data_notes':deepcopy(DATA_NOTES), 'data': {key: 'send' for key in DATA}}
 
 
@@ -86,15 +89,18 @@ def render(text, variables):
 
 def validate(value):
     """校验完整配置、长度与资料策略；核心身份/执行事实/观察不可移除。"""
-    if not isinstance(value, dict) or set(value) != {'schema','scenes','business_rules','data_notes','data'} or type(value['schema']) is not int or value['schema'] not in (1,2):
+    if not isinstance(value, dict) or set(value) != {'schema','scenes','business_rules','data_notes','data'} or type(value['schema']) is not int or value['schema'] not in (1,2,3):
         raise DomainError('交互配置结构无效', 422)
-    expected=set(SCENES)-set(HUMAN_SCENES) if value['schema']==1 else set(SCENES)
+    expected=set(SCENES)-(set(HUMAN_SCENES) if value['schema']==1 else set())-(set(MODE_SCENES) if value['schema']<3 else set())
     if not isinstance(value['scenes'], dict) or set(value['scenes']) != expected:
         raise DomainError('场景话术必须完整，不能添加脚本条件', 422)
     value=deepcopy(value)
     if value['schema']==1:
         value['schema']=2
         value['scenes'].update({key:SCENES[key][1] for key in HUMAN_SCENES})
+    if value['schema']==2:
+        value['schema']=3
+        value['scenes'].update({key:SCENES[key][1] for key in MODE_SCENES})
     if not isinstance(value['data_notes'],dict) or set(value['data_notes'])!=set(DATA_NOTES):raise DomainError('数据阅读及取数说明必须完整',422)
     if not isinstance(value['data'], dict) or set(value['data']) != set(DATA) or any(mode not in ('send','on_demand') for mode in value['data'].values()):
         raise DomainError('本期资料仅支持首轮发送或按需提供；核心执行事实始终发送', 422)
@@ -146,13 +152,14 @@ def overview():
         published=version(cur,row['published_version_id']) if row['published_version_id'] else None
         cur.execute('SELECT id,config_hash,actor_id,created_at FROM ai_operation_prompt_versions ORDER BY id DESC LIMIT 50')
         versions=[{**r,'id':str(r['id'])} for r in cur.fetchall()]
-    from . import human_contract
+    from . import human_contract, discussion
     return {'revision':row['revision'],'published':published,'draft':validate(json.loads(row['draft_json'])) if row['draft_json'] else (published['config'] if published else defaults()),
             'versions':versions,'scene_options':[{'key':k,'label':v[0]} for k,v in SCENES.items()],
             'data_options':[{'key':k,'label':v[0]} for k,v in DATA.items()], 'variables':list(VARIABLES),
             'fixed_protocol':conversation_context.SYSTEM,'human_protocol':human_contract.SYSTEM,
-            'configuration_note':'人工续聊新增4种可配置场景。旧发布版本不会被改写；若旧版本没有这些场景，新任务显式补入系统初始话术，并在请求快照记录升级及原发布摘要。发布新版本后采用完整配置。',
-            'fixed_note':'固定协议包含JSON输出、数据口径、Listing规范、执行与观察约束；可见但不能通过业务话术关闭。资料内口径注释仍随来源保存。'}
+            'discussion_protocol':discussion.SYSTEM,'proposal_protocol':conversation_context.SYSTEM+'\n'+discussion.PROPOSAL_BOUNDARY,
+            'configuration_note':'讨论和生成方案使用独立可配置场景；旧发布版本缺少的新场景只读补入初始话术，并记录原发布摘要。旧人工场景仅用于无模式的历史任务。讨论不发送运营要求、Listing规范及方案协议；方案与每日使用同一种JSON协议。',
+            'fixed_note':'每日与生成方案使用JSON、数据口径、Listing规范及观察约束；讨论只有最小事实边界，不发送这些执行协议。实际请求以所选模式的免费预览和消息附件为准。'}
 
 
 def save(body, actor):
