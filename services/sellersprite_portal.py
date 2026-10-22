@@ -152,10 +152,18 @@ def config_list(params):
     with session() as cur:
         cur.execute('SELECT COUNT(*) AS n FROM sellersprite_asin_config c WHERE '+where,args)
         total=cur.fetchone()['n']
-        cur.execute('''SELECT c.*,(SELECT t.status FROM sellersprite_keyword_tasks t
-            WHERE t.asin=c.asin AND t.marketplace=c.marketplace ORDER BY t.record_date DESC,t.id DESC LIMIT 1) AS latest_status
+        cur.execute('''SELECT c.*,(SELECT t.id FROM sellersprite_keyword_tasks t
+            WHERE t.asin=c.asin AND t.marketplace=c.marketplace ORDER BY t.record_date DESC,t.id DESC LIMIT 1) AS latest_task_id
             FROM sellersprite_asin_config c WHERE '''+where+' ORDER BY c.priority DESC,c.id DESC LIMIT %s OFFSET %s',args+[size,(page-1)*size])
         rows = [{key:iso(value) for key,value in row.items()} for row in cur.fetchall()]
+        from services.sellersprite_recovery import diagnose, safe_message
+        for row in rows:
+            row['latest_status'] = None
+            if row['latest_task_id']:
+                cur.execute('SELECT status,record_date,error_message FROM sellersprite_keyword_tasks WHERE id=%s', (row['latest_task_id'],))
+                task = cur.fetchone()
+                row.update(latest_status=task['status'], latest_date=iso(task['record_date']),
+                           latest_error=safe_message(task['error_message']), diagnostic=diagnose(task['error_message'], task['status']))
         config_identities(cur, rows)
         return {'list':rows, 'total':total,'page':page,'page_size':size}
 
@@ -232,9 +240,13 @@ def keyword_data(cur, asin, params, condition=None, facets=False):
             WHERE t.asin=%s AND t.marketplace='US' AND t.period='last30days' AND t.status='completed'
             ORDER BY t.record_date DESC,t.id DESC LIMIT 100''',(asin,))
     snapshots=[{key:(str(value) if key=='id' else iso(value)) for key,value in row.items() if key!='latest_file_id'} for row in cur.fetchall()]
-    cur.execute("SELECT status,record_date FROM sellersprite_keyword_tasks WHERE asin=%s AND marketplace='US' ORDER BY record_date DESC,id DESC LIMIT 1",(asin,))
+    cur.execute("SELECT id,status,record_date,error_message FROM sellersprite_keyword_tasks WHERE asin=%s AND marketplace='US' ORDER BY record_date DESC,id DESC LIMIT 1",(asin,))
     latest=cur.fetchone()
-    if latest: latest={key:iso(value) for key,value in latest.items()}
+    if latest:
+        from services.sellersprite_recovery import diagnose, safe_message
+        latest={key:iso(value) for key,value in latest.items()}
+        latest['error_message'] = safe_message(latest['error_message'])
+        latest['diagnostic'] = diagnose(latest['error_message'], latest['status'])
     result={'asin':asin,'marketplace':'US','period':'last30days','snapshots':snapshots,'latest_attempt':latest,'snapshot':None,'list':[],'total':0,'page':page,'page_size':size,'columns':columns()}
     selected=task_id or (snapshots[0]['id'] if snapshots else None)
     if facets:

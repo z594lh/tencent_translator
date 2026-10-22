@@ -5,6 +5,7 @@ from functools import wraps
 
 from flask import Blueprint, current_app, jsonify, request, send_file
 from services import sellersprite_service as service
+from services import sellersprite_recovery as recovery
 
 sellersprite_bp = Blueprint('sellersprite', __name__, url_prefix='/api/sellersprite')
 
@@ -54,8 +55,19 @@ def asins():
 @machine_api
 def claim():
     data = json_object()
-    result = service.claim_task(data.get('asin'), data.get('record_date'), data.get('worker_id'))
+    result = service.claim_task(data.get('asin'), data.get('record_date'), data.get('worker_id'), data.get('recovery_id'))
     return jsonify(status='success', data=result)
+
+
+@sellersprite_bp.post('/recovery/prepare')
+@machine_api
+def prepare_recovery():
+    """由虚拟机小时任务发现失败和消费到期补救；浏览器不能使用此机器入口。"""
+    data = json_object()
+    limit = int(data.get('limit', 20))
+    if not 1 <= limit <= 200:
+        raise service.PipelineError('limit超出范围')
+    return jsonify(status='success', data=recovery.prepare(limit, data.get('worker_id', '')))
 
 
 @sellersprite_bp.post('/tasks/<int:task_id>/progress')

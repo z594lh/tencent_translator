@@ -54,15 +54,24 @@ def candidates():
 
 
 def pending_asins(day=None, limit=50):
+    """列出正常日采候选；补救队列和账号阻塞由专用小时入口处理。"""
     day = record_date(day)
     eligible = candidates()
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            cur.execute('SELECT blocked FROM sellersprite_worker_state WHERE id=1')
+            state = cur.fetchone()
+            if state and state['blocked']:
+                return [], 0
             cur.execute("SELECT asin,status,lease_until FROM sellersprite_keyword_tasks WHERE marketplace='US' AND record_date=%s AND period='last30days'", (day,))
             existing = {row['asin']: row for row in cur.fetchall()}
+            cur.execute("SELECT asin FROM sellersprite_recovery_queue WHERE record_date=%s AND status IN ('queued','running','blocked','exhausted')", (day,))
+            recovering = {row['asin'] for row in cur.fetchall()}
         result = []
         for asin, sources in eligible.items():
+            if asin in recovering:
+                continue
             task = existing.get(asin)
             if task and (task['status'] == 'completed' or (task['lease_until'] and task['lease_until'] > utcnow()
                                                            and task['status'] in ('running', 'downloaded'))):
@@ -73,7 +82,11 @@ def pending_asins(day=None, limit=50):
         conn.close()
 
 
-def claim_task(asin, day, worker_id):
+def claim_task(asin, day, worker_id, recovery_id=None):
+    """同事务领取任务与补救队列；执行日志保留旧失败而不是清掉唯一证据。"""
+    from services import sellersprite_recovery as recovery
+    if recovery_id is not None and (isinstance(recovery_id, bool) or not str(recovery_id).isdigit()):
+        raise PipelineError('补救编号无效')
     asin = str(asin or '').strip().upper()
     if not re.fullmatch(r'[A-Z0-9]{10}', asin):
         raise PipelineError('ASIN格式错误')
@@ -102,14 +115,25 @@ def claim_task(asin, day, worker_id):
             cur.execute('SELECT * FROM sellersprite_keyword_tasks WHERE id=%s FOR UPDATE', (task_id,))
             task = cur.fetchone()
             if task['status'] == 'completed':
+                recovery.settle(cur, task, 'completed')
                 conn.commit()
                 return {'id': task_id, 'status': 'completed', 'asin': asin, 'row_count': task['row_count']}
             if task['lease_until'] and task['lease_until'] > now and task['status'] in ('running', 'downloaded'):
                 raise PipelineError('任务已被领取，等待租约结束后重试', 409)
+            if recovery_id is not None:
+                recovery.claim_queue(cur, task, int(recovery_id))
+            else:
+                cur.execute("SELECT id FROM sellersprite_recovery_queue WHERE asin=%s AND record_date=%s AND status IN ('queued','running','blocked','exhausted')", (asin, day))
+                if cur.fetchone():
+                    raise PipelineError('该任务由补救队列管理，请等待小时任务', 409)
+            if task.get('error_message'):
+                info = recovery.diagnose(task['error_message'], task['status'])
+                recovery.append_event(cur, task, info['stage'], info['code'], task['error_message'])
             lease = now + timedelta(hours=2)
             cur.execute("""UPDATE sellersprite_keyword_tasks SET status='running',worker_id=%s,claim_token=%s,
                 lease_until=%s,attempts=attempts+1,started_at=%s,updated_at=%s,error_message=NULL
                 WHERE id=%s""", (worker_id, token, lease, now, now, task_id))
+            recovery.append_event(cur, {**task, 'attempts': task['attempts'] + 1}, 'worker', 'STARTED', '已领取任务，准备查询或恢复上传')
         conn.commit()
         return {'id': task_id, 'asin': asin, 'marketplace': 'US', 'record_date': day.isoformat(),
                 'claim_token': token, 'lease_until': lease.isoformat() + 'Z', 'status': 'running'}
@@ -135,6 +159,8 @@ def _locked_task(cur, task_id, token, allow_completed=False):
 
 
 def update_progress(task_id, token, data):
+    """接收令牌绑定的阶段或失败，心跳不重复写事件；失败同步限次队列。"""
+    from services import sellersprite_recovery as recovery
     status = data.get('status')
     if status not in ('running', 'downloaded', 'failed', 'action_required'):
         raise PipelineError('不允许的进度状态')
@@ -147,10 +173,12 @@ def update_progress(task_id, token, data):
             if status == 'downloaded' and (not local_path or not file_name):
                 raise PipelineError('下载完成需要文件名和虚拟机路径')
             lease = utcnow() + timedelta(hours=2) if status in ('running', 'downloaded') else None
-            error = str(data.get('error_message') or '')[:1000] or None
+            error = recovery.safe_message(data.get('error_message')) or None
             cur.execute("""UPDATE sellersprite_keyword_tasks SET status=%s,local_path=%s,file_name=%s,
                 lease_until=%s,error_message=%s,updated_at=%s WHERE id=%s""",
                         (status, local_path, file_name, lease, error, utcnow(), task_id))
+            if data.get('diagnostic') or status in ('downloaded', 'failed', 'action_required'):
+                recovery.settle(cur, task, status, error, data.get('diagnostic'))
         conn.commit()
         return {'id': task_id, 'status': status}
     except Exception:
@@ -162,6 +190,7 @@ def update_progress(task_id, token, data):
 
 def receive_file(task_id, token, upload, expected_hash):
     """原文件不可变保存；文件记录、明细和任务完成在同一数据库事务内提交。"""
+    from services import sellersprite_recovery as recovery
     if not upload.filename or not upload.filename.lower().endswith('.xlsx'):
         raise PipelineError('仅接受卖家精灵原始xlsx文件')
     if not re.fullmatch(r'[a-f0-9]{64}', str(expected_hash or '')):
@@ -196,6 +225,7 @@ def receive_file(task_id, token, upload, expected_hash):
                     cur.execute("UPDATE sellersprite_keyword_tasks SET status='completed',latest_file_id=%s,row_count=%s,error_message=NULL,lease_until=NULL,completed_at=%s,updated_at=%s WHERE id=%s", (previous['id'], previous['row_count'], utcnow(), utcnow(), task_id))
                 else:
                     cur.execute("UPDATE sellersprite_keyword_tasks SET status='parse_failed',latest_file_id=%s,error_message=%s,lease_until=NULL,updated_at=%s WHERE id=%s", (previous['id'], previous['error_message'], utcnow(), task_id))
+                recovery.settle(cur, task, 'completed' if previous['status'] == 'imported' else 'parse_failed', previous.get('error_message'))
                 conn.commit()
                 return {**previous, 'file_id': previous['id'], 'task_id': task_id, 'duplicate': True}
             if task['status'] == 'completed':
@@ -233,6 +263,7 @@ def receive_file(task_id, token, upload, expected_hash):
                 row_count=%s,error_message=%s,lease_until=NULL,completed_at=%s,updated_at=%s WHERE id=%s""",
                         ('parse_failed' if error else 'completed', file_id, file_name, len(rows), error,
                          now if not error else None, now, task_id))
+            recovery.settle(cur, task, 'parse_failed' if error else 'completed', error)
         conn.commit()
         return {'task_id': task_id, 'file_id': file_id, 'status': status, 'row_count': len(rows), 'error_message': error}
     except Exception:
