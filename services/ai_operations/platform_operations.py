@@ -251,12 +251,13 @@ def link_history(identity, action, receipt):
     if not proof: return
     listing = action['kind'].startswith('listing_')
     table = 'amazon_listing_change_history' if listing else 'amazon_ads_history'
+    proof_field='confirmation_id' if proof.get('confirmation_id') else 'run_id'
     try:
         with plan_store.transaction() as cur:
-            cur.execute('SELECT id'+(',submission_id' if listing else '')+' FROM '+table+''' WHERE shop_id=%s
-                AND JSON_UNQUOTE(JSON_EXTRACT(audit_context_json,'$.run_id'))=%s
-                AND JSON_UNQUOTE(JSON_EXTRACT(audit_context_json,'$.action_id'))=%s ORDER BY id''',
-                (identity['id'], str(proof['run_id']), proof['action_id']))
+            cur.execute('SELECT id'+(',submission_id' if listing else '')+' FROM '+table+" WHERE shop_id=%s "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(audit_context_json,'$."+proof_field+"'))=%s "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(audit_context_json,'$.action_id'))=%s ORDER BY id",
+                (identity['id'], str(proof[proof_field]), proof['action_id']))
             rows = cur.fetchall()
         receipt['history_ids'] = [str(row['id']) for row in rows]
         if listing and len(rows) == 1:

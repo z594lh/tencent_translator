@@ -5,8 +5,9 @@ import pymysql
 from blueprints.user_auth import login_required
 from services.permissions_service import get_user_permission_codes
 from services.listing_performance.common import DomainError, positive_id
-from services.ai_operations import repository, managed_store, daily_runner, execution_recovery
+from services.ai_operations import repository, managed_store, daily_runner, execution_recovery, conversation_queries, prompt_configuration, prompt_preview, message_documents
 from services.ai_operations.metrics import dumps
+from services.ai_operations import chat_tasks, daily_queue, confirmations
 
 ai_operations_bp = Blueprint('ai_operations', __name__, url_prefix='/api/ai-operations')
 REQUIRED = {'ai_operations:manage'}
@@ -33,10 +34,13 @@ def endpoint(function):
             authorize()
             result = function(*args, **kwargs)
             authorize()
-            return response({'status': 'success', 'data': result})
+            value,status=result if isinstance(result,tuple) and len(result)==2 else (result,200)
+            return response({'status': 'success', 'data': value},status)
         except DomainError as error:
             return response({'status': 'error', 'message': str(error)}, error.status)
-        except pymysql.MySQLError:
+        except pymysql.MySQLError as error:
+            if error.args and error.args[0] in (1054,1146):
+                return response({'status':'error','message':'AI交互配置/共享会话数据库结构未就绪，请先执行本轮两份迁移SQL；读取和预览不会调用AI'},503)
             return response({'status': 'error', 'message': 'AI托管存储暂不可用；可能已计费或提交平台，请核对执行历史，不重复运行'}, 503)
         except Exception:
             return response({'status': 'error', 'message': 'AI托管流程未完成；可能已计费或提交平台，请核对执行历史，不重复运行'}, 503)
@@ -103,9 +107,9 @@ def managed_history(managed_id):
 @login_required
 @endpoint
 def run_managed(managed_id):
-    """显式触发当天会话主干，拒绝浏览器自定义日期和方案。"""
+    """显式登记当天统一队列，拒绝浏览器自定义日期和方案，不在HTTP等待模型。"""
     if request_body()!={}:raise DomainError('立即运行不接受任意日期或自定义方案参数')
-    return daily_runner.run_one(managed_id,request.current_user['id'],authorize=authorize)
+    return daily_queue.enqueue(managed_id,request.current_user['id']),202
 
 
 @ai_operations_bp.get('/runs/<run_id>')
@@ -122,3 +126,123 @@ def managed_run_detail(run_id):
 def retry_unsent_ads(run_id):
     """明确确认后，仅补原方案确定未发送的广告；不重新调用AI或重放Listing。"""
     return execution_recovery.retry_ads(run_id, request_body(), request.current_user['id'], authorize)
+
+
+@ai_operations_bp.get('/managed/<managed_id>/conversations')
+@login_required
+@endpoint
+def conversation_list(managed_id):
+    """独立会话目录，只读当前范围历次会话，打开页面不创建或收费。"""
+    return {**conversation_queries.listing(managed_id,request.args),'viewer_id':str(request.current_user['id'])}
+
+
+@ai_operations_bp.post('/managed/<managed_id>/conversations')
+@login_required
+@endpoint
+def new_conversation(managed_id):
+    """明确确认后归档并新建共享会话，原执行与每日唯一性不重置。"""
+    return conversation_queries.create(managed_id,request_body(),request.current_user['id'])
+
+
+@ai_operations_bp.get('/conversations/<session_id>/messages')
+@login_required
+@endpoint
+def conversation_messages(session_id):
+    """分页读取真实时间线，不调用AI或触发执行/平台回读。"""
+    return conversation_queries.messages(session_id,request.args)
+
+
+@ai_operations_bp.get('/conversations/<session_id>/messages/<message_id>')
+@login_required
+@endpoint
+def conversation_original(session_id,message_id):
+    """按所属会话查看完整原始资料，不开放任意磁盘文件读取。"""
+    return conversation_queries.original(session_id,message_id)
+
+
+@ai_operations_bp.get('/interaction-config')
+@login_required
+@endpoint
+def interaction_configuration():
+    """只读配置草稿、发布历史与所有固定协议，不自动发布默认配置。"""
+    return prompt_configuration.overview()
+
+
+def configuration_body():
+    """单独限制配置大文本到128KB，不扩大每日执行等旧入口的8KB限制。"""
+    if request.content_length is None or request.content_length>131072:raise DomainError('配置请求为空或超过128KB')
+    return request.get_json(silent=True)
+
+
+@ai_operations_bp.put('/interaction-config')
+@login_required
+@endpoint
+def save_interaction_configuration():
+    """权限内保存草稿/显式发布/回退，只影响后续新任务，不触发运行。"""
+    return prompt_configuration.save(configuration_body(),request.current_user['id'])
+
+
+@ai_operations_bp.post('/interaction-config/preview')
+@login_required
+@endpoint
+def preview_interaction_configuration():
+    """使用真实本地资料免费预览，POST仅读数据，绝不调用付费模型或Amazon。"""
+    return prompt_preview.preview(configuration_body())
+
+
+@ai_operations_bp.get('/conversations/<session_id>/messages/<message_id>/documents/<binding_id>')
+@login_required
+@endpoint
+def conversation_document(session_id,message_id,binding_id):
+    """读取严格绑定会话与消息的不可变附件，不接受磁盘路径或URL。"""
+    return message_documents.read(session_id,message_id,binding_id)
+
+
+@ai_operations_bp.post('/conversations/<session_id>/messages')
+@login_required
+@endpoint
+def send_conversation_message(session_id):
+    """先保存人工问题和任务后快速返回，长分析由独立消费者处理，不能触发平台修改。"""
+    if request.content_length is None or request.content_length>32768:raise DomainError('人工问题请求为空或超过32KB')
+    return chat_tasks.enqueue(session_id,request.get_json(silent=True),request.current_user['id']),202
+
+
+@ai_operations_bp.get('/tasks/<task_id>')
+@login_required
+@endpoint
+def chat_task_status(task_id):
+    """只读后台任务阶段/回复，刷新不重试收费请求。"""
+    return chat_tasks.get(task_id)
+
+
+@ai_operations_bp.post('/tasks/<task_id>/cancel')
+@login_required
+@endpoint
+def cancel_chat_task(task_id):
+    """取消未开始问题或停止后续调用，不撤回已产生费用和响应。"""
+    if request_body()!={}:raise DomainError('取消任务不接受其他参数')
+    return chat_tasks.cancel(task_id,request.current_user['id'])
+
+
+@ai_operations_bp.get('/plans/<plan_id>/confirmation')
+@login_required
+@endpoint
+def plan_confirmation(plan_id):
+    """只读人工方案逐项确认/失效/真实执行状态，不调用平台。"""
+    return confirmations.view(plan_id)
+
+
+@ai_operations_bp.post('/plans/<plan_id>/confirmation')
+@login_required
+@endpoint
+def decide_plan_actions(plan_id):
+    """原hash与行动编号的明确确认/拒绝，确认只入队，正式修改由独立消费者完成。"""
+    return confirmations.decide(plan_id,request_body(),request.current_user['id']),202
+
+
+@ai_operations_bp.get('/plans/<plan_id>/confirmation/executions')
+@login_required
+@endpoint
+def confirmed_execution_records(plan_id):
+    """只读人工确认对应的完整原执行记录，查看不触发提交或平台回读。"""
+    return confirmations.records(plan_id)

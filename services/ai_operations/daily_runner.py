@@ -64,8 +64,10 @@ def summarize(plan,records):
             'context_observation_count':len(context.get('observations',[]))}
 
 
-def run_one(managed_id,actor=None,source='manual',now=None,authorize=None):
-    """运行单个ASIN的每日会话、正式提交、回读及持久反馈。"""
+def run_one(managed_id,actor=None,source='manual',now=None,authorize=None,task=None):
+    """仅由统一消费者运行每日会话；Web/cron必须先持久入队，不允许同步旁路。"""
+    if not task or task.get('task_type')!='daily' or str(task['managed_id'])!=str(managed_id):
+        raise DomainError('每日优化必须先进入统一AI队列',409)
     if interfaces.MODE!='real':raise DomainError('本轮Amazon修改必须使用正式接口',503)
     if source not in ('manual','scheduled'):raise DomainError('触发来源无效')
     now=now or clock()
@@ -83,11 +85,14 @@ def run_one(managed_id,actor=None,source='manual',now=None,authorize=None):
             raise DomainError('AI执行人配置已变化，本次剩余行动未执行',409)
         store.execution_identity(latest)
     with lock(managed):
-        # 未授权的旧配置不登记当天失败账本，管理员授予权限后仍能正常启动。
+        from . import daily_queue,chat_tasks
+        daily_queue.bind(task)
+        # 入队时已经复核过权限；实际消费仍须复核，旧授权不能继续收费或提交。
         active()
         today=now.astimezone(BJ).date()
         end=min(today-timedelta(days=1),now.astimezone(SOURCE_ZONE).date()-timedelta(days=1))
         run=store.begin(managed,today,end,source,actor,run_mode=RUN_MODE)
+        if str(run['id'])!=str(task['run_id']):raise DomainError('每日任务日与原排队账本不一致',409)
         if run['status'] in TERMINAL:return {**run,'reused':True}
         try:
             if not run.get('executor_user_id') or str(run['executor_user_id'])!=str(managed.get('executor_user_id')):
@@ -102,19 +107,29 @@ def run_one(managed_id,actor=None,source='manual',now=None,authorize=None):
             if len(pending)>100:raise DomainError('待核实执行超过100条，请先核对历史',422)
             for record in pending:active();executions.verify(record['id'])
             store.update(run['id'],'analyzing','正在分析当前资料、历史调整快照与观察周期')
+            def registered(pid):
+                """先关联队列与每日原方案，进程中断后不误判为可以重新收费。"""
+                with plan_store.transaction(True) as cur:
+                    chat_tasks.fence(cur,task['id'],task['owner_token'])
+                    cur.execute('UPDATE ai_operation_tasks SET plan_id=%s WHERE id=%s',(pid,task['id']))
+                    cur.execute("UPDATE ai_operation_daily_runs SET status='analyzing',message='DeepSeek正在分析；请求已登记，勿重复发起',plan_id=%s,updated_at=UTC_TIMESTAMP(3) WHERE id=%s",(pid,run['id']))
             plan=plans.generate({'shop_id':managed['shop_id'],'asin':managed['asin'],'report_date':str(run['report_date']),
                                  'request_token':digest(['managed-day',run['id'],interfaces.MODE])[:32],'confirm_ai':True},
                 actor,active,management={'managed_id':managed['id'],'run_id':run['id'],'run_date':today,'now':now.astimezone(timezone.utc)},
-                on_registered=lambda pid:store.update(run['id'],'analyzing','DeepSeek正在分析；输入已保存，可能产生费用，请勿重复发起',plan_id=pid))
+                on_registered=registered,queue_task=task)
             store.update(run['id'],'executing','已保存AI结论，正在正式执行并独立回读',plan_id=plan['id'])
             if plan['status']!='ready':raise DomainError(plan.get('message') or '未形成有效方案',409)
             actions=plan['result']['actions'];unsupported=[]
-            for action in actions:
+            for action in executions.order_actions(actions):
                 if action['mode']!='change':continue
                 if not interfaces.supports(action):unsupported.append(action['action_id']);continue
                 active()
                 operation={'listing_text_update':'text','listing_price_update':'price'}.get(action['kind'],'update')
                 with ai_operation(managed['executor_user_id'],actor,run['id'],action['action_id'],operation):
+                    from . import confirmations
+                    if confirmations.blocks_daily(plan,action,managed['id']):
+                        executions.hold(plan,action,managed['executor_user_id'],'该对象存在待人工处理或已拒绝的有效建议，自动任务不绕过人工决策')
+                        continue
                     records=executions.execute(plan['id'],{'action_ids':[action['action_id']]},
                                                managed['executor_user_id'],active)['list']
                 if records[0]['status'] in ('submitting','submitted','pending','unknown'):
@@ -141,19 +156,21 @@ def run_one(managed_id,actor=None,source='manual',now=None,authorize=None):
 
 
 def run_due(now=None):
-    """北京时间18点30分后遍历启用ASIN，同日已完成的任务直接复用。"""
+    """18:30后仅幂等入队；同ASIN忙/消费者离线仍保留任务，不在cron同步收费执行。"""
+    from . import daily_queue
     now=now or clock();local=now.astimezone(BJ)
     if (local.hour,local.minute)<(18,30):
         return {'status':'not_due','message':'尚未到北京时间18:30，未运行','runtime_mode':'real','processed':0,'failed':0}
     results=[]
     for managed_id in store.enabled_targets():
         try:
-            row=run_one(managed_id,source='scheduled',now=now)
-            results.append({'id':row['id'],'status':row['status'],'reused':row['reused']})
-        except DomainError:
-            results.append({'status':'skipped','reused':False})
-    return {'status':'finished','runtime_mode':'real','processed':len(results),
-            'failed':sum(r['status'] in ('failed','partial') for r in results),'runs':results}
+            row=daily_queue.enqueue(managed_id,source='scheduled',now=now)
+            results.append({'id':row['run']['id'],'task_id':row['task']['id'] if row['task'] else None,
+                            'status':row['run']['status'],'reused':row['reused']})
+        except DomainError as error:
+            results.append({'managed_id':str(managed_id),'status':'enqueue_failed','message':str(error),'reused':False})
+    return {'status':'enqueued','message':'仅登记每日队列，不代表分析执行已完成','runtime_mode':'real','processed':len(results),
+            'failed':sum(r['status']=='enqueue_failed' for r in results),'runs':results}
 
 
 def retained_context(plan):
@@ -188,12 +205,17 @@ def detail(run_id):
 def check_ready():
     """仅验证部署结构；不代表已安装cron、数据已齐或真实API可用。"""
     with plan_store.transaction() as cur:
-        for table,fields in (('ai_operation_managed_asins','id,enabled,actor_id,executor_user_id'),
+        for table,fields in (('ai_operation_managed_asins','id,enabled,actor_id,executor_user_id,current_conversation_id'),
+                             ('ai_operation_conversations','id,scope_key,generation,state,daily_baseline_pending,baseline_plan_id'),
                              ('ai_operation_daily_runs','id,run_date,report_date,plan_id,summary_json,executor_user_id,audit_context_json'),
                              ('ai_operation_plans','id,runtime_mode,input_hash'),
                              ('ai_operation_executions','id,baseline_json,verified_at,audit_context_json')):
             cur.execute('SELECT '+fields+' FROM '+table+' WHERE 1=0')
         for table in conversation_store.TABLES:cur.execute('SELECT id FROM '+table+' WHERE 1=0')
+        from . import prompt_configuration
+        prompt_configuration.check_schema(cur)
+        from . import chat_tasks
+        chat_tasks.schema(cur)
         cur.execute("SELECT group_key FROM cron_task_slots WHERE group_key='task_ai_operations_daily'")
         if not cur.fetchone():raise DomainError('统一任务锁槽未初始化，请执行最新create_tables.sql',503)
         from services import operator_accounts

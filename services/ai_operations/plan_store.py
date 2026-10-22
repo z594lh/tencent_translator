@@ -29,6 +29,7 @@ def serialize(row, detail=False, include_events=True):
     keys = ('id', 'shop_id', 'marketplace_id', 'asin', 'report_date', 'status', 'model', 'contract_version', 'runtime_mode',
             'message', 'error_code', 'actor_id', 'created_at', 'completed_at')
     data = {k: str(row[k]) if k in ('id', 'shop_id') else row[k] for k in keys}
+    data['task_id']=str(row['task_id']) if row.get('task_id') is not None else None
     data['execution_available'] = False
     if detail:
         try:
@@ -47,7 +48,7 @@ def serialize(row, detail=False, include_events=True):
             data['execution_available'] = row['runtime_mode'] == 'real' and row['status'] == 'ready' and bool(result and result.get('execution_available'))
             if include_events:
                 from . import conversation_store
-                data['conversation_events'] = conversation_store.trace(row['id'])
+                data['conversation_events'] = conversation_store.trace(row['id'],row.get('task_id'))
         except (ValueError, TypeError):
             raise DomainError('方案输入或结果摘要不符，请核对存储；未重新调用AI', 503) from None
     return data
@@ -71,16 +72,16 @@ def get(plan_id):
         return serialize(row, True)
 
 
-def insert(pack, dataset, prompt, key, token, actor, model, version):
+def insert(pack, dataset, prompt, key, token, actor, model, version, task_id=None):
     """调用AI前保存同次真实资料、问题和提示参数，异常时保留意图记录。"""
     with transaction(True) as cur:
         cur.execute('''INSERT INTO ai_operation_plans
             (shop_id,marketplace_id,asin,report_date,request_token,request_key,status,model,contract_version,runtime_mode,
-             input_hash,facts_json,dataset_json,prompt_json,actor_id,created_at,message)
-            VALUES (%s,%s,%s,%s,%s,%s,'generating',%s,%s,'real',%s,%s,%s,%s,%s,%s,%s)''',
+             input_hash,facts_json,dataset_json,prompt_json,actor_id,created_at,message,task_id)
+            VALUES (%s,%s,%s,%s,%s,%s,'generating',%s,%s,'real',%s,%s,%s,%s,%s,%s,%s,%s)''',
             (pack['identity']['id'], pack['identity']['marketplace_id'], pack['identity']['asin'], pack['time']['report_end'],
              token, key, model, version, digest([pack, dataset, prompt]), dumps(pack), dumps(dataset), dumps(prompt),
-             positive_id(actor, '用户'), datetime.utcnow(), 'AI分析请求已登记，超时可能已计费；只刷新历史核对，不重复发起'))
+             positive_id(actor, '用户'), datetime.utcnow(), 'AI分析请求已登记，超时可能已计费；只刷新历史核对，不重复发起',task_id))
         return cur.lastrowid
 
 

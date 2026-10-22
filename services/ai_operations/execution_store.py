@@ -16,7 +16,7 @@ def serialize(row):
     result['audit_context'] = json.loads(row['audit_context_json']) if row.get('audit_context_json') else None
     receipt = result['receipt'] or {}
     result['retry_version'] = len(receipt.get('recovery_attempts') or [])
-    result['can_retry'] = (row['runtime_mode'] == 'real' and row['status'] == 'not_sent' and receipt.get('accepted') is False
+    result['can_retry'] = (bool((result['audit_context'] or {}).get('run_id')) and row['runtime_mode'] == 'real' and row['status'] == 'not_sent' and receipt.get('accepted') is False
         and result['action']['kind'].startswith('ads_') and result['retry_version'] < 3 and not receipt.get('history_ids'))
     return result
 
@@ -39,10 +39,14 @@ def insert(cur, plan, action, key, actor, baseline):
     proof = operation_identity.metadata()
     if not proof or proof['executor']['id'] != int(actor) or proof['action_id'] != action['action_id']:
         raise DomainError('AI执行缺少匹配的服务端操作身份，未提交', 403)
-    cur.execute('SELECT plan_id,executor_user_id FROM ai_operation_daily_runs WHERE id=%s', (proof['run_id'],))
-    run = cur.fetchone()
-    if not run or run['plan_id'] != int(plan['id']) or run['executor_user_id'] != int(actor):
-        raise DomainError('执行身份与每日优化方案不匹配，未提交', 409)
+    if proof.get('confirmation_id'):
+        from . import confirmations
+        confirmations.require_execution(cur,plan,proof,action)
+    else:
+        cur.execute('SELECT plan_id,executor_user_id FROM ai_operation_daily_runs WHERE id=%s', (proof['run_id'],))
+        run = cur.fetchone()
+        if not run or run['plan_id'] != int(plan['id']) or run['executor_user_id'] != int(actor):
+            raise DomainError('执行身份与每日优化方案不匹配，未提交', 409)
     cur.execute('''INSERT INTO ai_operation_executions
         (plan_id,action_id,shop_id,marketplace_id,asin,runtime_mode,resource_key,status,
          action_json,baseline_json,actor_id,audit_context_json,created_at,updated_at)

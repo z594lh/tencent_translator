@@ -5,6 +5,7 @@ import re
 from services.listing_performance.common import DomainError, positive_id
 from . import plan_store, execution_store as store, platform_operations as interfaces, execution_diagnostics
 from services.operation_identity import ai_operation
+from services import operation_identity
 from .catalog import REPORT_PLACEMENTS
 from .metrics import ADS_FIELDS,totals,ratios
 
@@ -73,6 +74,11 @@ def require_real(plan):
     """只允许当前正式会话进入真实执行，旧样本不能转换后提交。"""
     if plan['runtime_mode'] != interfaces.MODE or plan['status'] != 'ready' or not plan.get('result'):
         raise DomainError('只能执行当前正式会话有效方案，旧样本不能提交', 409)
+    if plan.get('task_id') is not None or plan.get('ai_call',{}).get('prompt',{}).get('conversation',{}).get('purpose')=='chat':
+        from . import confirmations
+        proof=operation_identity.metadata()
+        if not proof or not proof.get('confirmation_id'):raise DomainError('人工建议必须先经用户明确确认并进入执行队列',409)
+        with plan_store.transaction() as cur:confirmations.require_execution(cur,plan,proof)
 
 
 @contextmanager
@@ -95,6 +101,17 @@ def resource_lock(identity, action):
         finally: conn.close()
 
 
+def order_actions(selected):
+    """按真实选中集合保证同SKU标题先于亮点；日常逐项执行也复用相同顺序。"""
+    ordered=[]
+    for action in selected:
+        if action['kind']=='listing_text_update' and action['subject']['field']=='title_differentiation':
+            ordered.extend(a for a in selected if a not in ordered and a['kind']=='listing_text_update'
+                and a['subject'].get('sku')==action['subject'].get('sku') and a['subject']['field']=='item_name')
+        if action not in ordered:ordered.append(action)
+    return ordered
+
+
 def execute(plan_id, body, actor, authorize):
     """按已保存行动编号执行，浏览器和模型不能临时替换目标参数。"""
     plan_id, actor = positive_id(plan_id, '方案'), positive_id(actor, '用户')
@@ -109,17 +126,9 @@ def execute(plan_id, body, actor, authorize):
         raise DomainError('该行动没有正式适配，未提交', 422)
     results = []
     # 同SKU如同时改标题/亮点，先提交标题；亮点仍实时回读，不能凭上一接口接受就假设已合规。
-    ordered = []
-    for action_id in ids:
-        action = actions[action_id]
-        if action['kind'] == 'listing_text_update' and action['subject']['field'] == 'title_differentiation':
-            ordered.extend(i for i in ids if i not in ordered and actions[i]['kind'] == 'listing_text_update'
-                           and actions[i]['subject'].get('sku') == action['subject'].get('sku') and actions[i]['subject']['field'] == 'item_name')
-        if action_id not in ordered:
-            ordered.append(action_id)
-    for action_id in ordered:
+    for action in order_actions([actions[i] for i in ids]):
         authorize()
-        results.append(_execute_one(plan, actions[action_id], actor, authorize))
+        results.append(_execute_one(plan, action, actor, authorize))
     return {'runtime_mode': interfaces.MODE, 'list': results}
 
 
@@ -155,6 +164,19 @@ def _execute_one(plan, action, actor, authorize):
             execution_id = store.insert(cur, plan, action, interfaces.resource_key(identity, action['ref']), actor,
                 baseline(plan, action, {'value': action['before'], 'source': '分析资料缓存，尚未经平台预检'}))
         return attempt(plan, action, execution_id, authorize)
+
+
+def hold(plan,action,actor,message):
+    """保存明确未发送的政策/依赖冲突，不把阻止的行动冒充成功或可自动补执行。"""
+    identity=plan['dataset']['content']['identity']
+    with resource_lock(identity,action):
+        with plan_store.transaction(True) as cur:
+            old=store.existing(cur,plan['id'],action['action_id'])
+            if old:return store.serialize(old)
+            eid=store.insert(cur,plan,action,interfaces.resource_key(identity,action['ref']),actor,
+                baseline(plan,action,{'value':action['before'],'source':'原分析前值，未提交平台'}))
+            store.submitted(cur,eid,'conflict',{'accepted':False,'runtime_mode':'real','message':message,'policy_hold':True})
+    return read_record(eid)
 
 
 def with_attempt(receipt, recovery):
@@ -229,7 +251,8 @@ def verify(execution_id):
                     'message': '发送前流程中断，未进入平台发送阶段；不会自动接续旧行动'})
             return read_record(execution_id)
         operation = {'listing_text_update': 'text', 'listing_price_update': 'price'}.get(action['kind'], 'update')
-        with ai_operation(proof['executor']['id'], proof['initiated_by']['id'], proof['run_id'], proof['action_id'], operation):
+        context={k:proof.get(k) for k in ('task_id','plan_id','confirmation_id','conversation_id','proposed_by')} if proof.get('confirmation_id') else {}
+        with ai_operation(proof['executor']['id'], proof['initiated_by']['id'], proof['run_id'], proof['action_id'], operation,**context):
             try:
                 result = interfaces.verify(identity, action, record['baseline'].get('prepared') or {}, record['receipt'] or {})
                 status = 'confirmed' if result['matched'] else result['state'] if result['state'] in ('issues', 'conflict') else 'pending'

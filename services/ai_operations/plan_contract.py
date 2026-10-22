@@ -23,7 +23,7 @@ Listing必须使用现有产品事实和完整当前内容，输出能提交的�
 售价要结合当前成本/佣金、广告费率/退款假设，不把零广告利润当实际净利润；普通/企业价区分。不要要求重算用户已确认历史报表。
 关键词是完整词组；近30日流量快照不是日自然曝光，市场月搜索量不是ASIN销售；没有自然曝光/Sessions就不能声称其增幅/商品转化率。
 action_catalog列出本轮真实对象、字段、before、单位、作用范围；每条action只引用一个ref，after给完整新值。不要杜撰ref、实体ID、证据或基线。
-优先生成有依据的具体修改，不受旧影子契约“只观察”“仅自动target”“20%幅度”限制；同时允许观察或无需调整，不能为了数量强行修改。
+有依据才生成具体修改，不受旧影子契约“仅自动target”“20%幅度”限制；今日只观察或无需调整是有效结论，不能为了数量强行修改。
 共享组/活动改动要在理由说明影响范围，不冒充只影响本ASIN。用中文标签而非loose-match/Other on-Amazon/P2等内部英文。
 输出JSON对象，顶层字段summary、actions、notes、history_reviews，history_reviews格式见后文。例子中的ref和证据必须换为输入实际值：
 {"summary":"本轮判断", "actions":[{"ref":"实际action_catalog的ref","mode":"change","after":30,"reason":"结合实际窗口解释10%到30%的理由", "priority":"常规关注", "evidence_refs":["实际证据编号"],"observation":{"metrics":["impressions","acos","net_profit"],"keywords":[],"check_days":[3,7,14],"duration_days":14,"hypothesis":"待验证的影响方向，不把预期当事实","review_when":"什么变化时重新评估"}}],"notes":["需要说明的资料边界"],"history_reviews":[]}

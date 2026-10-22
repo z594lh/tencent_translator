@@ -26,9 +26,11 @@ def build(pack,data,management):
     refs=list(data['catalog']);keys=[interfaces.resource_key(identity,ref) for ref in refs]
     resource_keys=keys
     context={'run_id':str(management['run_id']),'run_date':today,'runtime_mode':interfaces.MODE,
-             'recent_runs':[],'observations':[],'pending_executions':[],
+             'recent_runs':[],'observations':[],'pending_executions':[],'execution_facts':[],'unstarted_actions':[],
              'notes':['下列为正式提交及真实回读；属性一致不证明经营收益由该操作产生。',
                       '观察日龄按北京时间日期；完整改后报告区间从操作次日开始，报表未到或缺失不能认定效果。']}
+    from . import confirmations
+    context['human_decisions']=confirmations.context(management['managed_id'])
     with plan_store.transaction() as cur:
         cur.execute('''SELECT p.*,r.id managed_run_id,r.run_date management_date,r.status daily_status
             FROM ai_operation_daily_runs r JOIN ai_operation_plans p ON p.id=r.plan_id
@@ -41,12 +43,20 @@ def build(pack,data,management):
             if not same_account(plan['facts']['identity'],identity):continue
             cur.execute('SELECT action_id,status,verified_at FROM ai_operation_executions WHERE plan_id=%s ORDER BY id',(plan['id'],))
             completed=cur.fetchall()
+            actual={r['action_id']:r['status'] for r in completed}
+            for action in (plan.get('result') or {}).get('actions',[]):
+                if action['mode']=='change' and action['action_id'] not in actual:
+                    context['unstarted_actions'].append({'plan_id':plan['id'],'run_id':str(row['managed_run_id']),
+                        'action_id':action['action_id'],'ref':action['ref'],'label':action['label'],
+                        'status':'not_started','note':'没有对应执行意图，ERP尚未提交该行动；不能将模型原建议解释为已修改'})
             context['recent_runs'].append({'run_id':str(row['managed_run_id']),'run_date':row['management_date'],
+                'conversation_id':plan['ai_call']['prompt']['conversation']['id'],
                 'status':row['daily_status'],'executions':completed,'plan_id':plan['id'],'report_date':plan['report_date'],
                 'model':plan['model'],'analysis_provider':'deepseek',
                 'execution_mode':plan['runtime_mode'],
                 'input_hash':row['input_hash'],'summary':(plan['result'] or {}).get('summary'),
-                'actions':[{k:a[k] for k in ('action_id','ref','mode','label','kind','reason','observation')}
+                'actions':[{**{k:a[k] for k in ('action_id','ref','mode','label','kind','reason','observation')},
+                            'execution_status':actual.get(a['action_id'],'not_started' if a['mode']=='change' else 'observe_only')}
                            for a in (plan['result'] or {}).get('actions',[])],
                 'snapshot':{'business':[{k:b[k] for k in ('sku','evidence_id','identity_ambiguous','periods')}
                                         for b in plan['dataset']['content']['business']],
@@ -65,6 +75,14 @@ def build(pack,data,management):
     for row in rows:
         record=execution_store.serialize(row);action=record['action'];baseline=record['baseline']
         if not same_account(baseline['identity'],identity):continue
+        # 失败也是真实事实：不能只给成功观察，否则模型会将旧方案中的“已调整”当成执行结果。
+        receipt=record.get('receipt') or {}
+        context['execution_facts'].append({'execution_id':record['id'],'plan_id':record['plan_id'],
+            'action_id':action['action_id'],'ref':action['ref'],'label':action['label'],'status':row['status'],
+            'before':action['before'],'proposed_after':action['after'],'accepted':receipt.get('accepted'),
+            'submitted_at':receipt.get('submitted_at'),'verified_at':row['verified_at'],
+            'note':'未发送，不可按改后效果观察' if row['status']=='not_sent' else
+                   '属性回读一致，不代表商城合规或收益改善' if row['status']=='confirmed' else '以本项状态为准，不以旧模型记忆为准'})
         if row['last_execution_id']!=row['id']:continue
         if row['status'] in ('preparing','submitting','submitted','pending','unknown','issues'):
             context['pending_executions'].append({'execution_id':record['id'],'ref':action['ref'],'label':action['label'],
@@ -160,7 +178,7 @@ def business_evidence(pack,action,start,end):
 def attach(data,context):
     """把本轮会话观察和近期结论登记为可核对证据，并校验归档大小。"""
     # 历史证据与当前证据使用独立编号，模型可明确引用上次执行而非编造关联。
-    for row in context.get('observations',[])+context.get('pending_executions',[]):
+    for row in context.get('execution_facts',[])+context.get('observations',[])+context.get('pending_executions',[]):
         ref='history:execution:'+str(row['execution_id'])
         entry={'label':row['label']+' · 往期执行','kind':'execution_history','data':row}
         data['evidence'][ref]=entry

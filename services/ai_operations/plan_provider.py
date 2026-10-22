@@ -49,6 +49,10 @@ def generate(client, prepared):
         counts = {k: getattr(data, k, None) for k in ('prompt_tokens', 'completion_tokens', 'total_tokens')}
         if all(type(v) is int and 0 <= v <= 10000000 for v in counts.values()) and counts['total_tokens'] == counts['prompt_tokens'] + counts['completion_tokens']:
             usage.update(counts)
+            # 缓存是供应商性能/费用指标，不是会话记忆；缺失时不伪造0或承诺命中。
+            cached={k:getattr(data,k,None) for k in ('prompt_cache_hit_tokens','prompt_cache_miss_tokens')}
+            if all(type(v) is int and v>=0 for v in cached.values()) and sum(cached.values())==counts['prompt_tokens']:
+                usage.update(cached)
         choice = reply.choices[0]; raw = choice.message.content
         usage['finish_reason']=choice.finish_reason
         # 留存模型的最终JSON，不保存或回传隐式思维链；JSON不通过仍能核查原始回答。

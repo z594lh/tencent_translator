@@ -35,7 +35,28 @@ def lock(shop, asin):
         conn.close()
 
 
-def generate(body, actor, check_permissions, management=None,on_registered=None):
+def build_data(shop, asin, report_date, management=None):
+    """预览和正式任务共用真实资料组包，只读本地数据，不创建会话或调用AI。"""
+    pack = facts.preview({'shop_id': shop, 'asin': asin, 'report_date': report_date})
+    data = dataset.build(pack)
+    if management is not None:
+        from . import management_context
+        management_context.attach(data,management_context.build(pack,data,management))
+    data['content']['analysis']={'provider':plan_provider.PROVIDER,'model':plan_contract.MODEL,
+        'execution_mode':interfaces.MODE,'history_is_explicit':True,
+        'output_metrics':sorted(plan_contract.METRICS),
+        'note':'AI提出可执行方案；ERP以实时前值预检后提交，接受不等于属性生效，业绩变化不直接归因于单次改动。'}
+    data['content']['reading_guide']={'windows':'d1/d3/d7/d14/d30=截止日向前对应天数；p7/p14/p30=前等长区间，互相重叠不可累加',
+        'matrices':'columns给字段顺序，rows给逐行值；coverage表示日期覆盖，null未知不等于0',
+        'ads':'spAdvertisedProduct仅本ASIN；spCampaigns/Placement为关联活动；spTargeting/SearchTerm为关联组，可能含其他SKU。五类报表不是五份可累加销售',
+        'keywords':'卖家精灵snapshot为近30日关键词曝光流量结构；月搜索量等是市场级，不能当本ASIN经营量',
+        'history':'recent_runs给近期AI结论及实际执行状态；observations给仍需复盘的具体改动、执行基线和改后区间证据；pending_executions不可认定已改成功'}
+    data['content_hash']=digest(data['content']);data['size_bytes']=len(dumps(data['content']).encode('utf8'))
+    if data['size_bytes']>dataset.MAX_INPUT_BYTES:raise DomainError('完整分析资料超过800KB，本次未调用模型',422)
+    return pack, data
+
+
+def generate(body, actor, check_permissions, management=None,on_registered=None,queue_task=None):
     """整合每日资料并调用持久会话，登记精确输入、结果与记忆检查点。"""
     if not isinstance(body, dict) or set(body) != {'shop_id', 'asin', 'report_date', 'request_token', 'confirm_ai'} or body['confirm_ai'] is not True:
         raise DomainError('选择店铺、ASIN和截止日后确认生成，不接受浏览器提交的模型资料')
@@ -60,23 +81,8 @@ def generate(body, actor, check_permissions, management=None,on_registered=None)
         previous = plan_store.find(token=token)
         if previous:return reused(previous)
         # 同次本地读取直接生成模型资料，自动落库，不要求手工保存快照。
-        pack = facts.preview({'shop_id': shop, 'asin': asin, 'report_date': body['report_date']})
-        data = dataset.build(pack)
-        if management is not None:
-            from . import management_context
-            management_context.attach(data,management_context.build(pack,data,management))
-        data['content']['analysis']={'provider':plan_provider.PROVIDER,'model':plan_contract.MODEL,
-            'execution_mode':interfaces.MODE,'history_is_explicit':True,
-            'output_metrics':sorted(plan_contract.METRICS),
-            'note':'AI提出可执行方案；ERP以实时前值预检后提交，接受不等于属性生效，业绩变化不直接归因于单次改动。'}
-        data['content']['reading_guide']={'windows':'d1/d3/d7/d14/d30=截止日向前对应天数；p7/p14/p30=前等长区间，互相重叠不可累加',
-            'matrices':'columns给字段顺序，rows给逐行值；coverage表示日期覆盖，null未知不等于0',
-            'ads':'spAdvertisedProduct仅本ASIN；spCampaigns/Placement为关联活动；spTargeting/SearchTerm为关联组，可能含其他SKU。五类报表不是五份可累加销售',
-            'keywords':'卖家精灵snapshot为近30日关键词曝光流量结构；月搜索量等是市场级，不能当本ASIN经营量',
-            'history':'recent_runs给近期AI结论及实际执行状态；observations给仍需复盘的具体改动、执行基线和改后区间证据；pending_executions不可认定已改成功'}
-        data['content_hash']=digest(data['content']);data['size_bytes']=len(dumps(data['content']).encode('utf8'))
-        if data['size_bytes']>dataset.MAX_INPUT_BYTES:raise DomainError('完整分析资料超过800KB，本次未调用模型',422)
-        prepared, session = conversation.prepare(data)
+        pack, data = build_data(shop, asin, body['report_date'], management)
+        prepared, session = conversation.prepare(data,queue_task)
         key = digest([data['content_hash'], plan_contract.VERSION, plan_contract.MODEL, plan_provider.VERSION, interfaces.VERSION, digest(prepared)])
         previous = plan_store.find(key=key)
         if previous:return reused(previous)
@@ -106,7 +112,13 @@ def generate(body, actor, check_permissions, management=None,on_registered=None)
             state, code, message = 'invalid', 'contract', str(error)
         except Exception:
             state, code, message = 'unknown', 'analysis_error', '分析回执或校验未完成，可能已计费；请核对历史，不自动重发。Amazon未真实修改'
+        def checkpoint(cur):
+            """每日方案和记忆入库前同事务检查统一队列租约，迟到实例不得覆盖新状态。"""
+            if queue_task:
+                from . import chat_tasks
+                chat_tasks.fence(cur,queue_task['id'],queue_task['owner_token'])
+            conversation_store.checkpoint(cur,session,plan_id,next_memory)
         saved = plan_store.finish(plan_id, state, result, usage, code, message,
-            on_ready=(lambda cur:conversation_store.checkpoint(cur,session,plan_id,next_memory)) if state=='ready' else None)
+            on_ready=checkpoint if state=='ready' else None)
         check_permissions()
         return {**saved, 'reused': False}

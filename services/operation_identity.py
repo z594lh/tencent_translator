@@ -57,13 +57,16 @@ def ads_state():
 
 
 @contextmanager
-def ai_operation(executor_id, initiated_by, run_id, action_id, operation_type='update'):
+def ai_operation(executor_id, initiated_by, run_id, action_id, operation_type='update',*,
+                 task_id=None,plan_id=None,confirmation_id=None,conversation_id=None,proposed_by=None):
     """核对 AI 与人工发起人并建立单行动身份，最后清理；不授权或调用 Amazon。"""
     if not isinstance(action_id, str) or not re.fullmatch(r'a\d{1,2}', action_id):
         raise DomainError('AI行动编号无效')
     if operation_type not in ('text', 'price', 'images', 'update'):
         raise DomainError('AI操作类型无效')
-    run_id = positive_id(run_id, '每日优化记录')
+    run_id = positive_id(run_id, '每日优化记录') if run_id is not None else None
+    if run_id is None and not all((task_id,plan_id,confirmation_id,conversation_id)):
+        raise DomainError('人工执行必须关联确认批次、任务、会话和原方案',409)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -76,8 +79,13 @@ def ai_operation(executor_id, initiated_by, run_id, action_id, operation_type='u
     actor_snapshot = accounts.snapshot(actor)
     proof = {'source': 'AI', 'executor': actor_snapshot, 'initiated_by': accounts.snapshot(initiator),
              'run_id': str(run_id), 'action_id': action_id}
+    if run_id is None:
+        proof.update(run_id=None,task_id=str(positive_id(task_id,'执行任务')),plan_id=str(positive_id(plan_id,'原方案')),
+            confirmation_id=str(positive_id(confirmation_id,'确认批次')),conversation_id=str(positive_id(conversation_id,'共享会话')),
+            confirmed_by=accounts.snapshot(initiator),proposed_by=proposed_by)
+    request_key=f'ai:{run_id}:{action_id}' if run_id is not None else f'ai-confirm:{confirmation_id}:{action_id}'
     state = AuditState(ads_history_active=True, user_id=actor['id'],
-                       ads_history_request_key=f'ai:{run_id}:{action_id}', ads_history_calls=0,
+                       ads_history_request_key=request_key, ads_history_calls=0,
                        ads_history_accepted=0, ads_history_new={})
     token = _current.set({'user': actor, 'metadata': proof, 'operation_type': operation_type, 'ads_state': state})
     try:

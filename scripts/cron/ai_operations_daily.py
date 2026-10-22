@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""每日18:30（北京时间）ASIN托管；DeepSeek收费分析，Amazon正式提交与回读。"""
+"""每日18:30（北京时间）仅登记统一AI队列；ai_worker.py消费后才分析和正式执行。"""
 import argparse
 import json
 from pathlib import Path
