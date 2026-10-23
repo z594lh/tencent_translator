@@ -4,7 +4,7 @@ from datetime import timedelta
 from services.listing_performance.common import DomainError
 from services import operator_accounts
 from . import chat_tasks as tasks, plan_store, plans, daily_runner, conversation_store, conversation
-from . import prompt_configuration, prompt_compiler, plan_contract, plan_provider
+from . import plan_contract, plan_provider, natural_history
 from .metrics import digest,dumps
 
 
@@ -27,9 +27,7 @@ def checkpoint(cur,task,session,memory,result,usage,plan_id=None):
     cur.execute('SELECT revision,state FROM ai_operation_conversations WHERE id=%s FOR UPDATE',(session['id'],))
     current=cur.fetchone()
     if not current or current['state']!='active' or current['revision']!=session['revision']:raise DomainError('会话记忆版本变化，保留原回答，不覆盖',409)
-    cur.execute('''INSERT INTO ai_operation_memory (conversation_id,revision,plan_id,task_id,covered_message_id,memory_json,memory_hash,created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(3))''',
-        (session['id'],session['revision']+1,plan_id,task['id'],task['user_message_id'],dumps(memory),digest(memory)))
+    natural_history.save(cur,session,'task:'+str(task['id']),memory['question'],memory['answer'],'human',task['actor_name'],task['id'],plan_id,task['created_at'])
     cur.execute('UPDATE ai_operation_conversations SET revision=revision+1,updated_at=UTC_TIMESTAMP(3) WHERE id=%s',(session['id'],))
     # 有方案时输入档案移交原plans，保留相同input_hash和明确引用；纯回答继续保存在任务。
     cur.execute('''UPDATE ai_operation_tasks SET status='completed',phase='completed',message=%s,
@@ -72,10 +70,9 @@ def process(task,invoke=None,stopping=None):
             session.update(purpose='chat',chat_mode=current.get('chat_mode'),task_id=task['id'],owner_token=task['owner_token'])
             with plan_store.transaction() as cur:
                 cur.execute('SELECT * FROM ai_operation_messages WHERE id=%s AND task_id=%s',(task['user_message_id'],task['id']))
-                question=conversation_store.checked(cur.fetchone(),'payload_json','payload_hash')['text']
-            prepared=prompt_compiler.prepare_human(data,session,prompt_configuration.active(),question,current.get('chat_mode'))
-            prepared['human_actor']={'user_id':str(task['actor_id']),'name':task['actor_name'],
-                                     'question_at_utc':task['created_at'],'source':'人工续聊，非每日自动任务'}
+                original=conversation_store.checked(cur.fetchone(),'payload_json','payload_hash');question=original['text']
+            session['retry_summary_id']=original.get('retry_summary_id')
+            prepared=conversation.prepare_human(data,session,question,current.get('chat_mode') or 'agent')
             frozen=[pack,data,prepared]
             with plan_store.transaction(True) as cur:
                 tasks.fence(cur,task['id'],task['owner_token'])
@@ -103,7 +100,11 @@ def process(task,invoke=None,stopping=None):
             return
         fail(task,'stopped',str(error),usage)
     except plan_provider.Failure as error:fail(task,error.code,str(error),error.usage)
-    except Exception:fail(task,'unknown','人工分析未正常结束；原请求和回答保留，可能已计费，不自动重试。平台没有因本次人工问答修改',usage)
+    except Exception as error:
+        from .execution_diagnostics import capture
+        diagnostic=capture(error,'human_chat_analysis','chat-task:'+str(task['id']))
+        fail(task,'unknown','人工分析出现内部异常（'+diagnostic['exception_type']+'）；原请求和回答保留，不自动重试，尚未执行平台修改',
+            {**(usage or {}),'diagnostic':diagnostic})
     finally:
         if plan_id:
             with plan_store.transaction(True) as cur:

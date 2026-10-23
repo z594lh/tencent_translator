@@ -30,8 +30,10 @@ def serialize_run(row):
     """解析每日账本摘要并保留任务日期与关联计划。"""
     result = {k: str(v) if v is not None and k in ('id','managed_id','plan_id','actor_id','executor_user_id') else v
               for k,v in row.items() if k not in ('summary_json','audit_context_json')}
-    result['summary'] = json.loads(row['summary_json'])
-    result['audit_context'] = json.loads(row['audit_context_json']) if row.get('audit_context_json') else None
+    from .protocol import object_value
+    summary=object_value(row.get('summary_json'));audit=object_value(row.get('audit_context_json'))
+    result['summary'] = summary if isinstance(summary,dict) else {}
+    result['audit_context'] = audit if isinstance(audit,dict) and isinstance(audit.get('executor'),dict) and isinstance(audit.get('initiated_by'),dict) else None
     return result
 
 
@@ -150,10 +152,12 @@ def listing(params):
                 (row['shop_id'],row['marketplace_id'],row['asin']))
             products=cur.fetchall();row.update(products=products,product_name=next((p['product_name'] for p in products if p['product_name']),None),
                 main_image_url=next((p['main_image_url'] for p in products if p['main_image_url']),None),skus=[p['sku'] for p in products])
-            cur.execute('SELECT * FROM ai_operation_daily_runs WHERE managed_id=%s ORDER BY run_date DESC,id DESC LIMIT 1',(row['id'],))
-            last=cur.fetchone();row['latest_run']=serialize_run(last) if last else None
+            from .optimization_history import latest
+            row['latest_run']=latest(cur,row['id'])
             cur.execute('''SELECT COUNT(*) n FROM ai_operation_executions e
                 WHERE e.shop_id=%s AND e.marketplace_id=%s AND BINARY e.asin=BINARY %s
+                AND EXISTS(SELECT 1 FROM ai_operation_plans p WHERE p.id=e.plan_id
+                    AND JSON_UNQUOTE(JSON_EXTRACT(CASE WHEN JSON_VALID(p.prompt_json) THEN p.prompt_json ELSE '{}' END,'$.conversation.protocol'))='native-tools-v1')
                 AND e.runtime_mode='real' AND e.status='confirmed' AND NOT EXISTS (
                     SELECT 1 FROM ai_operation_executions n WHERE n.resource_key=e.resource_key
                     AND n.runtime_mode='real' AND n.id>e.id AND n.status IN ('confirmed','submitted','submitting','pending','unknown','issues')) ''',(row['shop_id'],row['marketplace_id'],row['asin']))
@@ -230,10 +234,6 @@ def get_run(run_id):
 
 
 def history(managed_id,params):
-    """只读查询会话相关历史，不触发模型或正式执行。"""
-    managed=get_target(managed_id);page=positive_id(params.get('page',1),'页码')
-    if page>100000:raise DomainError('页码过大')
-    with plan_store.transaction() as cur:
-        cur.execute('SELECT COUNT(*) n FROM ai_operation_daily_runs WHERE managed_id=%s',(managed['id'],));total=cur.fetchone()['n']
-        cur.execute('SELECT * FROM ai_operation_daily_runs WHERE managed_id=%s ORDER BY run_date DESC,id DESC LIMIT 20 OFFSET %s',(managed['id'],(page-1)*20))
-        return {'managed':managed,'list':[serialize_run(r) for r in cur.fetchall()],'page':page,'total':total}
+    """统一历史的旧内部入口也复用新Service，不保留第二套每日列表实现。"""
+    from .optimization_history import listing
+    return listing(managed_id,params)

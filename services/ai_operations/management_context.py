@@ -40,6 +40,7 @@ def build(pack,data,management):
         context['history_limit']=7;context['older_history_omitted']=len(previous)>7
         for row in previous[:7]:
             plan=plan_store.serialize(row,True,include_events=False)
+            if plan.get('legacy'):continue
             if not same_account(plan['facts']['identity'],identity):continue
             cur.execute('SELECT action_id,status,verified_at FROM ai_operation_executions WHERE plan_id=%s ORDER BY id',(plan['id'],))
             completed=cur.fetchall()
@@ -63,7 +64,8 @@ def build(pack,data,management):
                             'keyword_snapshot':plan['dataset']['content']['keywords']['snapshot']}})
             context['recent_runs'][-1]['complete_actions_in_plan']=plan['id']
         extra=(' OR e.resource_key IN ('+','.join(['%s']*len(resource_keys))+')') if resource_keys else ''
-        cur.execute('''SELECT e.*, (SELECT MAX(n.id) FROM ai_operation_executions n
+        cur.execute('''SELECT e.*, (SELECT p.prompt_json FROM ai_operation_plans p WHERE p.id=e.plan_id) origin_prompt,
+            (SELECT MAX(n.id) FROM ai_operation_executions n
                 WHERE n.resource_key=e.resource_key AND n.runtime_mode='real'
                 AND n.status IN ('confirmed','submitting','submitted','pending','unknown','issues')) last_execution_id FROM ai_operation_executions e
             WHERE e.shop_id=%s AND e.marketplace_id=%s AND e.runtime_mode='real'
@@ -73,6 +75,13 @@ def build(pack,data,management):
         rows=cur.fetchall()
         if len(rows)>200:raise DomainError('托管近期执行超过200条，需按对象拆分记忆；未截断观察事项或调用AI',422)
     for row in rows:
+        from .protocol import native_prompt
+        if not native_prompt(row.get('origin_prompt')):
+            # 只保留旧真实状态用于防重，不解析旧action/baseline或恢复旧观察格式。
+            context['execution_facts'].append({'execution_id':str(row['id']),'plan_id':str(row['plan_id']),
+                'label':'旧版执行 #'+str(row['id']),'ref':'legacy:execution:'+str(row['id']),
+                'status':row['status'],'legacy':True,'note':'旧版真实执行账本，仅状态留存；不重放旧操作，不作为新观察数据'})
+            continue
         record=execution_store.serialize(row);action=record['action'];baseline=record['baseline']
         if not same_account(baseline['identity'],identity):continue
         # 失败也是真实事实：不能只给成功观察，否则模型会将旧方案中的“已调整”当成执行结果。

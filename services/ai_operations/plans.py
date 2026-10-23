@@ -7,7 +7,7 @@ from .metrics import digest, dumps
 
 
 def analyze(data,prepared):
-    """每轮唯一付费入口；模型只声明资料需求，不直接调用ERP/Amazon。"""
+    """分析和摘要共用供应商入口；工具由ERP白名单分发，模型不能直连Amazon。"""
     client=plan_provider.create_client()
     try:return plan_provider.generate(client,prepared)
     finally:

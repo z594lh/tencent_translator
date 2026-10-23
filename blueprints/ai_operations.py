@@ -5,9 +5,10 @@ import pymysql
 from blueprints.user_auth import login_required
 from services.permissions_service import get_user_permission_codes
 from services.listing_performance.common import DomainError, positive_id
-from services.ai_operations import repository, managed_store, daily_runner, execution_recovery, conversation_queries, prompt_configuration, prompt_preview, message_documents
+from services.ai_operations import repository, managed_store, daily_runner, execution_recovery, conversation_queries, tools, natural_history,optimization_history
 from services.ai_operations.metrics import dumps
 from services.ai_operations import chat_tasks, daily_queue, confirmations
+from services.ai_operations import tool_activity,prompt_settings
 
 ai_operations_bp = Blueprint('ai_operations', __name__, url_prefix='/api/ai-operations')
 REQUIRED = {'ai_operations:manage'}
@@ -40,7 +41,7 @@ def endpoint(function):
             return response({'status': 'error', 'message': str(error)}, error.status)
         except pymysql.MySQLError as error:
             if error.args and error.args[0] in (1054,1146):
-                return response({'status':'error','message':'AI交互配置/共享会话数据库结构未就绪，请先执行本轮两份迁移SQL；读取和预览不会调用AI'},503)
+                return response({'status':'error','message':'AI工具/共享会话数据库结构未就绪，请先执行本轮新表SQL；页面读取不会调用AI'},503)
             return response({'status': 'error', 'message': 'AI托管存储暂不可用；可能已计费或提交平台，请核对执行历史，不重复运行'}, 503)
         except Exception:
             return response({'status': 'error', 'message': 'AI托管流程未完成；可能已计费或提交平台，请核对执行历史，不重复运行'}, 503)
@@ -100,7 +101,15 @@ def authorize_assignment():
 @endpoint
 def managed_history(managed_id):
     """只读分页查询指定托管ASIN的每日会话历史。"""
-    return managed_store.history(managed_id,request.args)
+    return optimization_history.listing(managed_id,request.args)
+
+
+@ai_operations_bp.get('/history/<source>/<record_id>')
+@login_required
+@endpoint
+def unified_history_detail(source,record_id):
+    """每日与人工共用详情入口；旧记录返回明确占位，不恢复旧方案。"""
+    return optimization_history.detail(source,record_id)
 
 
 @ai_operations_bp.post('/managed/<managed_id>/run')
@@ -160,12 +169,28 @@ def conversation_original(session_id,message_id):
     return conversation_queries.original(session_id,message_id)
 
 
-@ai_operations_bp.get('/interaction-config')
+@ai_operations_bp.get('/conversations/<session_id>/messages/<message_id>/rounds')
 @login_required
 @endpoint
-def interaction_configuration():
-    """只读配置草稿、发布历史与所有固定协议，不自动发布默认配置。"""
-    return prompt_configuration.overview()
+def conversation_tool_rounds(session_id,message_id):
+    """按所属原消息查看完整工具轮次，不调用AI，不受聊天消息页边界影响。"""
+    return tool_activity.detail(session_id,message_id)
+
+
+@ai_operations_bp.get('/tools/statistics')
+@login_required
+@endpoint
+def tool_usage_statistics():
+    """只读已有工具频次/组合和模型用量，不自动付费分析或创建工具。"""
+    return tool_activity.statistics(request.args)
+
+
+@ai_operations_bp.get('/tools')
+@login_required
+@endpoint
+def tool_directory():
+    """只读代码注册的工具目录、参数及人工说明，打开不调用模型。"""
+    return tools.listing()
 
 
 def configuration_body():
@@ -174,28 +199,61 @@ def configuration_body():
     return request.get_json(silent=True)
 
 
-@ai_operations_bp.put('/interaction-config')
+@ai_operations_bp.get('/prompts')
 @login_required
 @endpoint
-def save_interaction_configuration():
-    """权限内保存草稿/显式发布/回退，只影响后续新任务，不触发运行。"""
-    return prompt_configuration.save(configuration_body(),request.current_user['id'])
+def prompt_configuration():
+    """只读当前精简提示词、实际触发条件及默认值；不自动发布或调用AI。"""
+    return prompt_settings.listing()
 
 
-@ai_operations_bp.post('/interaction-config/preview')
+@ai_operations_bp.put('/prompts')
 @login_required
 @endpoint
-def preview_interaction_configuration():
-    """使用真实本地资料免费预览，POST仅读数据，绝不调用付费模型或Amazon。"""
-    return prompt_preview.preview(configuration_body())
+def publish_prompt_configuration():
+    """发布新的不可变提示词版本，不影响在途任务或覆盖旧草稿。"""
+    return prompt_settings.publish(configuration_body(),request.current_user['id'])
+
+
+@ai_operations_bp.get('/prompts/versions')
+@login_required
+@endpoint
+def prompt_versions():
+    """只读历史精简版本，回退也须用户另行确认发布。"""
+    return prompt_settings.history()
+
+
+@ai_operations_bp.post('/prompts/preview')
+@login_required
+@endpoint
+def preview_prompts():
+    """用编辑文本及示例问答免费预览结构；无真实模型和平台调用。"""
+    return prompt_settings.preview(configuration_body())
+
+
+@ai_operations_bp.put('/tools/<name>')
+@login_required
+@endpoint
+def save_tool(name):
+    """仅编辑白名单工具说明或启停，不能在页面编写SQL、URL或代码。"""
+    return tools.update(name,configuration_body(),request.current_user['id'])
+
+
+@ai_operations_bp.get('/conversations/<session_id>/memory')
+@login_required
+@endpoint
+def conversation_memory(session_id):
+    """只读已生成的会话摘要及覆盖范围，不触发收费压缩。"""
+    session,_=conversation_queries.require_session(session_id)
+    return natural_history.describe(session['id'])
 
 
 @ai_operations_bp.get('/conversations/<session_id>/messages/<message_id>/documents/<binding_id>')
 @login_required
 @endpoint
 def conversation_document(session_id,message_id,binding_id):
-    """读取严格绑定会话与消息的不可变附件，不接受磁盘路径或URL。"""
-    return message_documents.read(session_id,message_id,binding_id)
+    """旧附件入口只返回停止支持，不访问已删除表或跨账户资料。"""
+    raise DomainError('旧数据，无法查看；当前请求请在分析过程查看完整原文',410)
 
 
 @ai_operations_bp.post('/conversations/<session_id>/messages')

@@ -14,6 +14,7 @@ TTL_HOURS=24
 def source(plan_id):
     """读取原人工建议和实际账户会话；不信任浏览器提交的身份、参数或目标值。"""
     plan=plan_store.get(positive_id(plan_id,'方案'))
+    if plan.get('legacy'):raise DomainError('旧数据，无法查看或执行；请重新分析',410)
     if plan['status']!='ready' or plan['runtime_mode']!='real' or not plan.get('task_id'):
         raise DomainError('只能确认已完成的人工对话建议',409)
     task,session,managed=chat_tasks.checked_task(plan['task_id'])
@@ -166,12 +167,14 @@ def blocks_daily(plan,action,managed_id):
     sid=plan['ai_call']['prompt']['conversation']['id']
     cutoff=daily_runner.clock().replace(tzinfo=None)-timedelta(hours=TTL_HOURS)
     with plan_store.transaction() as cur:
-        cur.execute('''SELECT p.id,p.result_json,p.result_hash FROM ai_operation_plans p JOIN ai_operation_tasks t ON t.id=p.task_id
+        cur.execute('''SELECT p.id,p.prompt_json,p.result_json,p.result_hash FROM ai_operation_plans p JOIN ai_operation_tasks t ON t.id=p.task_id
             WHERE t.managed_id=%s AND t.conversation_id=%s AND t.task_type='chat' AND t.status='completed'
             AND p.status='ready' AND p.completed_at>%s ORDER BY p.id DESC LIMIT 101''',(managed_id,sid,cutoff))
         rows=cur.fetchall()
         if len(rows)>100:raise DomainError('待处理人工建议过多，停止自动修改并先核对对话',409)
         for row in rows:
+            from .protocol import native_prompt
+            if not native_prompt(row['prompt_json']):continue
             actions=conversation_store.checked(row,'result_json','result_hash')['actions']
             matched=next((a for a in actions if a['ref']==action['ref']),None)
             if not matched:continue
@@ -201,7 +204,7 @@ def context(managed_id):
     """供每日/人工首包恢复有效人工决策，逐项保留未选、拒绝、排队和真实执行状态。"""
     cutoff=daily_runner.clock().replace(tzinfo=None)-timedelta(hours=TTL_HOURS)
     with plan_store.transaction() as cur:
-        cur.execute('''SELECT p.id,p.result_json,p.result_hash,t.conversation_id,t.actor_name,p.completed_at
+        cur.execute('''SELECT p.id,p.prompt_json,p.result_json,p.result_hash,t.conversation_id,t.actor_name,p.completed_at
             FROM ai_operation_plans p JOIN ai_operation_tasks t ON t.id=p.task_id
             JOIN ai_operation_managed_asins m ON m.id=t.managed_id AND m.current_conversation_id=t.conversation_id
             WHERE t.managed_id=%s AND t.task_type='chat' AND t.status='completed' AND p.status='ready'
@@ -210,6 +213,8 @@ def context(managed_id):
         if len(rows)>100:raise DomainError('有效人工方案超过100份，请处理或新建对话后再分析',422)
         result=[];seen=set()
         for row in rows:
+            from .protocol import native_prompt
+            if not native_prompt(row['prompt_json']):continue
             decided=decisions(cur,row['id'])
             cur.execute('SELECT action_id,id,status FROM ai_operation_executions WHERE plan_id=%s',(row['id'],))
             records={r['action_id']:r for r in cur.fetchall()}

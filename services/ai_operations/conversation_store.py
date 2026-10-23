@@ -4,7 +4,7 @@ from services.listing_performance.common import DomainError
 from . import plan_store
 from .metrics import digest, dumps
 
-TABLES = ('ai_operation_conversations', 'ai_operation_messages', 'ai_operation_memory')
+TABLES = ('ai_operation_conversations', 'ai_operation_messages')
 ACCOUNT_FIELDS = ('id', 'credential_group_id', 'region', 'marketplace_id', 'ads_profile_id', 'asin')
 
 
@@ -81,43 +81,11 @@ def peek_session(identity):
 
 
 def restore(cur, session):
-    """只读恢复相同会话记忆及近期反馈，供实际运行和免费预览共用。"""
-    sid=session['id']
-    cur.execute('SELECT * FROM ai_operation_memory WHERE conversation_id=%s ORDER BY revision DESC LIMIT 1', (sid,))
-    memory = cur.fetchone()
-    if (memory['revision'] if memory else 0) != session['revision']:
-        raise DomainError('会话记忆版本不完整，未调用AI', 503)
-    session['memory'] = checked(memory, 'memory_json', 'memory_hash') if memory else None
-    from . import chat_tasks
-    session['recent_turns']=chat_tasks.recent(cur,sid)
-    # 只恢复最近两份终稿/执行反馈；所有旧原文仍按方案编号归档。
-    cur.execute('''SELECT * FROM ai_operation_messages WHERE conversation_id=%s
-        AND event_type IN ('execution_feedback','execution_recovery','confirmation_feedback','human_decision') ORDER BY id DESC LIMIT 6''', (sid,))
-    session['recent_feedback'] = [checked(r, 'payload_json', 'payload_hash') for r in reversed(cur.fetchall())]
-    cur.execute('''SELECT * FROM ai_operation_memory WHERE conversation_id=%s
-        ORDER BY revision DESC LIMIT 2''', (sid,))
-    session['recent_finals'] = []
-    for checkpoint in reversed(cur.fetchall()):
-        if checkpoint['plan_id'] is None:continue
-        cur.execute('SELECT result_json,result_hash FROM ai_operation_plans WHERE id=%s AND status=\'ready\'', (checkpoint['plan_id'],))
-        plan = cur.fetchone()
-        if plan and plan['result_json']:
-            result = checked(plan, 'result_json', 'result_hash')
-            final={'plan_id':str(checkpoint['plan_id']), 'summary':result['summary'],
-                   'history_reviews':result.get('history_reviews',[]),
-                   'complete_message_ref':'plan:'+str(checkpoint['plan_id'])}
-            cur.execute("SELECT * FROM ai_operation_messages WHERE plan_id=%s AND event_type='model_response' ORDER BY round_no DESC LIMIT 1",(checkpoint['plan_id'],))
-            event=cur.fetchone()
-            if event:
-                payload=checked(event,'payload_json','payload_hash')
-                original=(payload.get('usage') or {}).get('raw_output') or dumps(payload.get('response'))
-                if len(original.encode('utf8'))<=16000:
-                    final['assistant_message']={'role':'assistant','content':original}
-                else:final['original_omitted_reason']='单份原回答超过16KB，恢复结论和记忆；完整行动可按方案编号取回'
-            session['recent_finals'].append(final)
+    """上下文只由自然问答/摘要恢复；会话revision继续CAS，不再依赖旧策略表。"""
+    session['memory']=None
 
 
-def append(session_id, plan_id, round_no, event_type, payload, archives=None, task_id=None, owner_token=None):
+def append(session_id, plan_id, round_no, event_type, payload, task_id=None, owner_token=None):
     """幂等追加不可变会话事件，已登记但内容不同则拒绝覆盖。"""
     if event_type not in ('model_request','model_response','data_response','validation_feedback','execution_feedback','execution_recovery','confirmation_feedback'):
         raise DomainError('会话事件类型无效')
@@ -146,9 +114,6 @@ def append(session_id, plan_id, round_no, event_type, payload, archives=None, ta
             (conversation_id,plan_id,task_id,round_no,event_type,payload_json,payload_hash,created_at)
             VALUES (%s,%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(3))''',
             (session_id,plan_id,task_id,round_no,event_type,dumps(payload),digest(payload)))
-        if event_type=='model_request':
-            from . import message_documents
-            message_documents.register(cur,cur.lastrowid,session_id,payload,archives or {})
     return True
 
 
@@ -158,10 +123,8 @@ def checkpoint(cur, session, plan_id, memory):
     current = cur.fetchone()
     if not current or current['revision'] != session['revision'] or current['state']!='active':
         raise DomainError('会话版本已改变，保留本次分析，不覆盖其他记忆',409)
-    cur.execute('''INSERT INTO ai_operation_memory
-        (conversation_id,revision,plan_id,memory_json,memory_hash,created_at)
-        VALUES (%s,%s,%s,%s,%s,UTC_TIMESTAMP(3))''',
-        (session['id'],session['revision']+1,plan_id,dumps(memory),digest(memory)))
+    from . import natural_history
+    natural_history.save(cur,session,'plan:'+str(plan_id),memory['question'],memory['answer'],'daily','ERP',session.get('task_id'),plan_id)
     cur.execute('UPDATE ai_operation_conversations SET revision=revision+1,updated_at=UTC_TIMESTAMP(3) WHERE id=%s', (session['id'],))
     if session.get('purpose')=='daily':
         cur.execute('UPDATE ai_operation_conversations SET daily_baseline_pending=0,baseline_plan_id=%s WHERE id=%s',(plan_id,session['id']))
@@ -179,27 +142,18 @@ def trace(plan_id,task_id=None):
 
 
 def history_index(session_id, offset, limit):
-    """会话内历史索引，支持模型不知道旧方案编号时分页查找。"""
+    """仅索引当前自然问答，不依赖已经删除的策略记忆表。"""
     with plan_store.transaction() as cur:
-        cur.execute('SELECT COUNT(*) n FROM ai_operation_memory WHERE conversation_id=%s',(session_id,))
+        cur.execute('SELECT COUNT(*) n FROM ai_operation_chat_turns WHERE conversation_id=%s',(session_id,))
         total=cur.fetchone()['n']
-        cur.execute('''SELECT m.plan_id,m.task_id,m.revision,COALESCE(p.report_date,t.report_date) report_date,
-            p.result_json,p.result_hash,t.result_json task_result,t.result_hash task_hash
-            FROM ai_operation_memory m LEFT JOIN ai_operation_plans p ON p.id=m.plan_id
-            LEFT JOIN ai_operation_tasks t ON t.id=m.task_id
-            WHERE m.conversation_id=%s ORDER BY m.revision DESC LIMIT %s OFFSET %s''',(session_id,limit,offset))
+        cur.execute('''SELECT h.*,COALESCE(p.report_date,t.report_date) report_date FROM ai_operation_chat_turns h
+            LEFT JOIN ai_operation_plans p ON p.id=h.plan_id LEFT JOIN ai_operation_tasks t ON t.id=h.task_id
+            WHERE h.conversation_id=%s ORDER BY h.id DESC LIMIT %s OFFSET %s''',(session_id,limit,offset))
         rows=[]
         for row in cur.fetchall():
-            if row['plan_id'] is not None:
-                result=checked(row,'result_json','result_hash');ref='plan:'+str(row['plan_id'])
-            else:
-                answer=checked(row,'task_result','task_hash');result=answer.get('plan') or {'summary':answer['reply'],'actions':[]}
-                ref='task:'+str(row['task_id'])
+            ref=('plan:'+str(row['plan_id'])) if row['plan_id'] is not None else 'task:'+str(row['task_id'])
             rows.append({'plan_id':str(row['plan_id']) if row['plan_id'] is not None else None,'ref':ref,
-                         'context_version':row['revision'],'report_date':row['report_date'],
-                         'summary':result['summary'],
-                         'actions':[{'ref':'plan:'+str(row['plan_id'])+':action:'+a['action_id'],
-                                     'label':a['label'],'mode':a['mode'],'kind':a['kind']} for a in result['actions']]})
+                         'report_date':row['report_date'],'question':row['question'],'summary':row['answer'],'actions':[]})
     return {'status':'provided' if rows else 'unavailable','source':'history','rows':rows,
             'total_in_archive':total,'offset':offset,'returned':len(rows),
             'next_offset':offset+len(rows) if rows and offset+len(rows)<total else None}
@@ -209,12 +163,8 @@ def execution_feedback(plan, records, status, message):
     """把已发生的正式执行与独立回读事实追加到同一会话。"""
     info = plan.get('ai_call',{}).get('prompt',{}).get('conversation')
     if not info:return
-    prepared=plan.get('ai_call',{}).get('prompt',{})
     note='ERP真实接口回读事实；属性一致不代表收益改善'
-    # 旧方案只保持原反馈语义；新方案用自身固定版本，不读取今天发布的配置。
-    if prepared.get('interaction'):
-        from . import prompt_compiler
-        note=prompt_compiler.scene(prepared,'execution_feedback')
+    # 执行JSON只供工具查询和折叠审计，不加入后续自然问答上下文。
     payload = {'plan_id':plan['id'],'report_date':plan['report_date'],'status':status,'message':message,
                'execution_mode':'real','note':note,
                'executions':[{'execution_id':r['id'],'action_id':r['action_id'],'status':r['status'],

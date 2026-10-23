@@ -7,7 +7,7 @@ import argparse
 import signal
 import threading
 import uuid
-from services.ai_operations import plan_store, chat_tasks, task_runner, prompt_configuration
+from services.ai_operations import plan_store, chat_tasks, task_runner, tools
 
 LOCK_NAME='ai_operations_shared_chat_worker'
 
@@ -15,7 +15,7 @@ LOCK_NAME='ai_operations_shared_chat_worker'
 def check():
     """只读部署预检；不发心跳、不领取任务、不调用AI或Amazon。"""
     with plan_store.transaction() as cur:
-        chat_tasks.schema(cur);prompt_configuration.check_schema(cur)
+        chat_tasks.schema(cur);tools.check_schema(cur)
     return {'status':'ready','worker':chat_tasks.health(),'note':'只读结构检查通过，不代表服务已启动或AI授权已验证'}
 
 

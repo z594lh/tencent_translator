@@ -1,7 +1,8 @@
 """共享会话的只读分页与明确新建；不调用模型或Amazon，不篡改旧会话原文。"""
 from datetime import timezone
 from services.listing_performance.common import DomainError, positive_id
-from . import plan_store, conversation_store as store, daily_runner, plans, message_documents, chat_tasks
+from . import plan_store, conversation_store as store, daily_runner, plans, chat_tasks
+from .protocol import native_prompt,native_task,object_value,LEGACY_MESSAGE
 
 STATUS = {'not_sent':'未发送','confirmed':'属性已回读确认','rejected':'被拒绝','unknown':'结果待核实',
           'submitted':'已提交待回读','pending':'等待平台处理','preparing':'准备中','submitting':'提交中','issues':'平台处理有问题',
@@ -97,71 +98,44 @@ def create(managed_id,body,actor):
 
 
 def describe(row,plan,task=None):
-    """将一条不可变原事件映射为人可读消息；不重放嵌套历史、不执行模型HTML。"""
-    payload=store.checked(row,'payload_json','payload_hash');kind=row['event_type']
+    """只解释原生事件；旧版返回占位，不兼容旧request_data/final_plan或附件。"""
+    from .protocol import LEGACY_MESSAGE
     result={'id':str(row['id']),'plan_id':str(row['plan_id']) if row['plan_id'] is not None else None,
-            'event_type':kind,
-            'task_id':str(row['task_id']) if row.get('task_id') is not None else None,'role':'erp','round':row['round_no'],
+            'task_id':str(row['task_id']) if row.get('task_id') is not None else None,
+            'event_type':row['event_type'],'role':'erp','round':row['round_no'],
             'created_at':row['created_at'].replace(tzinfo=timezone.utc).isoformat(),'title':'ERP',
-            'text':'','has_original':True,'attachment_name':'原始消息与资料.json','actor':plan.get('actor_name')}
+            'text':'','has_original':True,'attachment_name':'原始请求与结果.json','actor':plan.get('actor_name')}
+    if not row.get('_native'):
+        return {**result,'event_type':'legacy','legacy':True,'title':'旧版本记录','text':LEGACY_MESSAGE,'has_original':False}
+    payload=store.checked(row,'payload_json','payload_hash');kind=row['event_type']
+    result['engine']='native-tools-v1'
     if kind=='user_message':
-        result.update(role='user',title=payload['actor_name'],text=payload['text'],actor=None,attachment_name='用户原话与身份.json')
+        result.update(role='user',title=payload.get('actor_name','运营人员'),text=payload.get('text',''),actor=None)
     elif kind=='model_request':
-        actual=payload.get('messages',[])
-        questions=[r.get('content','') for r in actual if r.get('role')=='user' and not r.get('content','').lstrip().startswith(('{','['))]
-        result.update(title='ERP · 每日例行分析' if row['round_no']==1 else 'ERP · 继续分析',
-            text=questions[0] if row['round_no']==1 and questions else payload.get('control',{}).get('instruction','继续分析已提供资料'),
-            attachment_name='本轮真实问题、规则及运营资料.json')
-        if task and task['task_type']=='chat':result['title']='ERP · 人工问题分析' if row['round_no']==1 else 'ERP · 补查后继续回答'
-    elif kind=='model_response':
-        result.update(role='assistant',title='DeepSeek')
-        answer=payload.get('response') or {}
-        result['response_type']=answer.get('type') if isinstance(answer,dict) else None
-        result['has_error']=bool(payload.get('error_code'))
-        if not isinstance(answer,dict):
-            result['text']='模型输出格式无效，未形成可执行方案；可查看完整原文。'
-            return result
-        if payload.get('error_code'):
-            usage=payload.get('usage') or {}
-            readable=usage.get('readable_reply')
-            if not readable and payload['error_code']=='invalid_output':
-                from .plan_provider import readable_reply
-                readable=readable_reply(usage.get('raw_output',''))
-            result['text']=readable or payload.get('message') or '模型请求未完成，原始结果已保留'
-            result['error_note']=payload.get('message') or '此回答未形成可执行方案'
-        elif answer.get('type')=='request_data':
-            requests=answer.get('requests')
-            result['text']='需要补充以下资料后继续分析：\n'+'\n'.join(str(r.get('reason',''))+'（'+str(r.get('source',''))+' / '+str(r.get('window',''))+'）' for r in requests) if isinstance(requests,list) and all(isinstance(r,dict) for r in requests) else '模型资料请求格式无效，请查看原文'
-        elif answer.get('type') in ('reply','propose_plan'):
-            result['text']=answer.get('reply') if isinstance(answer.get('reply'),str) else '人工回复格式异常，请查看原文'
-        else:
-            value=answer.get('plan') or {}
-            if not isinstance(value,dict) or not isinstance(value.get('summary',''),str) or not isinstance(value.get('actions',[]),list) or any(not isinstance(a,dict) for a in value.get('actions',[])):
-                result['text']='模型方案格式无效，未执行；请查看完整原文与校验反馈。'
-                return result
-            parts=[value.get('summary','')]
-            labels={a['ref']:a.get('label',a['ref']) for a in plan.get('actions',[])}
-            for i,a in enumerate(value.get('actions',[]),1):
-                ref=a.get('ref');label=str(labels.get(ref,ref)) if isinstance(ref,str) else '无法识别的行动对象'
-                parts.append(str(i)+'. '+label+' · '+('建议修改（不代表已执行）' if a.get('mode')=='change' else '观察'))
-                if a.get('mode')=='change':parts.append('建议值：'+ ('\n'.join(str(v) for v in a['after']) if isinstance(a.get('after'),list) else str(a.get('after'))))
-                parts.append(str(a.get('reason','')))
-            for review in value.get('history_reviews',[]) if isinstance(value.get('history_reviews'),list) else []:
-                if isinstance(review,dict):parts.append('往期执行 #'+str(review.get('execution_id',''))+'：'+str(review.get('decision',''))+'\n'+str(review.get('conclusion','')))
-            result['text']='\n\n'.join(p for p in parts if p) or '本轮回答内容请查看原文'
-        result['usage']={k:payload.get('usage',{}).get(k) for k in ('prompt_tokens','completion_tokens','prompt_cache_hit_tokens','prompt_cache_miss_tokens')}
+        result.update(title='ERP · 自然任务',text=payload.get('question',''),
+                      technical=bool(task and task['task_type']=='chat') or row['round_no']>1,memory=payload.get('memory'))
     elif kind=='data_response':
-        result.update(title='ERP · 补充资料',text='\n'.join(str(r.get('request',{}).get('reason',''))+'：'+str(r.get('result',r).get('status','已提供')) for r in payload.get('data_responses',[])),attachment_name='本轮补充资料.json')
-    elif kind=='validation_feedback':result.update(title='ERP · 方案校验反馈',text=payload.get('validation_feedback',{}).get('message','请查看校验原文'))
+        result.update(title='ERP · 工具查询',technical=True,text='工具查询结果已保存')
+    elif kind=='model_response':
+        answer=payload.get('response') or {};answer=answer if isinstance(answer,dict) else {}
+        kind_reply=answer.get('type');is_process=kind_reply in ('tool_calls','tool_progress')
+        result.update(role='assistant',title='AI · 工具分析过程' if is_process else 'DeepSeek',
+                      technical=is_process,response_type=kind_reply,
+                      has_error=bool(payload.get('error_code')),text=answer.get('reply') or payload.get('message') or '本轮没有自然回复')
+        if payload.get('error_code'):result['error_note']=payload.get('message','本次分析未完成，不自动重发')
+        usage=payload.get('usage') or {}
+        result['usage']={k:usage.get(k) for k in ('prompt_tokens','completion_tokens','prompt_cache_hit_tokens','prompt_cache_miss_tokens')}
     elif kind=='human_decision':
-        result.update(role='user',title=payload['actor']['name'],actor=None,
-            text=('已确认执行' if payload['decision']=='execute' else '已明确拒绝')+'行动：'+', '.join(payload['action_ids'])+'。'+payload['note'])
+        actor=payload.get('actor') or {}
+        result.update(role='user',title=actor.get('name','运营人员'),actor=None,
+                      text=('已确认执行' if payload.get('decision')=='execute' else '已拒绝')+'行动：'+', '.join(payload.get('action_ids',[])))
     elif kind in ('execution_feedback','execution_recovery','confirmation_feedback'):
         lines=[payload.get('message',''),payload.get('note','')]
-        for r in payload.get('executions',[]):lines.append(str(r.get('label',r.get('execution_id','')))+'：'+STATUS.get(r.get('status'),r.get('status','待核实')))
-        result.update(title='ERP · 人工确认执行结果' if kind=='confirmation_feedback' else 'ERP · 真实执行结果' if kind=='execution_feedback' else 'ERP · 补执行结果',text='\n'.join(x for x in lines if x))
-    else:result['text']='已保存事件，请查看原文'
+        lines.extend(str(r.get('label',r.get('execution_id','')))+'：'+STATUS.get(r.get('status'),r.get('status','待核实')) for r in payload.get('executions',[]))
+        result.update(title='ERP · 真实执行结果',text='\n'.join(x for x in lines if x),technical=True)
+    else:result.update(text='当前事件原文已保存',technical=True)
     return result
+
 
 
 def messages(session_id,params):
@@ -178,25 +152,26 @@ def messages(session_id,params):
         if not after:rows.reverse()
         plans_by_id={}
         for pid in {r['plan_id'] for r in rows if r['plan_id'] is not None}:
-            cur.execute('''SELECT p.result_json,p.result_hash,COALESCE(NULLIF(u.nickname,''),u.username) actor_name
+            cur.execute('''SELECT p.prompt_json,p.result_json,p.result_hash,COALESCE(NULLIF(u.nickname,''),u.username) actor_name
                 FROM ai_operation_plans p LEFT JOIN users u ON u.id=p.actor_id WHERE p.id=%s''',(pid,))
             p=cur.fetchone()
-            if not p:raise DomainError('会话消息关联方案缺失，请核对历史',503)
-            plans_by_id[pid]={'actions':store.checked(p,'result_json','result_hash').get('actions',[]) if p['result_json'] else [],'actor_name':p['actor_name']}
+            plans_by_id[pid]={'native':bool(p and native_prompt(p['prompt_json'])),'actor_name':p['actor_name'] if p else None}
         items=[]
         from . import chat_tasks
         tasks_by_id={}
         for tid in {r['task_id'] for r in rows if r.get('task_id') is not None}:
             cur.execute('SELECT * FROM ai_operation_tasks WHERE id=%s AND conversation_id=%s',(tid,session['id']))
             task=cur.fetchone()
-            if not task:raise DomainError('人工消息关联任务缺失',503)
-            tasks_by_id[tid]=task
+            if task:task['_native']=native_task(cur,task);tasks_by_id[tid]=task
         for row in rows:
             task=tasks_by_id.get(row.get('task_id'))
+            payload=object_value(row['payload_json'])
+            row['_native']=bool(isinstance(payload,dict) and payload.get('engine')=='native-tools-v1' or
+                                plans_by_id.get(row['plan_id'],{}).get('native') or task and task.get('_native'))
             item=describe(row,plans_by_id.get(row['plan_id'],{'actor_name':task['actor_name'] if task else None,'actions':[]}),task)
-            if task:item['task']=chat_tasks.public(task)
-            item['documents']=message_documents.listing(cur,row['id'])
-            if row['event_type']=='model_request':
+            if task:item['task']=chat_tasks.public(task,task['_native'])
+            item['documents']=[]
+            if row['_native'] and row['event_type']=='model_request':
                 payload=store.checked(row,'payload_json','payload_hash')
                 item['interaction']=payload.get('interaction')
                 field,value=('task_id',row['task_id']) if row.get('task_id') is not None else ('plan_id',row['plan_id'])
@@ -204,7 +179,7 @@ def messages(session_id,params):
                 item['delivery_note']='已有对应调用结果事件（不代表AI读完每个文件）' if cur.fetchone() else '请求已登记；是否收到/计费请核对结果，勿重复运行'
             items.append(item)
         cur.execute("SELECT * FROM ai_operation_tasks WHERE managed_id=%s AND status IN ('queued','running') ORDER BY id LIMIT 20",(managed['id'],))
-        pending=[chat_tasks.public(r) for r in cur.fetchall()]
+        pending=[chat_tasks.public(r,native_task(cur,r)) for r in list(cur.fetchall())]
     return {'session':public_session(session),'managed_id':str(managed['id']),'pending_tasks':pending,
             'list':items,'has_more':more,
             'next_before_id':str(rows[0]['id']) if rows else None,'last_id':str(rows[-1]['id']) if rows else None}
@@ -218,5 +193,12 @@ def original(session_id,message_id):
                     (positive_id(message_id,'消息编号'),session['id']))
         row=cur.fetchone()
     if not row:raise DomainError('该会话中没有此消息',404)
+    payload=object_value(row['payload_json']);current=isinstance(payload,dict) and payload.get('engine')=='native-tools-v1'
+    with plan_store.transaction() as cur:
+        if not current and row.get('plan_id'):
+            cur.execute('SELECT prompt_json FROM ai_operation_plans WHERE id=%s',(row['plan_id'],));p=cur.fetchone();current=bool(p and native_prompt(p['prompt_json']))
+        if not current and row.get('task_id'):
+            cur.execute('SELECT * FROM ai_operation_tasks WHERE id=%s',(row['task_id'],));task=cur.fetchone();current=bool(task and native_task(cur,task))
+    if not current:return {'id':str(row['id']),'legacy':True,'message':LEGACY_MESSAGE,'documents':[]}
     return {'id':str(row['id']),'hash':row['payload_hash'],'event_type':row['event_type'],
-            'payload':store.checked(row,'payload_json','payload_hash')}
+            'payload':store.checked(row,'payload_json','payload_hash'),'documents':[]}

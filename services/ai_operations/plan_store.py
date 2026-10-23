@@ -5,6 +5,7 @@ import json
 from services.mysql_service import get_db_connection
 from services.listing_performance.common import DomainError, positive_id
 from .metrics import digest, dumps
+from .protocol import native_prompt,LEGACY_MESSAGE
 
 
 @contextmanager
@@ -31,6 +32,10 @@ def serialize(row, detail=False, include_events=True):
     data = {k: str(row[k]) if k in ('id', 'shop_id') else row[k] for k in keys}
     data['task_id']=str(row['task_id']) if row.get('task_id') is not None else None
     data['execution_available'] = False
+    data['legacy']=not native_prompt(row.get('prompt_json'))
+    data['detail_available']=not data['legacy']
+    if data['legacy']:
+        return {**data,'message':LEGACY_MESSAGE,'result':None,'dataset':None,'facts':None,'ai_call':{},'usage':None}
     if detail:
         try:
             dataset = json.loads(row['dataset_json'])

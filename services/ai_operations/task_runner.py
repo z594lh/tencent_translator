@@ -6,6 +6,12 @@ from . import chat_runner,chat_tasks,plan_store,daily_runner,managed_store
 
 def process(task,stopping=None):
     """执行一项已领取作业；锁忙退避，已开始外部请求中断不自动重发。"""
+    from .protocol import native_task,LEGACY_MESSAGE
+    with plan_store.transaction() as cur:current_protocol=native_task(cur,task)
+    if not current_protocol:
+        chat_runner.fail(task,'legacy_protocol',LEGACY_MESSAGE)
+        if task.get('run_id'):managed_store.update(task['run_id'],'failed',LEGACY_MESSAGE,done=True)
+        return
     if task['task_type']=='chat':return chat_runner.process(task,stopping=stopping)
     try:
         def permitted():

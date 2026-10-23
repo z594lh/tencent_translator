@@ -100,9 +100,11 @@ def run_one(managed_id,actor=None,source='manual',now=None,authorize=None,task=N
             active()
             # 先核实上次未知/待生效回执，绝不重新提交昨日修改。
             with plan_store.transaction() as cur:
-                cur.execute('''SELECT id FROM ai_operation_executions WHERE shop_id=%s AND marketplace_id=%s
+                cur.execute('''SELECT e.id FROM ai_operation_executions e WHERE shop_id=%s AND marketplace_id=%s
                     AND BINARY asin=BINARY %s AND runtime_mode='real' AND status IN ('preparing','submitting','submitted','pending','unknown','issues')
-                    ORDER BY id LIMIT 101''',(managed['shop_id'],managed['marketplace_id'],managed['asin']))
+                    AND EXISTS(SELECT 1 FROM ai_operation_plans p WHERE p.id=e.plan_id
+                      AND JSON_UNQUOTE(JSON_EXTRACT(CASE WHEN JSON_VALID(p.prompt_json) THEN p.prompt_json ELSE '{}' END,'$.conversation.protocol'))='native-tools-v1')
+                    ORDER BY e.id LIMIT 101''',(managed['shop_id'],managed['marketplace_id'],managed['asin']))
                 pending=cur.fetchall()
             if len(pending)>100:raise DomainError('待核实执行超过100条，请先核对历史',422)
             for record in pending:active();executions.verify(record['id'])
@@ -195,11 +197,8 @@ def retained_context(plan):
 
 def detail(run_id):
     """读取弹框的当前会话详情，不重新生成AI方案或执行动作。"""
-    run=store.get_run(run_id);managed=store.get_target(run['managed_id'])
-    plan=plan_store.get(run['plan_id']) if run['plan_id'] else None
-    return {'run':run,'managed':managed,'plan':plan,
-            'executions':executions.history(plan['id'])['list'] if plan else [],
-            'context':retained_context(plan) if plan else {}}
+    from .optimization_history import detail as history_detail
+    return history_detail('daily',run_id)
 
 
 def check_ready():
@@ -212,8 +211,8 @@ def check_ready():
                              ('ai_operation_executions','id,baseline_json,verified_at,audit_context_json')):
             cur.execute('SELECT '+fields+' FROM '+table+' WHERE 1=0')
         for table in conversation_store.TABLES:cur.execute('SELECT id FROM '+table+' WHERE 1=0')
-        from . import prompt_configuration
-        prompt_configuration.check_schema(cur)
+        from . import tools
+        tools.check_schema(cur)
         from . import chat_tasks
         chat_tasks.schema(cur)
         cur.execute("SELECT group_key FROM cron_task_slots WHERE group_key='task_ai_operations_daily'")

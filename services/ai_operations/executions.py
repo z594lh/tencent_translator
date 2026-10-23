@@ -134,12 +134,15 @@ def execute(plan_id, body, actor, authorize):
 
 def check_pending(cur, identity, action):
     """同账户资源存在不确定提交时禁止新写入，不以新方案绕过旧请求。"""
-    cur.execute("""SELECT * FROM ai_operation_executions WHERE shop_id=%s AND marketplace_id=%s
+    cur.execute("""SELECT e.*,(SELECT p.prompt_json FROM ai_operation_plans p WHERE p.id=e.plan_id) origin_prompt FROM ai_operation_executions e WHERE shop_id=%s AND marketplace_id=%s
         AND runtime_mode='real' AND status IN ('submitting','submitted','pending','unknown','issues')
         ORDER BY id LIMIT 1001""", (identity['id'], identity['marketplace_id']))
     rows = cur.fetchall()
     if len(rows) > 1000: raise DomainError('待核对执行超过1000条，请先处理历史', 409)
     for row in rows:
+        from .protocol import native_prompt
+        if not native_prompt(row.get('origin_prompt')):
+            raise DomainError('该账户有旧版未核实提交，请先核对原操作日志；本次不解析或重放旧操作',409)
         saved = store.serialize(row)
         if interfaces.lock_key(saved['baseline']['identity'], saved['action']) == interfaces.lock_key(identity, action):
             raise DomainError('该SKU或活动有未确认提交，请先回读，不重复修改', 409)

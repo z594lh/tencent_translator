@@ -39,9 +39,11 @@ def enqueue(managed_id,actor=None,source='manual',now=None):
             (managed['id'],conversation_store.scope(identity)[1],digest(['daily',managed['id'],str(today)])[:32],actor,
              (initiator.get('nickname') or initiator['username'])[:100],rid,now.astimezone(timezone.utc).replace(tzinfo=None),end))
         tid=cur.lastrowid
+        marker={'engine':'native-tools-v1'}
+        cur.execute('UPDATE ai_operation_tasks SET input_json=%s,input_hash=%s WHERE id=%s',(dumps(marker),digest(marker),tid))
         cur.execute('SELECT * FROM ai_operation_tasks WHERE id=%s',(tid,));task=cur.fetchone()
         cur.execute('SELECT * FROM ai_operation_daily_runs WHERE id=%s',(rid,))
-        return {'run':managed_store.serialize_run(cur.fetchone()),'task':chat_tasks.public(task),'reused':False}
+        return {'run':managed_store.serialize_run(cur.fetchone()),'task':chat_tasks.public(task,True),'reused':False}
 
 
 def bind(task):
