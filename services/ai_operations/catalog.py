@@ -3,10 +3,10 @@ import json
 from decimal import Decimal, InvalidOperation
 from services.ads_display import auto_label, PLACEMENTS
 from services import listing_content_policy
+from services.business_dictionary import DictionaryMapping
 from .metrics import digest
 
-TEXT_FIELDS = {'item_name': '商品标题', 'title_differentiation': '商品亮点', 'bullet_point': '五点描述',
-               'product_description': '商品描述', 'generic_keyword': '后台搜索词'}
+TEXT_FIELDS = DictionaryMapping('listing.field',builtin_only=True)
 PLACEMENT_CODES = {'PLACEMENT_TOP': 'TOP', 'PLACEMENT_REST_OF_SEARCH': 'REST_OF_SEARCH',
                    'PLACEMENT_PRODUCT_PAGE': 'PRODUCT_PAGE'}
 REPORT_PLACEMENTS = {'Top of Search on-Amazon': 'PLACEMENT_TOP', 'Other on-Amazon': 'PLACEMENT_REST_OF_SEARCH',

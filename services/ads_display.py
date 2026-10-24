@@ -1,34 +1,21 @@
-"""广告只读展示规则；不修改原事件、实体代码、金额或操作证据，不执行IO。"""
+"""广告只读展示规则；中文名称复用全系统字典，不修改事件、实体代码、金额或操作证据。"""
 import copy
 import json
 import re
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from services.business_dictionary import DictionaryMapping, aliases, canonical
 
-AUTO_LABELS = {'QUERY_HIGH_REL_MATCHES': '紧密匹配', 'QUERY_BROAD_REL_MATCHES': '宽泛匹配',
-               'ASIN_ACCESSORY_RELATED': '关联商品', 'ASIN_SUBSTITUTE_RELATED': '同类商品'}
-AUTO_ALIASES = {'close-match': 'QUERY_HIGH_REL_MATCHES', 'loose-match': 'QUERY_BROAD_REL_MATCHES',
-                'complements': 'ASIN_ACCESSORY_RELATED', 'substitutes': 'ASIN_SUBSTITUTE_RELATED'}
-STATES = {'ENABLED': '启用', 'PAUSED': '暂停', 'ARCHIVED': '归档', 'CREATED': '已添加'}
-STRATEGIES = {'OPTIMIZE_FOR_SALES': '动态竞价－提高和降低', 'AUTO_FOR_SALES': '动态竞价－提高和降低',
-              'LEGACY': '动态竞价－仅降低', 'LEGACY_FOR_SALES': '动态竞价－仅降低', 'MANUAL': '固定竞价'}
-PLACEMENTS = {'TOP': '搜索结果顶部（首页）', 'TOP_OF_SEARCH': '搜索结果顶部（首页）',
-              'DETAIL_PAGE': '商品页面', 'PRODUCT_PAGE': '商品页面', 'REST_OF_SEARCH': '搜索结果的其余位置'}
-CHANGES = {'BID_AMOUNT': '竞价', 'DEFAULT_BID_AMOUNT': '默认竞价', 'BUDGET_AMOUNT': '每日预算',
-           'PLACEMENT_GROUP': '广告位竞价调整', 'SMART_BIDDING_STRATEGY': '竞价方案', 'STATUS': '投放状态',
-           'NAME': '名称', 'START_DATE': '开始日期', 'END_DATE': '结束日期', 'CREATED': '创建/添加',
-           'IN_BUDGET': '广告活动预算状态', 'RULE_BASED_BUDGET_VALUE': '规则调整预算'}
-CHANGES.update({'PORTFOLIO': '广告组合', 'PORTFOLIO_ID': '广告组合', 'AUTO_TARGETED': '自动投放',
-                'APPLICABLE_RULE_NAME': '适用规则名称', 'APPLICABLE_RULE_ID': '适用规则 ID',
-                'IS_PREMIUM_BID_ENABLED': '加价设置', 'BUDGET_DOCUMENT_VERSION': '预算版本',
-                'IS_PROCESSING': '处理状态', 'CREATION_DATE': '创建时间'})
-ENTITIES = {'CAMPAIGN': '广告活动', 'AD_GROUP': '广告组', 'AD': '广告商品', 'KEYWORD': '关键词',
-            'NEGATIVE_KEYWORD': '否定关键词', 'PRODUCT_TARGETING': '投放项',
-            'NEGATIVE_PRODUCT_TARGETING': '否定商品', 'THEME': '主题投放'}
-MATCHES = {'NEGATIVE_KEYWORD_EXACT': '精准匹配', 'NEGATIVE_KEYWORD_PHRASE': '词组匹配',
-           'NEGATIVE_KEYWORD_BROAD': '广泛匹配', 'KEYWORD_EXACT': '精准匹配',
-           'KEYWORD_PHRASE': '词组匹配', 'KEYWORD_BROAD': '广泛匹配'}
+# 兼容原公共常量接口，但名称仅有字典这一个来源；自动类型集合仍只允许程序内置四类。
+AUTO_LABELS = DictionaryMapping('ads.auto_target', builtin_only=True)
+AUTO_ALIASES = aliases('ads.auto_target')
+STATES = DictionaryMapping('ads.state')
+STRATEGIES = DictionaryMapping('ads.strategy')
+PLACEMENTS = DictionaryMapping('ads.placement')
+CHANGES = DictionaryMapping('ads.change')
+ENTITIES = DictionaryMapping('ads.entity')
+MATCHES = DictionaryMapping('ads.match')
 AMOUNTS = {'BID_AMOUNT', 'DEFAULT_BID_AMOUNT', 'BUDGET_AMOUNT', 'RULE_BASED_BUDGET_VALUE'}
 
 
@@ -40,7 +27,7 @@ def raw_text(value):
 
 def auto_label(value):
     if not isinstance(value, str): return None
-    code = AUTO_ALIASES.get(value.lower(), value.upper())
+    code = canonical('ads.auto_target',value)
     return AUTO_LABELS.get(code)
 
 

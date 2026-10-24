@@ -134,13 +134,16 @@ def describe(sid):
             'note':'长期上下文只有原问题、最终回答及其摘要；工具过程和资料不进入下一次续聊。超限压缩可能额外计费。'}
 
 
-def search(sid,query,offset,limit):
+def search(sid,query,offset,limit,max_bytes=96000):
     """本会话检索完整问答，不返回原资料/工具协议。"""
     where='conversation_id=%s';params=[sid]
     if query:where+=' AND (LOCATE(%s,question)>0 OR LOCATE(%s,answer)>0)';params.extend([query,query])
     with plan_store.transaction() as cur:
         cur.execute('SELECT COUNT(*) n FROM ai_operation_chat_turns WHERE '+where,tuple(params));count=cur.fetchone()['n']
         cur.execute('SELECT id,question,answer,created_at,completed_at FROM ai_operation_chat_turns WHERE '+where+' ORDER BY id DESC LIMIT %s OFFSET %s',tuple([*params,limit,offset]));rows=list(cur.fetchall())
-    while rows and len(dumps(rows).encode('utf8'))>28000:rows.pop()
-    return {'rows':rows,'total':count,'offset':offset,'next_offset':offset+len(rows) if rows and offset+len(rows)<count else None,
+    from .tools.data import fit
+    requested=len(rows);rows=fit(rows,max(0,max_bytes-1500))
+    return {'rows':rows,'total':count,'returned':len(rows),'offset':offset,'has_more':offset+len(rows)<count,
+            'byte_limited':len(rows)<requested,'next_offset':offset+len(rows) if rows and offset+len(rows)<count else None,
+            'reason':'单条完整问答超过当前预算，请在页面查看原文' if requested and not rows else None,
             'note':'原问题与最终回答不是执行事实；单条超限时请在页面查看原文'}

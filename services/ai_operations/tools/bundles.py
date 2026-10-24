@@ -51,7 +51,10 @@ def query(ctx,snapshot,request,remaining,summary=False):
     if name not in snapshot['names']:return {'tool':name,'query':args,'result':{'status':'disabled','message':'底层工具未对本任务开放，未绕过开关'}}
     state=marks(ctx);started=time.monotonic()
     try:
-        result=readers.read(ctx,name,{'limit':3,**args})
+        original_budget=getattr(ctx,'output_budget',data.MAX_DATA_BYTES)
+        ctx.output_budget=min(original_budget,max(0,remaining-1500))
+        try:result=readers.read(ctx,name,{'limit':3 if summary else 1000,**args})
+        finally:ctx.output_budget=original_budget
         if summary:
             result=compact(ctx,name,result);restore(ctx,state);ctx.capture(result)
             if name=='read_observations':
@@ -74,7 +77,8 @@ def batch(ctx,snapshot,args):
         if not isinstance(request,dict) or request.get('tool') not in READ_TOOLS:raise DomainError('批量项不是允许的只读工具',422)
         readers.page({k:v for k,v in request.items() if k!='tool'})
     result={'status':'provided','queries':[],'note':'各项来源/窗口独立，不能把多类广告销售累加；部分失败或超限不是0。'}
-    for request in args['queries']:result['queries'].append(query(ctx,snapshot,request,MAX_BYTES-data.size(result)))
+    budget=min(data.MAX_DATA_BYTES,getattr(ctx,'output_budget',data.MAX_DATA_BYTES))
+    for request in args['queries']:result['queries'].append(query(ctx,snapshot,request,budget-data.size(result)))
     return result
 
 

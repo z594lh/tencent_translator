@@ -5,6 +5,7 @@ from services.listing_performance.common import DomainError,positive_id
 from .. import plan_store
 from ..metrics import digest
 from .specs import definitions
+from .guides import describe
 
 
 def check_schema(cur):
@@ -25,7 +26,7 @@ def listing():
     result=[]
     for name,base in rows.items():
         row=saved.get(name,{})
-        result.append({**base,'enabled':True if base['required'] else bool(row.get('enabled',True)),
+        result.append({**base,'guide':describe(base),'enabled':True if base['required'] else bool(row.get('enabled',True)),
                        'description':row.get('description',base['description']),'default_description':base['description'],
                        'revision':row.get('revision',0),'updated_at':row.get('updated_at'),'updated_by':row.get('updated_by')})
     return {'list':result,'note':'只管理代码注册工具的可见性和说明。新任务固定一份快照；关闭工具不撤回已执行操作，不影响在途任务。'}

@@ -14,8 +14,8 @@ SOURCES={'read_listing':'listing','read_business':'business','read_advertising':
 def page(args):
     """限制分页/日期参数，防止任意SQL、URL、超大读取及布尔冒充整数。"""
     if set(args)-{'ref','window','offset','limit'}:raise DomainError('查询参数不在工具白名单',422)
-    value={'ref':'','window':'all','offset':0,'limit':10,**args}
-    if not isinstance(value['ref'],str) or len(value['ref'])>200 or value['window'] not in data.WINDOWS or type(value['offset']) is not int or not 0<=value['offset']<=10000 or type(value['limit']) is not int or not 1<=value['limit']<=20:raise DomainError('查询对象、时间窗口或分页无效',422)
+    value={'ref':'','window':'all','offset':0,'limit':1000,**args}
+    if not isinstance(value['ref'],str) or len(value['ref'])>200 or not isinstance(value['window'],str) or value['window'] not in data.WINDOWS or type(value['offset']) is not int or not 0<=value['offset']<=10000 or type(value['limit']) is not int or not 1<=value['limit']<=1000:raise DomainError('查询对象、时间窗口或分页无效（limit为1～1000）',422)
     return value
 
 
@@ -30,7 +30,7 @@ def read(ctx,name,args):
     query=page(args)
     if name=='read_chat_history':
         from .. import natural_history
-        return natural_history.search(ctx.session['id'],query['ref'],query['offset'],query['limit'])
+        return natural_history.search(ctx.session['id'],query['ref'],query['offset'],query['limit'],max_bytes=getattr(ctx,'output_budget',data.MAX_DATA_BYTES))
     if name=='read_observations':
         management=ctx.data['content'].get('management_context',{})
         rows=[{'type':'observation',**data.watch(r)} for r in management.get('observations',[])]+[{'type':'pending',**data.watch(r)} for r in management.get('pending_executions',[])]
@@ -40,19 +40,22 @@ def read(ctx,name,args):
             if isinstance(row.get('post_evidence'),dict):row['post_evidence']={k:v for k,v in row['post_evidence'].items() if k not in ('items','business')}
         if query['ref']:rows=[r for r in rows if query['ref'] in (str(r['execution_id']),r['ref'])]
         selected=rows[query['offset']:query['offset']+query['limit']]
-        while selected and data.size(selected)>data.MAX_DATA_BYTES:selected.pop()
+        budget=getattr(ctx,'output_budget',data.MAX_DATA_BYTES)
+        selected=data.fit(selected,max(0,budget-3000))
         ctx.observations.update(str(r['execution_id']) for r in selected)
-        result={'rows':selected,'total':len(rows),'offset':query['offset'],'next_offset':query['offset']+len(selected) if selected and query['offset']+len(selected)<len(rows) else None,
+        result={'rows':selected,'total':len(rows),'returned':len(selected),'requested_limit':query['limit'],'offset':query['offset'],
+                'has_more':query['offset']+len(selected)<len(rows),'byte_limited':len(selected)<len(rows[query['offset']:query['offset']+query['limit']]),
+                'next_offset':query['offset']+len(selected) if selected and query['offset']+len(selected)<len(rows) else None,
                 'execution_facts':management.get('execution_facts',[])[:10],
                 'note':'真实执行账本优先；未发送、拒绝、未知都不是成功。观察未满期不能当完整改后效果。'}
-        if data.size(result)>data.MAX_DATA_BYTES:result.pop('execution_facts')
+        if data.size(result)>budget:result.pop('execution_facts')
         if rows and not selected:result['error']='单个完整观察超限，请用read_plan_history按execution引用查询；不能据此推定没有观察'
         ctx.observe_checked=True
         ctx.capture(result)
         return result
     source=SOURCES.get(name)
     if not source:raise DomainError('工具没有对应只读适配器',422)
-    result=data.fetch(ctx.data,{'source':source,**query},session=ctx.session)
+    result=data.fetch(ctx.data,{'source':source,**query},session=ctx.session,max_bytes=getattr(ctx,'output_budget',data.MAX_DATA_BYTES))
     if name=='read_current_settings':ctx.settings.update(r['ref'] for r in result.get('rows',[]))
     ctx.capture(result)
     return result

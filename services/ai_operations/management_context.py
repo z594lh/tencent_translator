@@ -201,4 +201,4 @@ def attach(data,context):
     data['content_hash']=digest(data['content']);data['size_bytes']=len(dumps(data['content']).encode('utf8'))
     from .dataset import MAX_INPUT_BYTES
     if data['size_bytes']>MAX_INPUT_BYTES:
-        raise DomainError('完整资料及持续托管记忆超过800KB，需分对象组包；未丢弃观察记录或调用AI',422)
+        raise DomainError('本地冻结资料及持续托管记录超过8MB，需分对象组包；未丢弃观察记录或调用AI',422)

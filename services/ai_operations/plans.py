@@ -52,7 +52,7 @@ def build_data(shop, asin, report_date, management=None):
         'keywords':'卖家精灵snapshot为近30日关键词曝光流量结构；月搜索量等是市场级，不能当本ASIN经营量',
         'history':'recent_runs给近期AI结论及实际执行状态；observations给仍需复盘的具体改动、执行基线和改后区间证据；pending_executions不可认定已改成功'}
     data['content_hash']=digest(data['content']);data['size_bytes']=len(dumps(data['content']).encode('utf8'))
-    if data['size_bytes']>dataset.MAX_INPUT_BYTES:raise DomainError('完整分析资料超过800KB，本次未调用模型',422)
+    if data['size_bytes']>dataset.MAX_INPUT_BYTES:raise DomainError('本地冻结资料超过8MB，本次未调用模型',422)
     return pack, data
 
 

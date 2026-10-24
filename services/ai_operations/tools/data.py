@@ -4,12 +4,23 @@ from services.listing_performance.common import DomainError
 from .. import plan_contract, plan_store, management_context
 from ..metrics import dumps, digest
 
-MAX_DATA_BYTES = 28000
+# 1000是条数上限，不承诺无限上下文；完整对象按预算分页，绝不截断单条字段。
+MAX_DATA_BYTES = 96000
 WINDOWS = ('all','daily','d1','d3','d7','p7','d14','p14','d30','p30')
 
 def size(value):
     """计算实际UTF8序列化字节数，不把它冒充token用量。"""
     return len(dumps(value).encode('utf8'))
+
+
+def fit(rows,budget):
+    """二分选择能完整放入预算的前缀，避免1000对象逐条反复序列化。"""
+    low,high=0,len(rows)
+    while low<high:
+        middle=(low+high+1)//2
+        if size(rows[:middle])<=budget:low=middle
+        else:high=middle-1
+    return rows[:low]
 
 
 def brief(value, ref):
@@ -53,7 +64,7 @@ def period(row, window):
     return result
 
 
-def fetch(data, request, session=None):
+def fetch(data, request, session=None, max_bytes=MAX_DATA_BYTES):
     """仅按白名单读取本地归档或本会话历史，不运行模型给出的SQL。"""
     source, ref, window = (request[k] for k in ('source','ref','window'))
     content = data['content']; rows = []
@@ -92,7 +103,13 @@ def fetch(data, request, session=None):
     elif source=='history':
         if not ref and session:
             from .. import conversation_store
-            return conversation_store.history_index(session['id'],request['offset'],request['limit'])
+            result=conversation_store.history_index(session['id'],request['offset'],request['limit'])
+            original=result['rows'];result['rows']=fit(original,max(0,max_bytes-2000))
+            result['returned']=len(result['rows']);result['byte_limited']=len(result['rows'])<len(original)
+            result['has_more']=request['offset']+len(result['rows'])<result['total_in_archive']
+            result['next_offset']=request['offset']+len(result['rows']) if result['rows'] and result['has_more'] else None
+            if result['byte_limited'] and not result['rows']:result.update(status='unavailable',reason='单条历史超过当前结果预算，请在页面查看原文')
+            return result
         if ref.startswith('task:') and ref[5:].isdigit():
             from .. import chat_tasks
             try:task,task_session,managed=chat_tasks.checked_task(ref[5:])
@@ -108,14 +125,27 @@ def fetch(data, request, session=None):
             rows=history_rows(data,ref,content)
     offset, limit = request['offset'],request['limit']
     selected = deepcopy(rows[offset:offset+limit])
-    while selected and size(selected)>MAX_DATA_BYTES:selected.pop()
+    selected=fit(selected,max(0,max_bytes-3000))
     result = {'status':'provided' if selected else 'unavailable','source':source,'ref':ref,'window':window,
         'report_end':content['time']['report_end'],'offset':offset,'total_in_archive':len(rows),
-        'rows':selected,'returned':len(selected),'next_offset':offset+len(selected) if selected and offset+len(selected)<len(rows) else None,
-        'note':'来自本次本地冻结资料；total_in_archive不是平台全部对象，缺项/缺日不补0'}
-    if not selected:result['reason']='对象/窗口没有可提供资料，或单个完整对象超过28KB；不截断全文，不把缺失当0'
+        'rows':selected,'returned':len(selected),
+        'requested_limit':limit,'has_more':offset+len(selected)<len(rows),
+        'next_offset':offset+len(selected) if selected and offset+len(selected)<len(rows) else None,
+        'byte_limited':len(selected)<len(rows[offset:offset+limit]),
+        'source_coverage':coverage(data,source),
+        'note':'来自本次本地冻结资料；total_in_archive不是平台全部对象；检查source_coverage和has_more，缺项/缺日不补0'}
+    if not selected:result['reason']='对象/窗口没有可提供资料，或单个完整对象超过本次字节预算；不截断全文，不把缺失当0'
     result['data_hash'] = digest(result)
     return result
+
+
+def coverage(data,source):
+    """披露冻结资料自身的筛选范围，避免把取数1000误认为平台无遗漏全量。"""
+    content=data['content']
+    if source=='advertising':return [{k:r.get(k) for k in ('kind','scope','total_objects','selected_objects','omitted_objects')} for r in content['ads']]
+    if source in ('keywords','keyword_history'):
+        return {k:content['keywords'].get(k) for k in ('snapshot','total','selected','omitted','note')}
+    return None
 
 
 def history_rows(data,ref,content):

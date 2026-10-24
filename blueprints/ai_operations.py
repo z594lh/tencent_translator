@@ -193,6 +193,24 @@ def tool_directory():
     return tools.listing()
 
 
+@ai_operations_bp.get('/tools/<name>/sources')
+@login_required
+@endpoint
+def tool_browser_sources(name):
+    """只读列出所选托管ASIN的冻结资料与此工具真实调用记录。"""
+    from services.ai_operations.tools import browser
+    return browser.sources(name,request.args)
+
+
+@ai_operations_bp.post('/tools/<name>/preview')
+@login_required
+@endpoint
+def tool_browser_preview(name):
+    """只读浏览查询/测算返回，不创建AI任务、不允许提交方案或写Amazon。"""
+    from services.ai_operations.tools import browser
+    return browser.preview(name,configuration_body())
+
+
 def configuration_body():
     """单独限制配置大文本到128KB，不扩大每日执行等旧入口的8KB限制。"""
     if request.content_length is None or request.content_length>131072:raise DomainError('配置请求为空或超过128KB')

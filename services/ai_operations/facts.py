@@ -6,11 +6,10 @@ import re
 
 from services.listing_performance.common import DomainError, parse_date, positive_id
 from . import repository as repo
+from services.business_dictionary import DictionaryMapping
 from .metrics import ADS_FIELDS, SKU_FIELDS, dates, digest, dumps, group_reports, ratios, select_details, summarize, totals, windows
 
-LABELS = {'spAdvertisedProduct': '商品广告（当前ASIN）', 'spCampaigns': '关联活动（含其他商品）',
-          'spCampaignsPlacement': '活动广告位（含其他商品）', 'spTargeting': '自动/手动投放（关联组）',
-          'spSearchTerm': '搜索词（关联组）'}
+LABELS = DictionaryMapping('ads.report',builtin_only=True)
 NOTES = [
     '本资料用于生成具体运营方案；读取资料本身不调用AI或执行修改，当前设置不作为历史回测资料。',
     '统计窗口7/14/30日均汇总原始7日归因指标，不是7/14/30日归因模型。重叠窗口不能当成独立证据。',
@@ -167,7 +166,7 @@ def build(data, asin, end):
                           'source': source_evidence(group, 'amazon_ads_raw_reports'),
                           'periods': compact_periods(group, periods, ADS_FIELDS),
                           'selection_metrics': totals(group, ADS_FIELDS)})
-        selected = select_details(items, 80)
+        selected = select_details(items, 1000)
         # 仅展示少量高优先级对象每日明细；其余对象保留完整窗口小计及省略说明。
         for item in selected[:6]:
             group = detail_sources[item['evidence_id']]
@@ -215,13 +214,13 @@ def build(data, asin, end):
         relationships.append({'campaign_id': cid, 'ad_group_id': gid, 'shared_or_unknown': shared or not members,
                               'members': [{'sku': sku, 'asin': a} for sku, a in sorted(members)]})
     sprite_rows = data['sprite_rows']
-    sprite_selected = sprite_rows[:300]
+    sprite_selected = sprite_rows[:1000]
     snapshot = data['sprite_snapshot']
     sprite = {'snapshot': snapshot, 'latest_current_snapshot': True, 'total': len(sprite_rows),
               'selected': len(sprite_selected), 'omitted': len(sprite_rows) - len(sprite_selected),
               'items': [{**r, 'evidence_id': f"sellersprite:{r['id']}"} for r in sprite_selected],
               'history': data.get('sprite_history', []),
-              'note': '最新最多300个完整词组，历史按实际成功文件比较；近30日快照不是单日自然曝光，市场月指标不是本ASIN销量。'}
+              'note': '最新最多1000个完整词组，total/omitted披露未归档数量；历史按实际成功文件比较；近30日快照不是单日自然曝光，市场月指标不是本ASIN销量。'}
     if not snapshot:
         gaps.append({'code': 'missing_sprite', 'message': '该ASIN暂无成功卖家精灵快照。'})
     verified_zones = {r['timezone'] for m in modules for r in m['source_provenance']

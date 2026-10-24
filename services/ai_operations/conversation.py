@@ -143,11 +143,13 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
             if tool_count>MAX_TOOL_CALLS or call.get('id') in ids:raise plan_provider.Failure('tool_limit','工具次数超限或调用编号重复，未执行计划',usage_summary(calls,started,input_bytes,memory))
             ids.add(call['id']);name=call['function']['name'];args=call['function']['arguments']
             before=(set(ctx.settings),set(ctx.evidence),set(ctx.observations),ctx.observe_checked)
+            # 默认1000只改变条数；给下一次请求与收尾留余量，不扩大220KB/1MB费用保护。
+            ctx.output_budget=min(96000,max(0,MAX_CONTEXT_BYTES-len(dumps(messages).encode('utf8'))-len(dumps(active_tools).encode('utf8'))-12000))
             arguments=None
             try:
                 arguments=plan_provider.json_object(args);result=tools.dispatch(ctx,prepared['tools_snapshot'],name,arguments)
                 size=len(dumps(result).encode('utf8'))
-                if size>28000 or batch_bytes+size>64000:
+                if size>ctx.output_budget or batch_bytes+size>160000:
                     ctx.settings,ctx.evidence,ctx.observations,ctx.observe_checked=before
                     result={'status':'too_large','message':'本批查询结果过大，未提供全文；请缩小对象、limit或分轮查询，不能把省略当0'}
                 batch_bytes+=len(dumps(result).encode('utf8'))

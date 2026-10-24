@@ -5,7 +5,8 @@ from services.listing_performance.common import DomainError
 from services import listing_content_policy
 
 # 给完整文案与多项历史基线留空间；按官方模型上下文保守控制，超限明确停止而非静默删历史。
-MAX_INPUT_BYTES = 800000
+# 本地冻结归档不等于模型首包；工具按剩余上下文预算分页返回，不能一次全发。
+MAX_INPUT_BYTES = 8000000
 PERIODS = ('d1', 'd3', 'd7', 'p7', 'd14', 'p14', 'd30', 'p30')
 
 
@@ -83,6 +84,6 @@ def build(pack):
     raw = dumps(result)
     size = len(raw.encode('utf8'))
     if size > MAX_INPUT_BYTES:
-        raise DomainError('本ASIN完整模型资料超过800KB入口上限，需按广告组拆分；未压成少量词或调用AI', 422)
+        raise DomainError('本ASIN本地冻结资料超过8MB入口上限，需按广告组拆分；未压成少量词或调用AI', 422)
     return {'content': result, 'content_hash': digest(result), 'size_bytes': size,
             'evidence': index, 'catalog': actions, 'schema_version': 'ai_operations_dataset_v2'}
