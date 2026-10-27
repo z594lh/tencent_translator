@@ -178,6 +178,13 @@ def fields(data):
 
 
 def add_config(data, actor):
+    """沿用批量添加入口并独立提交；重复ASIN保持已有启用、优先级和备注。"""
+    with session(write=True) as cur:
+        return add_config_in_session(cur, data, actor)
+
+
+def add_config_in_session(cur, data, actor):
+    """在调用方事务中复用原批量添加规则，供竞品绑定与配置原子保存。"""
     raw=data.get('asins')
     if isinstance(raw,str): raw=re.split(r'[\s,，;；]+',raw.strip())
     if not isinstance(raw,list) or not 1<=len(raw)<=200: raise PortalError('每次添加1～200个ASIN，每行一个')
@@ -185,13 +192,12 @@ def add_config(data, actor):
     enabled,priority,remark=fields(data)
     now=datetime.now(timezone.utc).replace(tzinfo=None)
     created=0
-    with session(write=True) as cur:
-        for asin in asins:
-            cur.execute('''INSERT INTO sellersprite_asin_config
-                (asin,marketplace,enabled,priority,remark,updated_by,updated_by_name,created_at,updated_at)
-                VALUES (%s,'US',%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE id=id''',
-                (asin,enabled,priority,remark,actor['id'],(actor.get('nickname') or actor['username'])[:255],now,now))
-            created+=1 if cur.rowcount==1 else 0
+    for asin in asins:
+        cur.execute('''INSERT INTO sellersprite_asin_config
+            (asin,marketplace,enabled,priority,remark,updated_by,updated_by_name,created_at,updated_at)
+            VALUES (%s,'US',%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE id=id''',
+            (asin,enabled,priority,remark,actor['id'],(actor.get('nickname') or actor['username'])[:255],now,now))
+        created+=1 if cur.rowcount==1 else 0
     return {'created':created,'existing':len(asins)-created}
 
 
