@@ -1,16 +1,12 @@
 """统一历史：页面仅读本地，平台采集按范围、可续传且不覆盖ERP原始证据。"""
 import re
-import time
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
-import requests
 
 from services import ads_history_repository as repo
 from services import ads_display
 from services import ads_negative_service as identities
-from services.shop_service import get_ads_api_client, get_all_active_shops
 
 HistoryError = repo.HistoryError
 DISPLAY_TZ = timezone(timedelta(hours=8))
@@ -112,6 +108,8 @@ def query(params, now=None):
         c.execute('SELECT * FROM amazon_ads_history_sync WHERE region=%s AND profile_id=%s AND '
                   "((scope=%s AND scope_id=%s) OR scope='shop')", (ctx['region'], ctx['profile_id'], ctx['scope'], repo.scope_key(ctx)))
         states = c.fetchall()
+        from services.ads_history_jobs import projection
+        collection = projection(c, ctx, repo.now_ms())
     output = []
     for row in rows:
         output.append({
@@ -133,7 +131,8 @@ def query(params, now=None):
         status = 'pending'
     return {'list': output, 'total': total, 'page': page, 'page_size': size, 'scope': ctx['scope'], 'view': view,
             'last_success_ms': success or None, 'sync_state': status,
-            'sync_error': state['error_message'] if state else '', 'source': 'local', 'timezone': tz_name}
+            'sync_error': state['error_message'] if state else '', 'source': 'local', 'timezone': tz_name,
+            'collection': collection}
 
 
 def event_types(ctx):
@@ -152,14 +151,6 @@ def event_types(ctx):
             spec = {'parents': [parent]}
         result[kind] = spec
     return result
-
-
-def event_batches(ctx):
-    """分开活动设置/否定词与其余实体，避免大扇出查询失败使所有类型都无法保存。"""
-    kinds = list(event_types(ctx))
-    if ctx['scope'] == 'group':
-        return [kinds]
-    return [['CAMPAIGN', 'NEGATIVE_KEYWORD'], [kind for kind in kinds if kind not in ('CAMPAIGN', 'NEGATIVE_KEYWORD')]]
 
 
 def normalize_event(c, ctx, raw, lo, hi):
@@ -241,165 +232,12 @@ def reconcile_saved(c, ctx):
 
 
 def sync_scope(params, budget=25):
-    ctx = context(params, allow_shop=True)
-    clock = repo.now_ms()
-    lock_conn = repo.get_db_connection()
-    lock_name = 'ads_hist_' + repo.digest([ctx['region'], ctx['profile_id']])[:40]
-    acquired = False
-    reconciled = 0
-    try:
-        lock_conn.autocommit(True)
-        with lock_conn.cursor() as lock:
-            lock.execute('SELECT GET_LOCK(%s,0) AS acquired', (lock_name,))
-            acquired = lock.fetchone()['acquired'] == 1
-        if not acquired:
-            with repo.transaction() as c: repo.mark_dirty(c, ctx)
-            return {'status': 'pending', 'message': '历史正在同步，已合并补采需求', 'saved': 0}
-        with repo.transaction() as c:
-            local_matches = reconcile_saved(c, ctx)
-        # 本地补关联单独提交；后面的采集状态或网络失败不能回滚已确认的证据。
-        reconciled = local_matches
-        with repo.transaction() as c:
-            account_state = repo.ensure_state(c, _root(ctx))
-            state = repo.ensure_state(c, ctx)
-            if account_state['next_retry_ms'] > clock:
-                repo.mark_dirty(c, ctx)
-                return {'status': 'pending', 'message': '历史采集冷却中，已保留补采需求', 'saved': 0, 'reconciled': reconciled,
-                        'next_retry_ms': account_state['next_retry_ms']}
-            work = repo.loads(state['work_json'])
-            if not work:
-                deep = not state['deep_success_ms'] or clock-state['deep_success_ms'] >= 86400000
-                # 与页面默认90个北京时间自然日一致，不能漏掉首日凌晨。
-                today_ms = ((clock+28800000)//86400000)*86400000-28800000
-                lo = today_ms-89*86400000 if deep else clock-7*86400000
-                work = {'deep': deep, 'version': state['dirty_version'], 'started': clock,
-                        'tasks': [{'lo': lo, 'hi': clock, 'page': 0, 'types': kinds} for kinds in event_batches(ctx)]}
-            elif any('types' not in task for task in work['tasks']):
-                # 兼容旧检查点：按相同时间窗重新分页，原事件指纹去重，不漏掉已跨页的类型。
-                work['tasks'] = [part for task in work['tasks'] for part in (
-                    [task] if 'types' in task else [
-                        {**task, 'page': 0, 'types': kinds} for kinds in event_batches(ctx)])]
-            c.execute("UPDATE amazon_ads_history_sync SET status='running',last_attempt_ms=%s,work_json=%s WHERE id=%s",
-                      (clock, repo.dumps(work), state['id']))
-        client = get_ads_api_client(ctx['shop_id'])
-        if str(client.profile_id) != ctx['profile_id'] or client.region != ctx['region']:
-            raise HistoryError('广告账户在采集中发生变化，已停止', 409)
-        deadline = time.monotonic()+budget
-        saved = calls = 0
-        while work['tasks'] and time.monotonic() < deadline and calls < 4:
-            task = work['tasks'][0]
-            if task['lo'] < repo.now_ms()-90*86400000:
-                raise HistoryError('未完成窗口已超过平台90天保留期，请核对后重新回填', 409)
-            kinds = event_types(ctx)
-            result = client.get_change_history({kind: kinds[kind] for kind in task['types']}, task['lo'], task['hi'], 200, task['page'])
-            calls += 1
-            total = result.get('totalRecords', result.get('totalResults')) if isinstance(result, dict) else None
-            rows = result.get('events') if isinstance(result, dict) else None
-            if isinstance(total, bool) or not isinstance(total, int) or total < 0 or not isinstance(rows, list) or len(rows)>200:
-                raise HistoryError('平台历史分页响应异常，未推进检查点', 502)
-            if total >= 10000:
-                if task['lo'] >= task['hi']:
-                    raise HistoryError('同毫秒事件超过分页上限，未截断；需平台支持核查', 502)
-                middle = (task['lo']+task['hi'])//2
-                work['tasks'][:1] = [{'lo': task['lo'], 'hi': middle, 'page': 0, 'types': task['types']},
-                                     {'lo': middle+1, 'hi': task['hi'], 'page': 0, 'types': task['types']}]
-            else:
-                if not rows and task['page']*200 < total:
-                    raise HistoryError('平台分页提前为空，未标记完整', 502)
-                complete = (task['page']+1)*200 >= total
-                with repo.transaction() as c:
-                    normalized = [normalize_event(c, ctx, r, task['lo'], task['hi']) for r in rows]
-                    fingerprints = [r['fingerprint'] for r in normalized]
-                    if len(set(fingerprints)) != len(fingerprints):
-                        raise HistoryError('平台页内重复事件，未推进检查点', 502)
-                    for event in normalized: saved += repo.save_event(c, ctx, event)
-                    if complete:
-                        c.execute('''SELECT platform_event FROM amazon_ads_history WHERE region=%s AND profile_id=%s
-                                     AND source='PLATFORM' AND merged_into_id IS NULL AND platform_time_ms BETWEEN %s AND %s''',
-                                  (ctx['region'], ctx['profile_id'], task['lo'], task['hi']))
-                        for item in c.fetchall():
-                            event = normalize_event(c, _root(ctx), repo.loads(item['platform_event']), task['lo'], task['hi'])
-                            repo.save_event(c, ctx, event, allow_merge=True)
-                if complete: work['tasks'].pop(0)
-                else: task['page'] += 1
-            with repo.transaction() as c:
-                c.execute('UPDATE amazon_ads_history_sync SET work_json=%s WHERE id=%s', (repo.dumps(work), state['id']))
-        with repo.transaction() as c:
-            finished = not work['tasks']
-            c.execute('''UPDATE amazon_ads_history_sync SET status=%s,work_json=%s,error_message='',
-                         last_success_ms=IF(%s,%s,last_success_ms),deep_success_ms=IF(%s,%s,deep_success_ms),
-                         done_version=IF(%s,%s,done_version),dirty_since_ms=IF(%s AND dirty_version=%s,NULL,dirty_since_ms),
-                         failures=0 WHERE id=%s''',
-                      ('success' if finished else 'partial', None if finished else repo.dumps(work), finished, work['started'],
-                       finished and work['deep'], clock, finished, work['version'], finished, work['version'], state['id']))
-            c.execute('UPDATE amazon_ads_history_sync SET next_retry_ms=%s WHERE id=%s', (repo.now_ms()+180000, account_state['id']))
-            if finished:
-                where = ' AND campaign_id=%s' if ctx['scope'] != 'shop' else ''
-                args = [ctx['region'], ctx['profile_id']]
-                if where: args.append(str(ctx['campaign_id']))
-                if ctx['scope'] == 'group': where += ' AND ad_group_id=%s'; args.append(str(ctx['ad_group_id']))
-                c.execute("UPDATE amazon_ads_history SET sync_status='pending',error_message='' "
-                          "WHERE region=%s AND profile_id=%s AND source='ERP' AND write_status='accepted' "
-                          "AND platform_time_ms IS NULL"+where, args)
-        return {'status': 'success' if finished else 'partial', 'saved': saved, 'reconciled': reconciled,
-                'message': '历史已更新' if finished else '历史已部分保存，余下窗口待自动续采'}
-    except Exception as exc:
-        status = exc.response.status_code if isinstance(exc, requests.HTTPError) and exc.response is not None else None
-        message = ('Amazon历史限流，保留原记录并稍后补采' if status == 429 else
-                   'Amazon广告授权失效或缺少历史读取权限，请核对店铺授权' if status in (401, 403) else
-                   str(exc) if isinstance(exc, HistoryError) else
-                   '连接Amazon超时或网络异常，原记录及检查点保留' if isinstance(exc, requests.RequestException) else
-                   '历史采集失败，原记录及检查点保留')
-        with repo.transaction() as c:
-            root = repo.ensure_state(c, _root(ctx))
-            state = repo.ensure_state(c, ctx)
-            delay = min(3600000, 300000*2**min(root['failures'], 3))
-            if status == 429:
-                retry = exc.response.headers.get('Retry-After', '')
-                try:
-                    retry_ms = int(retry)*1000 if str(retry).isdigit() else int(parsedate_to_datetime(retry).timestamp()*1000)-repo.now_ms()
-                    delay = max(delay, min(86400000, retry_ms))
-                except (ValueError, TypeError, OverflowError):
-                    pass
-            c.execute('UPDATE amazon_ads_history_sync SET next_retry_ms=%s,failures=failures+1 WHERE id=%s',
-                      (repo.now_ms()+delay, root['id']))
-            c.execute("UPDATE amazon_ads_history_sync SET status='failed',error_message=%s,last_attempt_ms=%s WHERE id=%s", (message, clock, state['id']))
-            where = ' AND campaign_id=%s' if ctx['scope'] != 'shop' else ''
-            values = [ctx['region'], ctx['profile_id']]
-            if where: values.append(str(ctx['campaign_id']))
-            if ctx['scope'] == 'group': where += ' AND ad_group_id=%s'; values.append(str(ctx['ad_group_id']))
-            c.execute("UPDATE amazon_ads_history SET sync_status='failed',error_message=%s WHERE region=%s AND profile_id=%s "
-                      "AND source='ERP' AND platform_time_ms IS NULL AND write_status='accepted'"+where, [message]+values)
-        return {'status': 'failed', 'message': message, 'saved': 0, 'reconciled': reconciled}
-    finally:
-        if acquired:
-            try:
-                with lock_conn.cursor() as c: c.execute('SELECT RELEASE_LOCK(%s)', (lock_name,))
-            except Exception: pass
-        lock_conn.close()
+    """兼容原接口，只登记近期补采；网络消费由独立cron统一限速处理。"""
+    from services.ads_history_jobs import request_scope
+    return request_scope(context(params, allow_shop=True))
 
 
 def run_due():
-    results = []
-    for shop in get_all_active_shops():
-        if not shop.get('ads_profile_id'): continue
-        try:
-            acct = repo.account(shop['id'])
-            clock = repo.now_ms()
-            with repo.transaction() as c:
-                c.execute("UPDATE amazon_ads_history SET write_status='unknown',error_message=%s,updated_at=UTC_TIMESTAMP() "
-                          "WHERE region=%s AND profile_id=%s AND source='ERP' AND write_status='requesting' AND local_started_ms<%s",
-                          ('请求超过15分钟未记录最终响应，请核实平台状态，不会自动重发', acct['region'], acct['profile_id'], clock-900000))
-                root = repo.ensure_state(c, _root(acct))
-                c.execute('''SELECT * FROM amazon_ads_history_sync WHERE region=%s AND profile_id=%s AND scope<>'shop'
-                             AND (work_json IS NOT NULL OR dirty_version>done_version)
-                             AND COALESCE(dirty_since_ms,0)<=%s ORDER BY COALESCE(dirty_since_ms,0),id LIMIT 1''',
-                          (acct['region'], acct['profile_id'], clock-120000))
-                dirty = c.fetchone()
-            selected = root if root['work_json'] or not root['last_success_ms'] or clock-root['last_success_ms']>=3600000 else dirty
-            if selected:
-                results.append(sync_scope({'shop_id': shop['id'], 'scope': selected['scope'],
-                                           'campaign_id': selected['campaign_id'], 'ad_group_id': selected['ad_group_id']}, budget=90))
-        except Exception:
-            results.append({'status': 'failed', 'message': '店铺历史任务未完成，请核对授权和表结构'})
-    return results
+    """委托增量队列消费者，不再每小时7天或每日90天全店回扫。"""
+    from services.ads_history_worker import run_due as consume
+    return consume()

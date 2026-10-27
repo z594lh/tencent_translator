@@ -232,6 +232,9 @@ def finish(acct, resource, plans, response=None, error=None):
                                                             'ad_group_id': group, 'entity_name': plan['item'].get('name', '')}
             if campaign and status != 'failed':
                 repo.mark_dirty(c, {**acct, 'scope': 'group' if group else 'campaign', 'campaign_id': campaign, 'ad_group_id': group})
+                # 队列只引用刚保存的真实操作与窄时间窗，不在写入请求中调用历史API。
+                from services.ads_history_jobs import enqueue_events
+                enqueue_events(c, acct, plan['ids'])
         # 平台事件先被另一采集进程保存时，只读本地证据补关联，不新增API调用。
         from services.ads_history_service import normalize_event
         for kind, eid in accepted_entities:

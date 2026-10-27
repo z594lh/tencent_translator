@@ -15,8 +15,11 @@ def run():
     if not results:
         print('没有到期的广告历史采集需求，本轮不调用Amazon。', flush=True)
     for item in results:
-        print(f"历史采集：{item['status']}；{item.get('message', '')}；保存{item.get('saved', 0)}条；"
+        print(f"历史采集：{item['status']}；{item.get('message', '')}；外部请求{item.get('calls', 0)}次；保存/关联{item.get('saved', 0)}条；"
               f"本地已有记录补关联{item.get('reconciled', 0)}条", flush=True)
+        if item.get('next_retry_ms'):
+            from datetime import datetime, timezone
+            print('下次最早请求（UTC）：'+datetime.fromtimestamp(item['next_retry_ms']/1000,timezone.utc).isoformat(),flush=True)
     return 1 if any(item['status'] == 'failed' for item in results) else 0
 
 

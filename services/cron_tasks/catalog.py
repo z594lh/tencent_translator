@@ -44,7 +44,7 @@ TASKS = {t.id: t for t in (
     _task('ads_create', 'ads_create', '创建广告报告', '全部启用店铺，昨日；不强制重建'),
     _task('ads_download', 'ads_download', '下载广告报告', '全部启用店铺，昨日；不强制重建'),
     _task('ads_entity_sync', 'ads_entity_sync', '广告实体同步', '全部启用店铺，只同步实体，不调整广告'),
-    _task('ads_history_sync', 'ads_history_sync', '广告更改历史采集', '合批处理ERP待补采范围、小时全店兜底及每日90天回扫；不修改广告'),
+    _task('ads_history_sync', 'ads_history_sync', '广告更改历史采集', '检查精准补采队列、每日近3天及停机缺口、首次历史回填；冷却不请求，不修改广告'),
     _task('keyword_translation', 'keyword_translation', '关键词与广告搜索词翻译', '完整词组去重、增量补译；仅写本地译文，共享账户节流和日预算，不修改广告'),
     _task('ai_operations_daily', 'ai_operations_daily', 'ASIN每日AI托管', '北京时间18:30起，仅登记启用ASIN到持久队列；ai_worker.py随后恢复会话、收费分析及正式执行，入队完成不代表优化完成'),
     _task('ads_report', 'ads_report', '生成广告日报', '昨日广告日报', '--daily'),
