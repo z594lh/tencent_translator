@@ -1,4 +1,7 @@
-"""卖家精灵任务领取、原始文件归档和关键词快照入库。"""
+"""关键词反查任务Service：领取续租、原件归档、关键词清洗入库和进度。
+
+只处理关键词业务表；Excel解析由sellersprite_keyword_excel.py负责，
+竞品任务在sellersprite_competitors.py，共用错误/日期/存储配置在sellersprite_common.py。"""
 import hashlib
 import hmac
 import json
@@ -6,42 +9,15 @@ import os
 import re
 import secrets
 import tempfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from services.mysql_service import get_db_connection
-from services.sellersprite_excel import parse_excel, ExcelValidationError
+from services.sellersprite_common import PipelineError, utcnow, record_date, storage_root, MAX_FILE_SIZE
+from services.sellersprite_keyword_excel import parse_excel, ExcelValidationError
 
 US_MARKETPLACE = 'ATVPDKIKX0DER'
-MAX_FILE_SIZE = 20 * 1024 * 1024
 PARSER_VERSION = '1'
-
-
-class PipelineError(ValueError):
-    def __init__(self, message, code=400):
-        super().__init__(message)
-        self.code = code
-
-
-def utcnow():
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def record_date(value=None, allow_history=False):
-    today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
-    try:
-        result = date.fromisoformat(str(value)) if value else today
-    except (ValueError, TypeError) as exc:
-        raise PipelineError('record_date必须为YYYY-MM-DD') from exc
-    if result > today or (not allow_history and result < today - timedelta(days=31)):
-        raise PipelineError('只允许领取或重传最近31天任务')
-    return result
-
-
-def storage_root():
-    return Path(os.environ.get('SELLERSPRITE_UPLOAD_DIR') or
-                Path(__file__).resolve().parents[1] / 'data' / 'sellersprite').resolve()
 
 
 def candidates():
@@ -84,7 +60,7 @@ def pending_asins(day=None, limit=50):
 
 def claim_task(asin, day, worker_id, recovery_id=None):
     """同事务领取任务与补救队列；执行日志保留旧失败而不是清掉唯一证据。"""
-    from services import sellersprite_recovery as recovery
+    from services import sellersprite_keyword_recovery as recovery
     if recovery_id is not None and (isinstance(recovery_id, bool) or not str(recovery_id).isdigit()):
         raise PipelineError('补救编号无效')
     asin = str(asin or '').strip().upper()
@@ -160,7 +136,7 @@ def _locked_task(cur, task_id, token, allow_completed=False):
 
 def update_progress(task_id, token, data):
     """接收令牌绑定的阶段或失败，心跳不重复写事件；失败同步限次队列。"""
-    from services import sellersprite_recovery as recovery
+    from services import sellersprite_keyword_recovery as recovery
     status = data.get('status')
     if status not in ('running', 'downloaded', 'failed', 'action_required'):
         raise PipelineError('不允许的进度状态')
@@ -190,7 +166,7 @@ def update_progress(task_id, token, data):
 
 def receive_file(task_id, token, upload, expected_hash):
     """原文件不可变保存；文件记录、明细和任务完成在同一数据库事务内提交。"""
-    from services import sellersprite_recovery as recovery
+    from services import sellersprite_keyword_recovery as recovery
     if not upload.filename or not upload.filename.lower().endswith('.xlsx'):
         raise PipelineError('仅接受卖家精灵原始xlsx文件')
     if not re.fullmatch(r'[a-f0-9]{64}', str(expected_hash or '')):

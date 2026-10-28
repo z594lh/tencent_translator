@@ -1,47 +1,16 @@
-"""机器接口只处理鉴权和HTTP，领取/清洗事务由独立Service负责。"""
-import hmac
-import os
-from functools import wraps
+"""关键词反查机器接口：接收虚拟机领取、进度、报告上传与失败恢复请求。
 
-from flask import Blueprint, current_app, jsonify, request, send_file
-from services import sellersprite_service as service
-from services import sellersprite_recovery as recovery
+业务委托services/sellersprite_keywords.py；共用鉴权在sellersprite_common.py。
+为兼容现有VM保留/api/sellersprite地址及Blueprint标识，不处理竞品路由。"""
+
+from flask import Blueprint, jsonify, request, send_file
+from services import sellersprite_keywords as service
+from services import sellersprite_keyword_recovery as recovery
 
 sellersprite_bp = Blueprint('sellersprite', __name__, url_prefix='/api/sellersprite')
 
 
-def machine_api(function):
-    @wraps(function)
-    def decorated(*args, **kwargs):
-        expected = os.environ.get('SELLERSPRITE_API_KEY') or os.environ.get('BSR_API_KEY')
-        if not expected:
-            return jsonify(status='error', message='服务端未配置采集API密钥'), 503
-        if not hmac.compare_digest(expected.encode(), request.headers.get('X-API-Key', '').encode()):
-            return jsonify(status='error', message='API Key无效'), 401
-        try:
-            return function(*args, **kwargs)
-        except service.PipelineError as exc:
-            return jsonify(status='error', message=str(exc)), exc.code
-        except (ValueError, TypeError) as exc:
-            return jsonify(status='error', message='参数格式错误'), 400
-        except Exception:
-            current_app.logger.exception('卖家精灵任务处理失败')
-            return jsonify(status='error', message='采集服务处理失败，请查看服务器日志'), 500
-    return decorated
-
-
-def bounded_int(name, default, maximum):
-    value = int(request.args.get(name, default))
-    if value < 1 or value > maximum:
-        raise service.PipelineError(f'{name}超出范围')
-    return value
-
-
-def json_object():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        raise service.PipelineError('请求体必须为JSON对象')
-    return data
+from blueprints.sellersprite_common import machine_api, bounded_int, json_object
 
 
 @sellersprite_bp.get('/asins')

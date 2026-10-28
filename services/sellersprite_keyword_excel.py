@@ -1,15 +1,14 @@
-"""卖家精灵原始关键词Excel清洗；仅接受可核实的美国站ASIN快照。"""
+"""关键词反查Excel清洗器：识别双语关键词列，校验US/ASIN并生成关键词快照。
+
+保留原行、词频和来源排名时间；本文件不处理竞品产品列，也不领取任务。
+共用空值/数字转换位于sellersprite_excel_common.py。"""
 import json
 import re
 import zipfile
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from openpyxl import load_workbook
-
-
-class ExcelValidationError(ValueError):
-    pass
+from services.sellersprite_excel_common import ExcelValidationError, number_value, text_value
 
 
 # 使用双语名称映射，不依赖列序号；更新时间由其前面的排名列确定含义。
@@ -65,38 +64,6 @@ def normalized(value):
 
 
 HEADER_MAP = {normalized(alias): field for field, names in ALIASES.items() for alias in names}
-MISSING = {'', '-', '--', 'none', 'null', 'n/a', 'na', '前3页无排名', '暂无数据'}
-
-
-def text_value(value):
-    if value is None or str(value).strip().casefold() in MISSING:
-        return None
-    return str(value).strip()
-
-
-def number_value(value, integer=False, signed=False):
-    raw = text_value(value)
-    if raw is None:
-        return None
-    percent = raw.endswith('%')
-    raw = re.sub(r'[$,\s]', '', raw.rstrip('%'))
-    try:
-        number = Decimal(raw)
-    except InvalidOperation as exc:
-        raise ExcelValidationError('无法识别数字字段') from exc
-    if not number.is_finite() or (not signed and number < 0):
-        raise ExcelValidationError('数字字段超出允许范围')
-    if percent:
-        number /= 100
-    if integer:
-        if number != number.to_integral_value() or number > 9223372036854775807:
-            raise ExcelValidationError('计数或排名不是有效整数')
-        return int(number)
-    if abs(number) >= Decimal('1000000000000'):
-        raise ExcelValidationError('数值超出数据库精度')
-    return number.quantize(Decimal('0.00000001'))
-
-
 def parse_excel(path, asin, marketplace='US'):
     """提取关键词主表；空值、真零、原始双时区排名时间分别保留。"""
     path = Path(path)

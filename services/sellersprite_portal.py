@@ -1,11 +1,15 @@
-"""卖家精灵Web配置和清洗快照只读查询；不调用机器接口或外部服务。"""
+"""卖家精灵门户工具与关键词配置/快照查询。
+
+关键词专用入口：configured_candidates、config_list、关键词配置增改及keyword_data。
+session、ASIN/字段校验和config_identities为两类任务共用的门户工具；
+竞品配置/进度/商品快照由sellersprite_competitors.py独立实现，本文件不调用外部服务。"""
 import json
 import re
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 import pymysql
 from services.mysql_service import get_db_connection
-from services.sellersprite_excel import ALIASES, INTEGER_FIELDS, DECIMAL_FIELDS, TEXT_FIELDS
+from services.sellersprite_keyword_excel import ALIASES, INTEGER_FIELDS, DECIMAL_FIELDS, TEXT_FIELDS
 
 US = 'ATVPDKIKX0DER'
 # MySQL 5.7无REGEXP_REPLACE；关键词最长500字符，九次折叠足以合并连续空格。
@@ -156,7 +160,7 @@ def config_list(params):
             WHERE t.asin=c.asin AND t.marketplace=c.marketplace ORDER BY t.record_date DESC,t.id DESC LIMIT 1) AS latest_task_id
             FROM sellersprite_asin_config c WHERE '''+where+' ORDER BY c.priority DESC,c.id DESC LIMIT %s OFFSET %s',args+[size,(page-1)*size])
         rows = [{key:iso(value) for key,value in row.items()} for row in cur.fetchall()]
-        from services.sellersprite_recovery import diagnose, safe_message
+        from services.sellersprite_keyword_recovery import diagnose, safe_message
         for row in rows:
             row['latest_status'] = None
             if row['latest_task_id']:
@@ -249,7 +253,7 @@ def keyword_data(cur, asin, params, condition=None, facets=False):
     cur.execute("SELECT id,status,record_date,error_message FROM sellersprite_keyword_tasks WHERE asin=%s AND marketplace='US' ORDER BY record_date DESC,id DESC LIMIT 1",(asin,))
     latest=cur.fetchone()
     if latest:
-        from services.sellersprite_recovery import diagnose, safe_message
+        from services.sellersprite_keyword_recovery import diagnose, safe_message
         latest={key:iso(value) for key,value in latest.items()}
         latest['error_message'] = safe_message(latest['error_message'])
         latest['diagnostic'] = diagnose(latest['error_message'], latest['status'])

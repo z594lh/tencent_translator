@@ -1,12 +1,13 @@
-"""ERP会话鉴权入口，与机器X-API-Key接口完全分离，不向浏览器暴露机器凭证。"""
-from functools import wraps
-from flask import Blueprint, jsonify, request, current_app
+"""关键词反查ERP会话接口：ASIN配置、历史快照、Listing关键词和补救队列。
+
+不暴露机器凭证、不触发网页采集；竞品由sellersprite_competitors.py独立注册。
+保留原Web接口地址和权限标识，公共响应/JSON校验位于sellersprite_common.py。"""
+from flask import Blueprint, jsonify, request
 from blueprints.user_auth import login_required
 from blueprints.permissions import require_permission
 from services import sellersprite_portal as service
-from services import sellersprite_reverse
-from services import sellersprite_recovery as recovery
-from services.sellersprite_service import PipelineError
+from services import sellersprite_keyword_reverse as sellersprite_reverse
+from services import sellersprite_keyword_recovery as recovery
 
 sellersprite_web_bp=Blueprint('sellersprite_web',__name__,url_prefix='/api')
 
@@ -17,23 +18,7 @@ def no_cache(response):
     return response
 
 
-def response(function):
-    @wraps(function)
-    def wrapped(*args,**kwargs):
-        try: return jsonify(status='success',data=function(*args,**kwargs))
-        except service.PortalError as exc: return jsonify(status='error',message=str(exc)),exc.code
-        except PipelineError as exc: return jsonify(status='error',message=str(exc)),exc.code
-        except Exception:
-            current_app.logger.exception('卖家精灵页面接口异常')
-            return jsonify(status='error',message='卖家精灵数据暂不可用，请检查数据表或稍后重试'),503
-    return wrapped
-
-
-def payload():
-    if not request.is_json or (request.content_length or 0)>32768: raise service.PortalError('请提交不超过32KB的JSON数据')
-    value=request.get_json(silent=True)
-    if not isinstance(value,dict): raise service.PortalError('请求体必须为JSON对象')
-    return value
+from blueprints.sellersprite_common import response, payload
 
 
 @sellersprite_web_bp.get('/system/sellersprite/asins')

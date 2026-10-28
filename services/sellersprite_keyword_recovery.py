@@ -1,9 +1,9 @@
-"""卖家精灵阶段诊断和限次补救；重采归今天，绝不伪造历史近30天快照。"""
+"""关键词反查失败恢复：补采/补传队列、诊断和重试状态；不处理竞品任务。"""
 import re
 from datetime import timedelta
 
 from services.mysql_service import get_db_connection
-from services.sellersprite_service import PipelineError, record_date, utcnow
+from services.sellersprite_common import PipelineError, record_date, utcnow
 
 STAGES = {'query', 'export', 'download', 'upload', 'parse', 'worker', 'queue'}
 BLOCKED = {'LOGIN_REQUIRED', 'VERIFICATION_REQUIRED', 'PERMISSION_DENIED',

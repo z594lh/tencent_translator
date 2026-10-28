@@ -1,4 +1,4 @@
-"""关键词反查工具：仅查询已入库快照，不调用采集或外部接口。"""
+"""关键词反查只读查询：工具页ASIN选项、关键词筛选和已导入快照，不发起采集。"""
 import json
 import re
 from decimal import Decimal, InvalidOperation
