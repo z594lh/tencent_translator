@@ -46,6 +46,8 @@ TASKS = {t.id: t for t in (
     _task('ads_entity_sync', 'ads_entity_sync', '广告实体同步', '全部启用店铺，只同步实体，不调整广告'),
     _task('ads_history_sync', 'ads_history_sync', '广告更改历史采集', '检查精准补采队列、每日近3天及停机缺口、首次历史回填；冷却不请求，不修改广告'),
     _task('keyword_translation', 'keyword_translation', '关键词与广告搜索词翻译', '完整词组去重、增量补译；仅写本地译文，共享账户节流和日预算，不修改广告'),
+    # 清理任务也必须由统一入口持锁，避免新增cron导致全局手动执行检查不通过。
+    _task('sellersprite_cleanup', 'sellersprite_cleanup', '清理卖家精灵Excel原件', '删除上传超过1小时且已成功清洗入库的服务端Excel；保留失败原件、清洗数据与虚拟机原件', '--apply'),
     _task('ai_operations_daily', 'ai_operations_daily', 'ASIN每日AI托管', '北京时间18:30起，仅登记启用ASIN到持久队列；ai_worker.py随后恢复会话、收费分析及正式执行，入队完成不代表优化完成'),
     _task('ads_report', 'ads_report', '生成广告日报', '昨日广告日报', '--daily'),
     _task('reports', 'reports', '生成经营报表', '最近10天经营日报及原SKU/库存汇总', '--daily'),
