@@ -22,7 +22,7 @@ def no_cache(result):
 
 @competitors_bp.get('/tools/competitor-data/options')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('competitor_data:view')
 @response
 def view_options():
     """工具页只读ASIN搜索，不要求采集配置管理权。"""
@@ -31,7 +31,7 @@ def view_options():
 
 @competitors_bp.get('/tools/competitor-data')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('competitor_data:view')
 @response
 def view_products():
     """浏览本地最近成功或指定历史竞品快照，不触发采集。"""
@@ -40,7 +40,7 @@ def view_products():
 
 @competitors_bp.get('/tools/competitor-data/<asin>/history')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('competitor_data:view')
 @response
 def view_history(asin):
     """向运营返回脱敏采集历史，保留失败原因。"""
@@ -49,7 +49,7 @@ def view_history(asin):
 
 @competitors_bp.get('/tools/competitor-data/files/<int:identifier>')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('competitor_data:view')
 def view_download(identifier):
     """原件留在采集VM；旧下载入口明确返回已停用，不影响清洗数据查询。"""
     return jsonify(status='error',message='ERP不再提供原始Excel下载，请查看清洗后的数据'),410

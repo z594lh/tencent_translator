@@ -44,7 +44,7 @@ def update(identifier): return service.update_config(identifier,payload(),reques
 
 @sellersprite_web_bp.get('/tools/keyword-reverse/<asin>/tasks')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('keyword_data:view')
 @response
 def reverse_tasks(asin):
     """关键词反查仅查看脱敏任务历史，不赋予补救权限。"""
@@ -95,20 +95,20 @@ def cancel_recovery(identifier):
 
 @sellersprite_web_bp.get('/amazon/listings/<path:sku>/sellersprite')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('keyword_data:view')
 @response
 def keywords(sku): return service.listing_data(request.args.get('shop_id'),sku,request.args)
 
 
 @sellersprite_web_bp.get('/tools/keyword-reverse/options')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('keyword_data:view')
 @response
 def reverse_options(): return sellersprite_reverse.asin_options(request.args)
 
 
 @sellersprite_web_bp.get('/tools/keyword-reverse/<asin>')
 @login_required
-@require_permission('amazon_listings:page')
+@require_permission('keyword_data:view')
 @response
 def reverse_keywords(asin): return sellersprite_reverse.reverse_data(asin,request.args)
