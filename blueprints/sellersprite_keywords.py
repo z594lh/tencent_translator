@@ -3,7 +3,7 @@
 业务委托services/sellersprite_keywords.py；共用鉴权在sellersprite_common.py。
 为兼容现有VM保留/api/sellersprite地址及Blueprint标识，不处理竞品路由。"""
 
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, jsonify, request
 from services import sellersprite_keywords as service
 from services import sellersprite_keyword_recovery as recovery
 
@@ -81,5 +81,5 @@ def keywords(task_id):
 @sellersprite_bp.get('/files/<int:file_id>')
 @machine_api
 def download(file_id):
-    path, filename = service.file_details(file_id)
-    return send_file(path, as_attachment=True, download_name=filename, conditional=True)
+    # 原件只保留在采集VM；ERP仅读取已清洗数据。
+    return jsonify(status='error', message='ERP不再提供原始Excel下载，请查看清洗后的数据'), 410

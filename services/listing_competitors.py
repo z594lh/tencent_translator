@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import pymysql
 from services.mysql_service import get_db_connection
 from services import sellersprite_portal as portal
+from services import sellersprite_competitors as competitor_reports
 
 Error=portal.PortalError
 MAX_COMPETITORS=50
@@ -92,7 +93,8 @@ def save(shop_id,sku,data,actor,can_collect=False):
                 (listing_id,shop_id,marketplace_id,source_asin,competitor_asin,sort_order,updated_by,updated_by_name,created_at,updated_at)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))''',
                 [(listing['id'],listing['shop_id'],listing['marketplace_id'],listing['asin'],asin,index,actor['id'],(actor.get('nickname') or actor.get('username') or '')[:255]) for index,asin in enumerate(asins)])
-        collection=portal.add_config_in_session(cur,{'asins':asins,'marketplace':'US','enabled':1},actor) if collect and asins else None
+        # 绑定竞品只加入“查竞品报告”清单，不再新增关键词反查配置。
+        collection=competitor_reports.add_config_in_session(cur,{'asins':asins,'marketplace':'US','enabled':1},actor) if collect and asins else None
         result=project(listing,asins);result['collection']=collection
         return result
 

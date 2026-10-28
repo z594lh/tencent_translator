@@ -47,18 +47,24 @@ def config_list(params):
 
 
 def add_config(data,actor):
+    """配置页批量添加竞品采集目标，独立提交并保持已有配置。"""
+    with portal.session(write=True) as cur:
+        return add_config_in_session(cur,data,actor)
+
+
+def add_config_in_session(cur,data,actor):
+    """复用竞品批量规则，在调用方事务内添加目标，供Listing绑定原子保存。"""
     raw=data.get('asins')
     if isinstance(raw,str): raw=re.split(r'[\s,，;；]+',raw.strip())
     if not isinstance(raw,list) or not 1<=len(raw)<=200: raise PipelineError('每次添加1～200个ASIN')
     asins=list(dict.fromkeys(portal.asin_value(v) for v in raw))
     enabled,priority,remark=portal.fields(data);now=utcnow();created=0
-    with portal.session(write=True) as cur:
-        for asin in asins:
-            cur.execute('''INSERT INTO sellersprite_competitor_config
-                (asin,marketplace,enabled,priority,remark,updated_by,updated_by_name,created_at,updated_at)
-                VALUES (%s,'US',%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE id=id''',
-                (asin,enabled,priority,remark,actor['id'],(actor.get('nickname') or actor['username'])[:255],now,now))
-            created+=int(cur.rowcount==1)
+    for asin in asins:
+        cur.execute('''INSERT INTO sellersprite_competitor_config
+            (asin,marketplace,enabled,priority,remark,updated_by,updated_by_name,created_at,updated_at)
+            VALUES (%s,'US',%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE id=id''',
+            (asin,enabled,priority,remark,actor['id'],(actor.get('nickname') or actor['username'])[:255],now,now))
+        created+=int(cur.rowcount==1)
     return {'created':created,'existing':len(asins)-created}
 
 

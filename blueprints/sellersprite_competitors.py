@@ -1,12 +1,13 @@
 """查竞品机器接口与ERP会话接口；浏览器不接触机器API密钥。"""
 from functools import wraps
 import json
-from flask import Blueprint, request, jsonify, send_file
+from flask import Blueprint, request, jsonify
 from blueprints.sellersprite_common import machine_api, json_object, bounded_int
 from blueprints.sellersprite_common import response, payload
 from blueprints.user_auth import login_required
 from blueprints.permissions import require_permission
 from services import sellersprite_competitors as service
+from services import sellersprite_competitor_view as view
 from services.sellersprite_common import PipelineError, MAX_FILE_SIZE
 from services.sellersprite_portal import PortalError
 
@@ -17,6 +18,41 @@ competitors_bp=Blueprint('sellersprite_competitors',__name__,url_prefix='/api')
 def no_cache(result):
     result.headers['Cache-Control']='no-store'
     return result
+
+
+@competitors_bp.get('/tools/competitor-data/options')
+@login_required
+@require_permission('amazon_listings:page')
+@response
+def view_options():
+    """工具页只读ASIN搜索，不要求采集配置管理权。"""
+    return view.options(request.args)
+
+
+@competitors_bp.get('/tools/competitor-data')
+@login_required
+@require_permission('amazon_listings:page')
+@response
+def view_products():
+    """浏览本地最近成功或指定历史竞品快照，不触发采集。"""
+    return view.products(request.args)
+
+
+@competitors_bp.get('/tools/competitor-data/<asin>/history')
+@login_required
+@require_permission('amazon_listings:page')
+@response
+def view_history(asin):
+    """向运营返回脱敏采集历史，保留失败原因。"""
+    return view.history(asin,request.args)
+
+
+@competitors_bp.get('/tools/competitor-data/files/<int:identifier>')
+@login_required
+@require_permission('amazon_listings:page')
+def view_download(identifier):
+    """原件留在采集VM；旧下载入口明确返回已停用，不影响清洗数据查询。"""
+    return jsonify(status='error',message='ERP不再提供原始Excel下载，请查看清洗后的数据'),410
 
 
 def machine(function):
@@ -106,8 +142,5 @@ def snapshot(identifier):return service.product(identifier)
 @login_required
 @require_permission('system:sellersprite_config')
 def download(identifier):
-    # 下载同样沿用JSON错误处理，但成功响应保持二进制文件。
-    try:
-        path,name=service.download(identifier)
-        return send_file(path,as_attachment=True,download_name=name,conditional=True)
-    except (PipelineError,PortalError) as exc:return jsonify(status='error',message=str(exc)),exc.code
+    """原件留在采集VM；旧下载入口明确返回已停用，不影响清洗数据查询。"""
+    return jsonify(status='error',message='ERP不再提供原始Excel下载，请查看清洗后的数据'),410

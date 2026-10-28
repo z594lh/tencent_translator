@@ -172,9 +172,11 @@ def receive_file(task_id, token, upload, expected_hash):
     if not re.fullmatch(r'[a-f0-9]{64}', str(expected_hash or '')):
         raise PipelineError('必须提供sha256校验值')
     root = storage_root()
-    root.mkdir(parents=True, exist_ok=True)
+    # 按业务分目录，临时上传和最终归档均放入keyword；根目录仍供历史路径解析。
+    upload_root = root / 'keyword'
+    upload_root.mkdir(parents=True, exist_ok=True)
     digest, size = hashlib.sha256(), 0
-    fd, temp_name = tempfile.mkstemp(prefix='.upload-', suffix='.xlsx', dir=root)
+    fd, temp_name = tempfile.mkstemp(prefix='.upload-', suffix='.xlsx', dir=upload_root)
     temporary = Path(temp_name)
     conn = None
     try:
@@ -213,7 +215,7 @@ def receive_file(task_id, token, upload, expected_hash):
                 error = str(exc)[:1000] if isinstance(exc, ExcelValidationError) else f'Excel读取失败（{type(exc).__name__}）'
                 rows, metadata = [], {}
             status = 'parse_failed' if error else 'imported'
-            relative = Path(task['record_date'].isoformat()) / f'{task_id}_{sha}.xlsx'
+            relative = Path('keyword') / task['record_date'].isoformat() / f'{task_id}_{sha}.xlsx'
             destination = root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not destination.exists():
@@ -273,6 +275,26 @@ def list_tasks(day=None, status=None, page=1, page_size=50):
         conn.close()
 
 
+def keyword_file_path(relative):
+    """解析关键词归档；兼容旧日期路径，以及人工移入keyword后的旧数据库记录。"""
+    root = storage_root().resolve()
+    relative = Path(relative)
+    # 仅兼容原来的日期目录，不能通过关键词接口读取competitors等其他业务原件。
+    legacy = len(relative.parts) == 2 and re.fullmatch(r'\d{4}-\d{2}-\d{2}', relative.parts[0])
+    current = (len(relative.parts) == 3 and relative.parts[0] == 'keyword'
+               and re.fullmatch(r'\d{4}-\d{2}-\d{2}', relative.parts[1]))
+    if relative.is_absolute() or not (legacy or current):
+        raise PipelineError('归档文件路径无效', 404)
+    candidates = [root / relative]
+    if legacy:
+        candidates.append(root / 'keyword' / relative)
+    for candidate in candidates:
+        path = candidate.resolve()
+        if path.is_relative_to(root) and path.is_file():
+            return path
+    raise PipelineError('归档文件不存在', 404)
+
+
 def file_details(file_id):
     conn = get_db_connection()
     try:
@@ -281,9 +303,7 @@ def file_details(file_id):
             row = cur.fetchone()
             if not row:
                 raise PipelineError('文件不存在', 404)
-            path = (storage_root() / row['storage_path']).resolve()
-            if not path.is_relative_to(storage_root()) or not path.is_file():
-                raise PipelineError('归档文件不存在', 404)
+            path = keyword_file_path(row['storage_path'])
             return path, row['file_name']
     finally:
         conn.close()

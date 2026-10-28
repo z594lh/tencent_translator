@@ -132,7 +132,8 @@ def update(body,user):
     """CAS修改/补充或恢复默认，同事务记录前后快照，不允许改代码/别名/格式语义。"""
     if not isinstance(body,dict) or set(body)!={'group','code','label','description','version','reset'}:raise DomainError('字典提交字段无效',422)
     group,code=body['group'],body['code']
-    if not isinstance(group,str) or group not in DEFAULTS or not isinstance(code,str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.:/ ()-]{0,179}',code):raise DomainError('请选择已注册分类并填写有效英文代码',422)
+    # 固定报告表头可能含$、&或撇号；只对程序注册词条放行，人工新增仍沿原代码限制。
+    if not isinstance(group,str) or group not in DEFAULTS or not isinstance(code,str) or not (code in DEFAULTS[group]['labels'] or re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.:/ ()-]{0,179}',code)):raise DomainError('请选择已注册分类并填写有效英文代码',422)
     code=canonical(group,code)
     if type(body['version']) is not int or not 0<=body['version']<2**63 or type(body['reset']) is not bool:raise DomainError('字典版本或操作无效',422)
     value=None if body['reset'] else clean_text(body['label'],'中文名称',100)

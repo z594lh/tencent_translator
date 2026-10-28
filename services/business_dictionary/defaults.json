@@ -1,5 +1,81 @@
 {
   "groups": {
+    "sellersprite.competitor_column": {
+      "name": "竞品展示列说明",
+      "case_sensitive": true,
+      "labels": {"sales_trend": "销量趋势（父）"},
+      "aliases": {},
+      "descriptions": {
+        "sales_trend": "点击小标题后侧的箭头可以切换查看父/子体销量趋势\n\n特别提示：\n\n1、父体销量基于该父体下所有跟卖销量之和\n\n2、子体ASIN的月销量数据来源于亚马逊搜索页，如 '4K+ bought in past month'，如显示为“-”，则表示亚马逊搜索页没有开放该销量\n\n3、如果该ASIN只有最近一个月的销量，并不意味着以前一定没有销量，而是有可能以前系统没有收录该ASIN"
+      }
+    },
+    "sellersprite.product_size_tier": {
+      "name": "竞品报告商品尺寸分级",
+      "case_sensitive": false,
+      "labels": {"Large Standard-size": "大号标准尺寸"},
+      "aliases": {},
+      "descriptions": {"Large Standard-size": "仅翻译报告原分级；页面不按重量尺寸自行判断或重新分类。"}
+    },
+    "sellersprite.competitor_field": {
+      "name": "竞品普通报告字段",
+      "case_sensitive": true,
+      "labels": {
+        "ASIN": "ASIN", "SKU": "规格", "Product Overview": "商品概述",
+        "Brand": "品牌", "Brand Link": "品牌链接", "Product Title": "商品标题",
+        "Product Highlight": "商品亮点", "URL": "商品链接", "Product Image": "商品图片",
+        "Parent": "父ASIN", "Category Path": "类目路径", "Category": "大类目",
+        "Category BSR": "大类BSR", "Category BSR Increase": "大类BSR变化数",
+        "Category BSR Growth": "大类BSR变化率", "Sub-Category": "小类目", "Sub-Category BSR": "小类BSR",
+        "Sales": "销量(父)", "MoM Sales Growth Rate": "销量环比增长率", "YoY Sales Growth Rate": "销量同比增长率",
+        "Monthly Revenue($)": "月销售额", "Variation Sold": "子体销量", "Variation Revenue($)": "子体销售额",
+        "Variations": "变体数", "Price($)": "价格", "Prime Price($)": "Prime价格", "Coupon": "优惠券",
+        "Q&A": "问答数", "Ratings": "评分数", "Monthly Rating Increase": "月新增评分数", "Rating": "评分",
+        "Reviews Rate": "留评率", "FBA($)": "FBA费用", "Gross Margin": "毛利率", "Grade": "商品等级",
+        "Date Available": "上架时间", "Available days": "已上架天数", "Seller Type": "配送方式",
+        "Delivery price($)": "配送费", "LQS": "Listing质量评分", "Sellers": "卖家数",
+        "BuyBox Seller": "BuyBox卖家", "BuyBox Type": "BuyBox配送方式", "BuyBox Location": "BuyBox卖家所属地",
+        "Seller Info": "卖家信息", "Seller Link": "卖家链接", "Best Seller": "畅销标记",
+        "Amazon's Choice": "Amazon精选", "New Release": "新品标记", "EBC Available": "A+内容",
+        "Video Available": "商品视频", "Sponsored Product": "商品推广标记", "Brand Story": "品牌故事",
+        "Sponsored Brands": "品牌推广标记", "LTD": "限时优惠标记", "AC Keyword": "Amazon精选关键词",
+        "Weight": "商品重量", "Weight(Unit Conversion)": "商品重量（来源换算）",
+        "Dimension": "商品尺寸", "Dimension(Unit Conversion)": "商品尺寸（来源换算）",
+        "Package Weight": "包装重量", "Package Weight(Unit Conversion)": "包装重量（来源换算）",
+        "Package Dimension": "包装尺寸", "Package Dimension(Unit Conversion)": "包装尺寸（来源换算）",
+        "Product size tiers": "商品尺寸分级", "Label": "来源标签"
+      },
+      "aliases": {},
+      "descriptions": {
+        "Category BSR": "第一行：大类BSR排名，选择查看最近30天的数据时，显示的是该ASIN最近1天在Listing页面Best Sellers Rank的大类排名\n\n选择按月份查询（如：2023-06），则显示的是该ASIN在对应月份月末那一天的大类排名",
+        "Category BSR Increase": "第二行：近7天BSR增长数，BSR增长数 = 7天前的BSR-当天BSR",
+        "Category BSR Growth": "第三行：近7天BSR增长率，BSR增长率 = (7天前的BSR-当天BSR)/7天前的BSR *100%\n\n比如当天BSR排名60，7天前的排名100，则BSR增长数 = 100-60=40，BSR增长率 = (100-60)/ 100 =40%\n\n红色数字表示排名下降，绿色数字表示排名上升，点击BSR数字可以查看大类最新排名及历史趋势\n\n（有时候列表页和趋势图不一致，是因为列表页的BSR更新频率没有趋势图快）",
+        "Sales": "上行：该产品父体近30天(或某个自然月)预测总销量\n\n（不建议将该销量直接作为补货的数量参考，需综合多方数据再确定）",
+        "MoM Sales Growth Rate": "下行：近30天(或某个自然月) 销量增长率，即本月(近30天) 相对于上月(上30天) 的销量增长率\n\n销量基于该父体下所有跟卖销量之和，如果您是跟卖者之一，则该值一般大于您在卖家后台看到的那个销量\n\n月销量增长率为本月相对于上月的增长百分比，比如上月销量为1000，本月为1200，则增长率 = (1200-1000)/1000=20%",
+        "Monthly Revenue($)": "该产品父体近30天(或某个自然月)总销售额\n\n近30天销售额=该产品父体近30天的总销量*该子体ASIN的最新售价\n\n历史自然月销售额=该产品父体在某个自然月的总销量*该子体ASIN在此自然月的平均售价\n\n例：该ASIN的平均售价为$9.49，父体近30天的总销量为244,236\n\n则该产品父体近30天的总销售额=9.49*244,236=2,317,800",
+        "Variation Sold": "上行：该子体ASIN近30天(或某个自然月)的销量，数据来源于亚马逊搜索页，如 '4K+ bought in past month'\n\n如显示为“-”，则表示亚马逊搜索页没有开放该销量",
+        "Variation Revenue($)": "下行：该子体ASIN近30天(或某个自然月)的预估销售额\n\n销售额=该子体ASIN近30天(或某个自然月)的销量*该子体ASIN在近30天(或某个自然月)的平均售价\n\n例：该子体ASIN近一个月的销量为10K+，价格为$45，则销售额为10K*$45=$450,000",
+        "Variations": "该ASIN所在Listing的变体总数量\n\n比如一款男士拖鞋共有黑、灰、蓝3个颜色，每个颜色分别有39-44码6个尺码\n\n则该产品的Listing上共有3*6=18个变体，是一个多变体产品\n\n通过变体数这一指标可以过滤出单一变体的产品或多变体的产品\n\n各变体的曝光、销量会累积到对应Listing中，所以单一变体的产品和多变体的产品往往有不同的运营策略",
+        "Price($)": "上行：该产品的最新售价(不是历史均价)",
+        "Q&A": "下行：该产品的历史Q&A数(截止到24年8月)\n\n点击价格数字，可查看Listing自上架以来的价格变化趋势",
+        "Ratings": "上行：Listing的最新评分数",
+        "Monthly Rating Increase": "下行：Listing近30天或一个自然月内的新增评分数，增长数 = 月底评分数-月初评分数\n\n点击评分数或月新增数字，可查看最近3年的变化趋势",
+        "Rating": "上行：Listing的最新评分值\n\n（如选择了历史月份，则评分值显示为对应月份的历史数据）",
+        "Reviews Rate": "下行：月度留评率，留评率 = 近30天(或一个自然月)评分数增长值/近30天(或该自然月)销量\n\n通过留评率可以推算该Listing的预估月销量以及判断该Listing是否有作弊倾向",
+        "FBA($)": "上行：产品FBA运费，根据产品Listing页面显示的体积以及重量进行计算",
+        "Gross Margin": "下行：产品毛利率，系统默认毛利率 = (商品售价-亚马逊佣金-FBA运费)/商品售价*100%\n\n由于目前亚马逊用于计算佣金的类目分类与前台的营销类目不匹配，所以无法自动匹配准确的佣金率\n\n烦请点击毛利率数字移步“利润计算器”，可计算出准确的利润率，再根据毛利率验证市场的可行性",
+        "Date Available": "上架时间取自Keepa初次抓取到数据（价格或BSR）的时间\n\n一般来说，选择上架时间普遍集中在最近6个月或1年的产品，风险较小并且有爆款潜质（处于市场成长期）",
+        "Sellers": "产品Listing的BuyBox下所有跟卖数量\n\n比如您是一个投机客，可以找那些跟卖者大于1的产品，但一定要清楚侵权风险",
+        "Seller Type": "上行：当前获得产品BuyBox卖家的配送方式\n\n分为AMZ(亚马逊自营)、FBA(亚马逊物流服务)和FBM(卖家自配送)三种方式\n\n该指标可以评估市场竞争度或是寻找可以自发货（不压货）的市场",
+        "Delivery price($)": "下行：买家运费\n\n产品由第三方卖家自配送时买家需要支付的运费",
+        "BuyBox Seller": "上行：当前获取BuyBox的卖家名称",
+        "BuyBox Location": "下行：当前BuyBox卖家的所属地",
+        "LQS": "Listing Quality Score，Listing质量得分\n\n计算方法：从商品图片、商品描述及评价三大维度对Listing进行质量分析得出的分数\n\n得分越高，Listing质量越好，10分为满分\n\n可以用于自检Listing，或对比竞品LQS找出自己的不足，优化Listing以提高转化率\n\n还可以用于寻找高需求、低竞争的产品机会，也就是销量较高但LQS较低的产品",
+        "Weight": "产品实际入库到亚马逊时的重量和体积（包含入库时的包装重量），以及对应的亚马逊尺寸分段\n\n可以和产品尺寸指标一起帮您筛选出运费低的轻小产品\n\n鼠标悬浮在对应的数字上，可以看到不同单位的重量和尺寸",
+        "Package Weight": "产品的包装重量，即按照亚马逊物流政策和要求包装完毕、准备发货时商品重量的测量值。\n\n包装尺寸与包装重量一起，用于计算各种亚马逊物流费用，包括仓储费、配送费用和退货处理费。",
+        "Available days": "报告导出时的上架天数；不按今天重新计算。",
+        "Weight(Unit Conversion)": "报告已提供的换算原文，页面不自行换算单位。"
+      }
+    },
     "ads.auto_target": {
       "name": "自动投放匹配类型",
       "case_sensitive": false,
