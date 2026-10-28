@@ -28,6 +28,9 @@ def read(ctx,name,args):
                 'inventory':content.get('inventory'),'data_gaps':content.get('gaps'),
                 'note':'经营/广告按已入库report_date查询；当前设置为本地缓存，执行前另做平台实时前值核对'}
     query=page(args)
+    if name=='read_competitors':
+        from . import competitors
+        return competitors.read(ctx,query)
     if name=='read_chat_history':
         from .. import natural_history
         return natural_history.search(ctx.session['id'],query['ref'],query['offset'],query['limit'],max_bytes=getattr(ctx,'output_budget',data.MAX_DATA_BYTES))

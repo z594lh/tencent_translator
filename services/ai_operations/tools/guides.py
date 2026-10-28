@@ -4,6 +4,7 @@ from services.business_dictionary import DictionaryMapping, entry
 
 WINDOWS = DictionaryMapping('data.window')
 REF_HELP = {
+    'read_competitors':'留空列出当前ASIN绑定竞品；可填绑定竞品ASIN或本次返回的竞品证据引用。不能查询未绑定ASIN。仅window=all，数据时间见每条采集日期。',
     'read_advertising':'可填 spAdvertisedProduct（本ASIN商品广告）、spCampaigns（关联活动）、spCampaignsPlacement（广告位）、spTargeting（投放）、spSearchTerm（搜索词），或返回的精确证据编号。',
     'read_keywords':'输入完整关键词精确匹配，例如 egg slicer；留空列出当前快照。',
     'read_keyword_history':'输入完整关键词精确匹配；每行包含真实采集日期，缺日不会补0。',

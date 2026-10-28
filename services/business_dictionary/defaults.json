@@ -573,6 +573,7 @@
         "read_advertising": "广告与搜索词",
         "read_keywords": "ASIN关键词",
         "read_keyword_history": "关键词历史",
+        "read_competitors": "绑定竞品数据",
         "read_pricing": "售价与成本",
         "read_current_settings": "行动对象与前值",
         "read_operations": "人工与AI操作",

@@ -9,7 +9,9 @@ PAGE = {'type':'object','properties':{'ref':{'type':'string','description':'精�
     'limit':{'type':'integer','minimum':1,'maximum':1000,'default':1000,
              'description':'默认最多1000条；实际受完整对象/字节预算限制，查看next_offset续查，不把部分结果当全量'}},'additionalProperties':False}
 EMPTY = {'type':'object','properties':{},'additionalProperties':False}
-READ_TOOLS=('read_listing','read_business','read_advertising','read_keywords','read_keyword_history','read_pricing',
+COMPETITORS = deepcopy(PAGE)
+COMPETITORS['properties']['window']['enum']=['all']
+READ_TOOLS=('read_listing','read_business','read_advertising','read_keywords','read_keyword_history','read_competitors','read_pricing',
             'read_current_settings','read_operations','read_observations','read_plan_history','read_chat_history')
 BUNDLE={'type':'object','properties':{'queries':{'type':'array','minItems':1,'maxItems':4,'items':{
     'type':'object','properties':{'tool':{'type':'string','enum':list(READ_TOOLS)},**deepcopy(PAGE['properties'])},
@@ -51,6 +53,7 @@ def definitions():
         definition('read_advertising','查询商品广告、活动、广告位、自动/手动投放、搜索词。ref可为spAdvertisedProduct/spCampaigns/spCampaignsPlacement/spTargeting/spSearchTerm或具体对象引用；活动/组数据可能含其他SKU。'),
         definition('read_keywords','分页查询卖家精灵完整词组和排名流量；ref为完整关键词或证据引用，数据是近30日快照，不是单日流量。'),
         definition('read_keyword_history','查询完整词组在真实采集日期的排名和流量变化；缺日不伪造。'),
+        definition('read_competitors','查询当前托管ASIN显式绑定竞品的已采集商品报告，含销量、价格、排名、评分、文案和原字段。只读本任务冻结快照，不能查询未绑定ASIN；ref留空或绑定竞品ASIN/证据引用。仅window=all。检查实际导出ASIN、采集日、最近失败和缺口；Sales是父体所有跟卖近30天预测销量，不是本店销量。默认1000条，按next_offset续查，不即时采集或修改竞品。',COMPETITORS),
         definition('read_pricing','查询当前售价、成本来源、佣金及明确假设的利润场景；不是历史实际利润。ref可为SKU。'),
         definition('read_current_settings','分页查询可调整对象的精确ref、完整before、单位、约束及evidence_refs。广告位是竞价加价，不是流量比例。提交任何行动前必须实际查询对应对象。'),
         definition('read_operations','查询近期人工/AI实际操作日志，不把模型建议当作已执行。'),

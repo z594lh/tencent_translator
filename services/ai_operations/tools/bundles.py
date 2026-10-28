@@ -108,4 +108,7 @@ def overview(ctx,snapshot,args):
                     section['recent_history']=history;section['history_note']='仅本概览完整词组的最近两个已采集快照，缺日不插值；更多用read_keyword_history'
         result['sections'].append(section)
     result['detail_tools']=['read_data_bundle','read_current_settings','read_observations']
+    if 'read_competitors' in snapshot['names']:
+        result['detail_tools'].append('read_competitors')
+        result['competitor_bound_count']=content.get('competitors',{}).get('bound_count')
     return result
