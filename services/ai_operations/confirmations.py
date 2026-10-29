@@ -42,10 +42,10 @@ def state(cur,plan,session,managed):
     reason=None
     if now>=deadline:reason='建议已超过24小时，请重新分析'
     if session['state']!='active' or str(managed.get('current_conversation_id'))!=str(session['id']):reason='原对话已归档'
-    if not managed['enabled'] or managed['shop_status']!=1:reason='托管或店铺已暂停，恢复并复核后才能确认'
+    if (managed['id'] and not managed['enabled']) or managed['shop_status']!=1:reason='托管或店铺已暂停，恢复并复核后才能确认'
     cur.execute('''SELECT p.result_json,p.result_hash FROM ai_operation_plans p JOIN ai_operation_tasks t ON t.id=p.task_id
-        WHERE t.managed_id=%s AND t.task_type='chat' AND t.status='completed' AND p.status='ready'
-        AND p.id>%s AND t.conversation_id=%s ORDER BY p.id LIMIT 101''',(managed['id'],plan['id'],session['id']))
+        WHERE t.scope_key=%s AND t.task_type='chat' AND t.status='completed' AND p.status='ready'
+        AND p.id>%s AND t.conversation_id=%s ORDER BY p.id LIMIT 101''',(session['scope_key'],plan['id'],session['id']))
     newer=cur.fetchall()
     if len(newer)>100:raise DomainError('后续建议超过100份，请新建对话再分析',422)
     superseded={a['ref'] for row in newer for a in conversation_store.checked(row,'result_json','result_hash')['actions']}
@@ -105,11 +105,14 @@ def decide(plan_id,body,actor):
     ids=body['action_ids'];token=body['request_token'];decision=body['decision']
     if decision not in ('execute','reject') or not isinstance(token,str) or not re.fullmatch('[a-f0-9]{32}',token):raise DomainError('决策或请求标识无效')
     if not isinstance(ids,list) or not 1<=len(ids)<=12 or any(not isinstance(a,str) or not re.fullmatch(r'a\d{1,2}',a) for a in ids) or len(ids)!=len(set(ids)):raise DomainError('请选择不重复的行动编号')
-    actor=positive_id(actor,'确认人');daily_runner.authorize_actor(actor)
+    actor=positive_id(actor,'确认人')
+    from services.ai_workspace import access,products
+    access.authorize(actor,'ai_chat:execute')
     plan,task,session,managed=source(plan_id)
+    access.product(actor,managed,'ai_chat:execute')
     if body['plan_hash']!=digest(plan['result']):raise DomainError('方案版本已变化，请刷新原建议',409)
     with plan_store.transaction(True) as cur:
-        cur.execute('SELECT * FROM ai_operation_managed_asins WHERE id=%s FOR UPDATE',(managed['id'],));latest=cur.fetchone()
+        latest=products.lock_current(cur,managed)
         cur.execute('SELECT * FROM ai_operation_confirmations WHERE request_token=%s',(token,));old=cur.fetchone()
         if old:
             if old['plan_id']!=int(plan['id']) or old['actor_id']!=actor or old['decision']!=decision or set(json.loads(old['action_ids_json']))!=set(ids) or old['plan_hash']!=body['plan_hash']:
@@ -136,6 +139,7 @@ def decide(plan_id,body,actor):
             (plan['id'],body['plan_hash'],dumps(ids),decision,token,actor,dumps(operator_accounts.snapshot(person))))
         cid=cur.lastrowid
         if decision=='execute':
+            managed['executor_user_id']=operator_accounts.read_ai(cur,managed.get('executor_user_id'))['id']
             frozen={'executor_user_id':str(managed['executor_user_id']),
                     'proposed_by':{'id':int(task['actor_id']),'name':task['actor_name']},'plan_hash':body['plan_hash']}
             cur.execute('''INSERT INTO ai_operation_tasks
@@ -168,8 +172,8 @@ def blocks_daily(plan,action,managed_id):
     cutoff=daily_runner.clock().replace(tzinfo=None)-timedelta(hours=TTL_HOURS)
     with plan_store.transaction() as cur:
         cur.execute('''SELECT p.id,p.prompt_json,p.result_json,p.result_hash FROM ai_operation_plans p JOIN ai_operation_tasks t ON t.id=p.task_id
-            WHERE t.managed_id=%s AND t.conversation_id=%s AND t.task_type='chat' AND t.status='completed'
-            AND p.status='ready' AND p.completed_at>%s ORDER BY p.id DESC LIMIT 101''',(managed_id,sid,cutoff))
+            WHERE t.conversation_id=%s AND t.task_type='chat' AND t.status='completed'
+            AND p.status='ready' AND p.completed_at>%s ORDER BY p.id DESC LIMIT 101''',(sid,cutoff))
         rows=cur.fetchall()
         if len(rows)>100:raise DomainError('待处理人工建议过多，停止自动修改并先核对对话',409)
         for row in rows:
@@ -200,15 +204,15 @@ def require_execution(cur,plan,proof,action=None):
     if action and action['action_id'] not in json.loads(batch['action_ids_json']):raise DomainError('该行动未被明确确认，未提交',403)
 
 
-def context(managed_id):
+def context(managed_id,scope_key=None):
     """供每日/人工首包恢复有效人工决策，逐项保留未选、拒绝、排队和真实执行状态。"""
     cutoff=daily_runner.clock().replace(tzinfo=None)-timedelta(hours=TTL_HOURS)
     with plan_store.transaction() as cur:
         cur.execute('''SELECT p.id,p.prompt_json,p.result_json,p.result_hash,t.conversation_id,t.actor_name,p.completed_at
             FROM ai_operation_plans p JOIN ai_operation_tasks t ON t.id=p.task_id
-            JOIN ai_operation_managed_asins m ON m.id=t.managed_id AND m.current_conversation_id=t.conversation_id
-            WHERE t.managed_id=%s AND t.task_type='chat' AND t.status='completed' AND p.status='ready'
-              AND p.completed_at>%s ORDER BY p.id DESC LIMIT 101''',(managed_id,cutoff))
+            JOIN ai_operation_conversations c ON c.id=t.conversation_id AND c.state='active'
+            WHERE t.scope_key=%s AND t.task_type='chat' AND t.status='completed' AND p.status='ready'
+              AND p.completed_at>%s ORDER BY p.id DESC LIMIT 101''',(scope_key,cutoff))
         rows=cur.fetchall()
         if len(rows)>100:raise DomainError('有效人工方案超过100份，请处理或新建对话后再分析',422)
         result=[];seen=set()

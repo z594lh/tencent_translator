@@ -2,19 +2,19 @@
 from contextlib import ExitStack
 from datetime import timedelta
 from services.listing_performance.common import DomainError
-from services import operator_accounts
 from . import chat_tasks as tasks, plan_store, plans, daily_runner, conversation_store, conversation
 from . import plan_contract, plan_provider, natural_history
 from .metrics import digest,dumps
 
 
 def active(task,allow_stop=False):
-    """收费/提交记忆前复核人工权限、AI账号、店铺范围、当前指针与租约；暂停仍可仅问答。"""
-    daily_runner.authorize_actor(task['actor_id'])
+    """收费/提交记忆前复核人工权限、商品范围、当前会话与租约；不依赖托管执行人。"""
+    from services.ai_workspace import access
+    access.authorize(task['actor_id'])
     current,session,managed=tasks.checked_task(task['id'])
     if session['state']!='active' or str(managed['current_conversation_id'])!=str(session['id']):raise DomainError('对话已归档，未继续收费分析',409)
     if managed['shop_status']!=1:raise DomainError('店铺已停用，未继续分析',409)
-    with plan_store.transaction() as cur:operator_accounts.read_ai(cur,managed['executor_user_id'])
+    access.product(task['actor_id'],managed)
     with plan_store.transaction(True) as cur:tasks.fence(cur,task['id'],task['owner_token'],allow_stop)
     return current,session,managed
 

@@ -1,7 +1,7 @@
 """共享会话的只读分页与明确新建；不调用模型或Amazon，不篡改旧会话原文。"""
 from datetime import timezone
 from services.listing_performance.common import DomainError, positive_id
-from . import plan_store, conversation_store as store, daily_runner, plans, chat_tasks
+from . import plan_store, conversation_store as store, chat_tasks
 from .protocol import native_prompt,native_task,object_value,LEGACY_MESSAGE
 
 STATUS = {'not_sent':'未发送','confirmed':'属性已回读确认','rejected':'被拒绝','unknown':'结果待核实',
@@ -32,69 +32,28 @@ def public_session(row):
 
 
 def listing(managed_id,params):
-    """分页查看当前账户下的历次会话；GET不创建会话、不调用AI。"""
-    managed,identity=managed_identity(managed_id);boundary,key=store.scope(identity)
-    before=positive_id(params['before_id'],'会话游标') if params.get('before_id') else None
-    with plan_store.transaction() as cur:
-        cur.execute('''SELECT c.*,(SELECT MAX(e.created_at) FROM ai_operation_messages e WHERE e.conversation_id=c.id) last_message_at
-            FROM ai_operation_conversations c WHERE scope_key=%s'''+(' AND c.id<%s' if before else '')+
-                    ' ORDER BY c.id DESC LIMIT 21',(key,before) if before else (key,))
-        rows=cur.fetchall()
-    return {'list':[public_session(row) for row in rows[:20]],'has_more':len(rows)>20,
-            'next_before_id':str(rows[19]['id']) if len(rows)>20 else None,
-            'current_id':str(managed['current_conversation_id']) if managed['current_conversation_id'] else None,
-            'capabilities':{'read':True,'new_conversation':True,'human_chat':True,'confirm_execution':True,
-                'note':'人工分析会计费；建议须选择并确认才执行，18:30每日与人工任务共用持久队列'},
-            'worker':chat_tasks.health()}
+    """旧托管入口仅解析身份，目录使用通用实现。"""
+    from services.ai_workspace import products,sessions
+    managed,identity=managed_identity(managed_id)
+    return sessions.listing(products.resolve(managed['shop_id'],managed['asin']),params)
 
 
 def require_session(session_id):
-    """回查会话所属托管和当前真实账户，禁止跨店/已换凭证的历史被拼入新会话。"""
+    """会话按账户范围核验，不要求存在托管配置。"""
+    from services.ai_workspace import products
     with plan_store.transaction() as cur:
-        cur.execute('''SELECT c.*,m.id managed_id FROM ai_operation_conversations c
-            JOIN ai_operation_managed_asins m ON m.shop_id=c.shop_id AND BINARY m.asin=BINARY c.asin
-              AND m.marketplace_id=JSON_UNQUOTE(JSON_EXTRACT(c.identity_json,'$.marketplace_id'))
-            WHERE c.id=%s''',(positive_id(session_id,'会话编号'),))
-        session=cur.fetchone()
+        cur.execute('SELECT * FROM ai_operation_conversations WHERE id=%s',(positive_id(session_id,'会话'),));session=cur.fetchone()
     if not session:raise DomainError('会话不存在',404)
-    managed,identity=managed_identity(session['managed_id'])
-    if session['scope_key']!=store.scope(identity)[1]:raise DomainError('会话账户配置已变化，不允许跨账户读取',409)
-    return session,managed
+    target=products.resolve(session['shop_id'],session['asin'])
+    if session['scope_key']!=target['scope_key']:raise DomainError('会话账户配置已变化，不允许跨账户读取',409)
+    return session,target
 
 
 def create(managed_id,body,actor):
-    """显式归档当前会话并原子切换；复用每日/方案互斥，不重置每日幂等或执行记录。"""
-    if not isinstance(body,dict) or set(body)!={'expected_current_id','confirm_new'} or body['confirm_new'] is not True:
-        raise DomainError('请明确确认新建会话，保留旧历史与真实执行')
-    expected=positive_id(body['expected_current_id'],'当前会话') if body['expected_current_id'] is not None else None
-    managed,identity=managed_identity(managed_id);boundary,key=store.scope(identity)
-    if managed['shop_status']!=1:raise DomainError('店铺已停用，不新建运营会话',409)
-    with daily_runner.lock(managed),plans.lock(managed['shop_id'],managed['asin']):
-        with plan_store.transaction(True) as cur:
-            cur.execute('SELECT current_conversation_id FROM ai_operation_managed_asins WHERE id=%s FOR UPDATE',(managed['id'],))
-            old_id=cur.fetchone()['current_conversation_id']
-            if old_id!=expected:raise DomainError('当前会话已被其他用户切换，请刷新后查看，不重复新建',409)
-            cur.execute("SELECT id FROM ai_operation_plans WHERE shop_id=%s AND BINARY asin=BINARY %s AND status='generating' LIMIT 1",(managed['shop_id'],managed['asin']))
-            if cur.fetchone():raise DomainError('该ASIN仍有生成中或结果待核实的分析，请先核对历史后再新建',409)
-            cur.execute("SELECT id FROM ai_operation_tasks WHERE managed_id=%s AND status IN ('queued','running') LIMIT 1",(managed['id'],))
-            if cur.fetchone():raise DomainError('还有分析、每日或确认执行任务排队/运行，请等待或取消后再新建对话',409)
-            cur.execute("SELECT id FROM ai_operation_executions WHERE shop_id=%s AND BINARY asin=BINARY %s AND runtime_mode='real' AND status IN ('preparing','submitting') LIMIT 1",(managed['shop_id'],managed['asin']))
-            if cur.fetchone():raise DomainError('该ASIN仍有执行中的改动，请等待本次执行结束',409)
-            # 再读账户，避免等待命名锁期间店铺被切换Profile/凭证。
-            cur.execute('SELECT credential_group_id,region,marketplace_id,ads_profile_id,status FROM amazon_shops WHERE id=%s FOR UPDATE',(managed['shop_id'],))
-            latest=cur.fetchone()
-            if not latest or latest['status']!=1 or any(str(latest[k] or '')!=str(identity[k] or '') for k in ('credential_group_id','region','marketplace_id','ads_profile_id')):
-                raise DomainError('店铺账户配置已变化，请刷新后新建',409)
-            if old_id:
-                cur.execute('SELECT shop_id,asin,state FROM ai_operation_conversations WHERE id=%s FOR UPDATE',(old_id,))
-                old=cur.fetchone()
-                if not old or old['shop_id']!=managed['shop_id'] or old['asin']!=managed['asin'] or old['state']!='active':
-                    raise DomainError('当前会话指针异常，请先核对配置；不会归档其他商品会话',409)
-                cur.execute("UPDATE ai_operation_conversations SET state='archived',archived_at=UTC_TIMESTAMP(3),archived_by=%s WHERE id=%s AND state='active'",(positive_id(actor,'用户'),old_id))
-            sid=store.create_session(cur,identity,boundary,key)
-            cur.execute('UPDATE ai_operation_managed_asins SET current_conversation_id=%s WHERE id=%s',(sid,managed['id']))
-            cur.execute('SELECT * FROM ai_operation_conversations WHERE id=%s',(sid,))
-            return public_session(cur.fetchone())
+    """旧托管入口复用通用显式新建。"""
+    from services.ai_workspace import products,sessions
+    managed,identity=managed_identity(managed_id)
+    return sessions.create(products.resolve(managed['shop_id'],managed['asin']),body,actor)
 
 
 def describe(row,plan,task=None):
@@ -178,9 +137,9 @@ def messages(session_id,params):
                 cur.execute("SELECT id FROM ai_operation_messages WHERE "+field+"=%s AND round_no=%s AND event_type='model_response'",(value,row['round_no']))
                 item['delivery_note']='已有对应调用结果事件（不代表AI读完每个文件）' if cur.fetchone() else '请求已登记；是否收到/计费请核对结果，勿重复运行'
             items.append(item)
-        cur.execute("SELECT * FROM ai_operation_tasks WHERE managed_id=%s AND status IN ('queued','running') ORDER BY id LIMIT 20",(managed['id'],))
+        cur.execute("SELECT * FROM ai_operation_tasks WHERE scope_key=%s AND status IN ('queued','running') ORDER BY id LIMIT 20",(session['scope_key'],))
         pending=[chat_tasks.public(r,native_task(cur,r)) for r in list(cur.fetchall())]
-    return {'session':public_session(session),'managed_id':str(managed['id']),'pending_tasks':pending,
+    return {'session':public_session(session),'managed_id':str(managed['id']) if managed['id'] else None,'pending_tasks':pending,
             'list':items,'has_more':more,
             'next_before_id':str(rows[0]['id']) if rows else None,'last_id':str(rows[-1]['id']) if rows else None}
 

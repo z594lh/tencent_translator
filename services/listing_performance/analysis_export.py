@@ -1,24 +1,19 @@
-"""负责人关注SKU的经营/自动广告资料及AI分析编排，不执行广告操作。
+"""负责人关注SKU的经营/自动广告资料下载，不调用AI或执行广告操作。
 
 入口 build_document 要求 HTTP 层已校验本人/全员分析与 analysis_ads 权限。
 同一只读事务读取固定截止日的 30 天数据，返回 UTF-8 Markdown 和安全文件名；
-不落盘、不写报表、不启动任务。下载不调用AI，独立确认的AI入口调用deepseekAI。
+不落盘、不写报表、不启动任务。AI分析统一由ai_workspace处理，本文件不持有模型或历史结果逻辑。
 活动/广告组整体表现不分摊、不重复计为 SKU 金额。
 当前设置仅为实体最后同步值；原始广告报告没有历史 profile/竞价快照，明确说明限制。
 """
 from collections import defaultdict
-from contextlib import contextmanager
 from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import html
-import hashlib
 import json
-import logging
 import re
-import pymysql
 
 from services.listing_performance import analysis_service as analysis
-from services.listing_performance import analysis_history as history
 from services.listing_performance.common import DomainError, parse_date, utc_now
 from services import profit_calculator
 from services.ads_display import AUTO_LABELS, AUTO_ALIASES
@@ -632,168 +627,3 @@ def build_document(params, owner, include_pricing=False):
         authorize_sku(cursor, shop, market, owner, sku, expected)
     safe_sku = re.sub(r'[^\w.-]', '_', sku, flags=re.UNICODE).strip('.')[:100] or 'SKU'
     return document, f'{safe_sku}_经营广告分析_截至{last}.md'
-
-
-@contextmanager
-def ai_request_lock(params, owner):
-    """独立MySQL会话锁防同一人员/SKU跨worker并发收费；不新增表、不锁源报表记录。
-
-    必须在HTTP鉴权后使用，0秒等待，已有请求则409。本连接autocommit，仅持有会话锁；
-    原资料的只读事务全部在调用AI前关闭；finally释放锁和连接，异常也不遗留锁。
-    锁只防在途并发，不保存历史结果/顺序请求去重；再次明确确认分析会重新计费。
-    """
-    shop = analysis.integer(params.get('shop_id'), 'shop_id', 1)
-    market = analysis.text_input(params.get('marketplace_id'), 'marketplace_id', 32)
-    sku = analysis.text_input(params.get('seller_sku'), 'seller_sku', 255)
-    if not sku:
-        raise DomainError('请选择需要分析的SKU')
-    identity_json = json.dumps([shop, market, owner, sku], ensure_ascii=False)
-    key = 'sku_ai:' + hashlib.sha256(identity_json.encode('utf-8')).hexdigest()[:56]
-    conn = analysis.get_db_connection()
-    acquired = False
-    try:
-        conn.autocommit(True)
-        with conn.cursor() as cursor:
-            # 仅本会话延长空闲超时，避免等待AI时短wait_timeout提前释放防重复锁。
-            cursor.execute('SET SESSION wait_timeout=600')
-            cursor.execute('SELECT GET_LOCK(%s,0) AS acquired', (key,))
-            row = cursor.fetchone()
-            if not row or row['acquired'] is None:
-                raise DomainError('AI并发控制暂不可用，本次未调用AI', 503)
-            acquired = bool(row and row['acquired'] == 1)
-        if not acquired:
-            raise DomainError('该人员的这个SKU正在AI分析中，请等待完成，不要重复请求', 409)
-        yield
-    finally:
-        try:
-            if acquired:
-                with conn.cursor() as cursor:
-                    cursor.execute('SELECT RELEASE_LOCK(%s)', (key,))
-        except Exception:
-            # 关闭会话也会释放GET_LOCK；不记录供应商响应/资料，不掩盖原始业务结果。
-            logging.getLogger(__name__).warning('SKU AI会话锁释放失败，将关闭连接释放')
-        finally:
-            conn.close()
-
-
-def verify_bid_adjustments(result, data, profile):
-    """用返回前的新快照复核AI竞价表的对象、启用状态和当前值，拒绝虚构/过期竞价。
-
-    不执行调价。无效条目移除并明确提示，保留其他分析；不会再调用AI修复。
-    此复核只覆盖结构化竞价表，正文建议仍须人工判断，不能保证模型推断正确。
-    """
-    entries = result['analysis'].get('bid_adjustments', [])
-    verified, seen = [], set()
-    for item in entries:
-        cid, gid, tid = (item[k] for k in ('campaign_id', 'ad_group_id', 'target_id'))
-        campaign, group = data['campaigns'].get(cid), data['groups'].get((cid, gid))
-        relation = data['relations'].get(cid)
-        configs = [r for r in data['targets'] if identity(r['campaign_id']) == cid and identity(r['ad_group_id']) == gid and identity(r['target_id']) == tid]
-        if (not relation or gid not in relation['groups'] or not campaign or not group or
-                not classify_campaign(cid, campaign, data['target_rows'], profile)[0] or
-                str(campaign['state']).upper() != 'ENABLED' or str(group['state']).upper() != 'ENABLED' or
-                len(configs) != 1 or str(configs[0]['state']).upper() != 'ENABLED' or (cid, gid, tid) in seen):
-            continue
-        current = configs[0]['bid'] if configs[0]['bid'] is not None else group['default_bid']
-        if current is None or analysis.amount(current) != Decimal(str(item['current_bid'])):
-            continue
-        key = expression(configs[0]['resolved_expression'])
-        if key not in AUTO_LABELS:
-            continue
-        seen.add((cid, gid, tid))
-        verified.append({**item, 'target_name': AUTO_LABELS[key]})
-    result['analysis']['bid_adjustments'] = verified
-    if len(verified) != len(entries):
-        result['analysis']['data_gaps'].append('部分AI竞价条目的对象/启用状态/当前出价与最新本地设置不符，已移除；未再次调用AI。其他正文建议仍需人工核对。')
-
-
-def verify_placement_adjustments(result, data, profile):
-    """按最新本地快照核验活动广告位比例，只返回真实关联、启用的自动活动建议。
-
-    与现有广告设置页一致，合法配置中省略某广告位表示0%加价；配置损坏、重复、
-    当前比例变动或profile不符则移除该建议。中文名称由服务端确定，不信任模型命名。
-    只校验、不调价、不访问Amazon；移除原因保留为简短补充，不再收费修复。
-    """
-    labels = {code: label for label, code in PLACEMENTS.values() if code != 'PLACEMENT_OFF_AMAZON'}
-    entries = result['analysis'].get('placement_adjustments', [])
-    verified, seen = [], set()
-    for item in entries:
-        cid, placement = item['campaign_id'], item['placement']
-        campaign = data['campaigns'].get(cid)
-        if (cid not in data['relations'] or not campaign or placement not in labels or
-                not classify_campaign(cid, campaign, data['target_rows'], profile)[0] or
-                str(campaign['state']).upper() != 'ENABLED' or (cid, placement) in seen):
-            continue
-        settings = bidding_settings(campaign)
-        if not settings:
-            continue
-        configs = settings.get('placementBidding', [])
-        # 非对象条目说明来源配置损坏，不能把它当成缺省的0%。
-        if any(not isinstance(row, dict) for row in configs):
-            continue
-        values = [row.get('percentage') for row in configs if row.get('placement') == placement]
-        current = values[0] if len(values) == 1 else 0
-        if len(values) > 1 or isinstance(current, bool):
-            continue
-        try:
-            value = Decimal(str(current))
-            if not value.is_finite() or not 0 <= value <= 900 or value != value.to_integral_value():
-                continue
-        except (ValueError, ArithmeticError):
-            continue
-        if value != Decimal(str(item['current_percentage'])):
-            continue
-        seen.add((cid, placement))
-        verified.append({**item, 'placement_name': labels[placement]})
-    result['analysis']['placement_adjustments'] = verified
-    if len(verified) != len(entries):
-        result['analysis']['data_gaps'].append('部分AI广告位条目的活动/启用状态/当前比例与最新本地设置不符，已移除；其他建议仍需人工核对，未再次调用AI。')
-
-
-def analyze_document(params, owner, check_permissions, include_pricing=False, actor=None):
-    """已确认的AI编排：取得会话锁、构造同一下载资料、调用现有DeepSeek、复核访问资格。
-
-    check_permissions是HTTP传入的可信权限复核回调，收费前/返回前都调用；
-    不接受浏览器提供的提示词或模型，不保留业务连接事务等待AI，不写报表/广告。
-    成功结果在返回前短事务落历史表，操作人actor由HTTP登录身份传入；保存失败不重新调用AI。
-    """
-    from services.deepseekAI import analyze_sku_operations, SkuAnalysisError
-    if params.get('confirm_ai') is not True:
-        raise DomainError('请先确认将资料发送至DeepSeek并可能产生API费用')
-    with ai_request_lock(params, owner):
-        document, _ = build_document(params, owner, include_pricing=include_pricing)
-        check_permissions()
-        history.ensure_ready(params, owner)
-        try:
-            result = analyze_sku_operations(document)
-        except SkuAnalysisError as error:
-            raise DomainError(str(error), error.status) from None
-        # AI等待期间交接/配置/权限可能变化。新短事务锁店铺复核并保存，绝不锁库等待模型。
-        validated = False
-        try:
-            with analysis.session(params, owner, write=True) as (cursor, shop, market, _, _):
-                choice = authorize_sku(cursor, shop, market, owner, params['seller_sku'],
-                                       analysis.integer(params.get('config_version'), 'config_version', 1))
-                if result['analysis'].get('bid_adjustments') or result['analysis'].get('placement_adjustments'):
-                    cursor.execute('SELECT ads_profile_id FROM amazon_shops WHERE id=%s', (shop,))
-                    profile = identity(cursor.fetchone()['ads_profile_id'])
-                    data = source_data(cursor, shop, market, params['seller_sku'], parse_date(params['report_date']), profile)
-                    verify_bid_adjustments(result, data, profile)
-                    verify_placement_adjustments(result, data, profile)
-                check_permissions()
-                result = {**result, 'seller_sku': params['seller_sku'], 'product_name': choice['product_name'],
-                          'report_date': parse_date(params['report_date']), 'generated_at': utc_now(),
-                          'guide_version': 'sku_operations_v3'}
-                validated = True
-                record_id = history.save_result(cursor, shop, market, owner, actor if actor is not None else owner,
-                                                params, result, include_pricing)
-            return {**result, 'history_id': record_id, 'history_saved': True}
-        except DomainError as error:
-            raise DomainError(str(error) + '；AI请求可能已计费，未自动重试', error.status) from None
-        except pymysql.MySQLError:
-            if not validated:
-                raise DomainError('分析后的访问资格暂时无法核实，请联系管理员；AI请求可能已计费，未自动重试', 503) from None
-            # 事务已由session回滚；保留已验证结果供下载，不把存储故障变成再次收费的理由。
-            logging.getLogger(__name__).warning('SKU AI历史保存未确认成功，返回本次结果供下载；未重试模型')
-            return {**result, 'history_saved': False, 'history_id': None,
-                    'history_warning': '本次分析已完成，但历史保存未确认成功，请先下载结果留存；无需重新调用AI。'}

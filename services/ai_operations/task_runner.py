@@ -16,7 +16,10 @@ def process(task,stopping=None):
     try:
         def permitted():
             """每轮收费和每项提交前复核租约、权限及退出信号。"""
-            daily_runner.authorize_actor(task['actor_id'])
+            if task['task_type']=='execute':
+                from services.ai_workspace import access
+                _,_,target=chat_tasks.checked_task(task['id']);access.product(task['actor_id'],target,'ai_chat:execute')
+            else:daily_runner.authorize_actor(task['actor_id'])
             with plan_store.transaction(True) as cur:chat_tasks.fence(cur,task['id'],task['owner_token'])
             if stopping and stopping():raise DomainError('消费者正在停止，未启动后续操作',409)
         permitted()

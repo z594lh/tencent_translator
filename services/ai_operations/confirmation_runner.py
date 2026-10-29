@@ -21,8 +21,11 @@ def process(task,permitted):
             """每次提交前重查权限、启停、原会话、期限、执行身份和较新同对象结论。"""
             permitted()
             current,_,latest=chat_tasks.checked_task(task['id'])
+            from services import operator_accounts
+            with plan_store.transaction() as cur:executor=operator_accounts.read_ai(cur,latest.get('executor_user_id'))
+            latest['executor_user_id']=executor['id']
             if str(latest['executor_user_id'])!=frozen['executor_user_id']:raise DomainError('AI执行人已变化，请重新分析并确认',409)
-            managed_store.execution_identity(latest)
+            if latest['id']:managed_store.execution_identity(latest)
             snapshot=confirmations.view(plan['id'])
             rows={a['action_id']:a for a in snapshot['actions']}
             if any(rows[aid]['invalid_reason'] for aid in ids):raise DomainError('原建议已失效或托管暂停；未继续提交，请重新分析',409)

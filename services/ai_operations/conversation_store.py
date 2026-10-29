@@ -66,7 +66,7 @@ def peek_session(identity):
         cur.execute('SELECT current_conversation_id FROM ai_operation_managed_asins WHERE shop_id=%s AND marketplace_id=%s AND BINARY asin=BINARY %s',
                     (identity['id'],identity['marketplace_id'],identity['asin']))
         managed=cur.fetchone()
-        if not managed:raise DomainError('请先添加托管ASIN再预览',404)
+        if not managed:managed={'current_conversation_id':None}
         sid=managed['current_conversation_id']
         cur.execute("SELECT * FROM ai_operation_conversations WHERE scope_key=%s AND state='active'"+(' AND id=%s' if sid else ' ORDER BY generation DESC LIMIT 1'),(key,sid) if sid else (key,))
         session=cur.fetchone()

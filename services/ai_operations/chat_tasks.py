@@ -73,7 +73,6 @@ def get(task_id):
 def enqueue(session_id,body,actor):
     """同事务保存原话与任务，返回后异步处理；原token重试先复用而非再次收费。"""
     from .conversation_queries import require_session
-    from .daily_runner import authorize_actor
     if not isinstance(body,dict) or not {'text','request_token','confirm_ai'}<=set(body) or set(body)-{'text','request_token','confirm_ai','mode','retry_summary_id'} or body['confirm_ai'] is not True:
         raise DomainError('请输入问题并确认AI分析可能计费')
     mode=body.get('mode','discussion')
@@ -82,11 +81,13 @@ def enqueue(session_id,body,actor):
     text=body['text'];token=body['request_token']
     if not isinstance(text,str) or not text.strip() or len(text)>4000 or any(ord(c)<32 and c not in '\n\t' for c in text):raise DomainError('问题不能为空、超过4000字符或含控制字符')
     if not isinstance(token,str) or not re.fullmatch('[a-f0-9]{32}',token):raise DomainError('发送标识无效')
-    actor=positive_id(actor,'用户');authorize_actor(actor)
+    actor=positive_id(actor,'用户')
+    from services.ai_workspace import access,products
+    access.authorize(actor)
     session,managed=require_session(session_id)
+    access.product(actor,managed)
     with plan_store.transaction(True) as cur:
-        cur.execute('SELECT current_conversation_id FROM ai_operation_managed_asins WHERE id=%s FOR UPDATE',(managed['id'],))
-        current=cur.fetchone()
+        current=products.lock_current(cur,managed)
         cur.execute('SELECT * FROM ai_operation_tasks WHERE request_token=%s',(token,))
         old=cur.fetchone()
         if old:
@@ -168,7 +169,7 @@ def claim():
             if old.get('run_id') and (sent or old['stop_requested']):
                 cur.execute("UPDATE ai_operation_daily_runs SET status='failed',message='每日消费者中断，原分析或执行可能已发生；仅核对历史，不自动重放',completed_at=UTC_TIMESTAMP(3),updated_at=UTC_TIMESTAMP(3) WHERE id=%s",(old['run_id'],))
         cur.execute("""SELECT t.* FROM ai_operation_tasks t WHERE t.status='queued' AND t.available_after<=UTC_TIMESTAMP(3)
-            AND NOT EXISTS (SELECT 1 FROM ai_operation_tasks prior WHERE prior.managed_id=t.managed_id
+            AND NOT EXISTS (SELECT 1 FROM ai_operation_tasks prior WHERE (prior.scope_key=t.scope_key OR (prior.managed_id IS NOT NULL AND prior.managed_id=t.managed_id))
                 AND prior.id<t.id AND prior.status IN ('queued','running')) ORDER BY t.id LIMIT 1 FOR UPDATE""")
         row=cur.fetchone()
         if not row:return None

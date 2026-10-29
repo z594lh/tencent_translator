@@ -1,4 +1,4 @@
-"""AI托管独立权限入口；权限同时包含敏感资料、AI归属分配和真实运营执行。"""
+"""AI工作区HTTP入口；对话、托管、配置及确认执行独立鉴权。"""
 from functools import wraps
 from flask import Blueprint, Response, request
 import pymysql
@@ -11,13 +11,31 @@ from services.ai_operations import chat_tasks, daily_queue, confirmations
 from services.ai_operations import tool_activity,prompt_settings
 
 ai_operations_bp = Blueprint('ai_operations', __name__, url_prefix='/api/ai-operations')
-REQUIRED = {'ai_operations:manage'}
 
 
 def authorize():
-    """只接受显式AI托管权限，不以管理员身份或旧绩效权限兜底放行。"""
-    if not REQUIRED.issubset(set(get_user_permission_codes(request.current_user['id']))):
-        raise DomainError('需要管理员分配“AI托管”权限', 403)
+    """按能力独立鉴权；商品/会话编号再核实际数据范围。"""
+    from services.ai_workspace import access,products
+    name=request.endpoint.rsplit('.',1)[-1];actor=request.current_user['id']
+    if name in ('prompt_configuration','publish_prompt_configuration','prompt_versions','preview_prompts'):permission='ai_prompts:manage'
+    elif name in ('tool_directory','tool_browser_sources','tool_browser_preview','save_tool','tool_usage_statistics'):permission='ai_tools:manage'
+    elif name in ('conversation_list','new_conversation','conversation_messages','conversation_original','conversation_tool_rounds','conversation_memory','conversation_document','send_conversation_message','chat_task_status','cancel_chat_task','plan_confirmation','confirmed_execution_records','workspace_products','workspace_resolve','workspace_conversations'):permission='ai_chat:use'
+    elif name=='decide_plan_actions':permission='ai_chat:execute'
+    else:permission='ai_operations:manage'
+    if name=='workspace_products' and request.args.get('purpose')=='tools':permission='ai_tools:manage'
+    access.authorize(actor,permission)
+    values=request.view_args or {};target=None
+    if values.get('session_id'):_,target=conversation_queries.require_session(values['session_id'])
+    elif values.get('task_id'):
+        task,_,target=chat_tasks.checked_task(values['task_id'])
+        if name=='cancel_chat_task' and task['task_type']!='chat':
+            permission='ai_operations:manage' if task['task_type']=='daily' else 'ai_chat:execute'
+            access.authorize(actor,permission)
+    elif values.get('plan_id') and name in ('plan_confirmation','decide_plan_actions','confirmed_execution_records'):_,_,_,target=confirmations.source(values['plan_id'])
+    elif values.get('product_id'):target=products.get(values['product_id'])
+    elif values.get('managed_id') and name in ('conversation_list','new_conversation'):
+        managed,identity=conversation_queries.managed_identity(values['managed_id']);target=products.resolve(managed['shop_id'],managed['asin'])
+    if target:access.product(actor,target,permission)
 
 
 def response(value, status=200):
@@ -41,7 +59,7 @@ def endpoint(function):
             return response({'status': 'error', 'message': str(error)}, error.status)
         except pymysql.MySQLError as error:
             if error.args and error.args[0] in (1054,1146):
-                return response({'status':'error','message':'AI工具/共享会话数据库结构未就绪，请先执行本轮新表SQL；页面读取不会调用AI'},503)
+                return response({'status':'error','message':'AI工作区数据库结构未就绪，请先执行本轮迁移SQL；页面读取不会调用AI'},503)
             return response({'status': 'error', 'message': 'AI托管存储暂不可用；可能已计费或提交平台，请核对执行历史，不重复运行'}, 503)
         except Exception:
             return response({'status': 'error', 'message': 'AI托管流程未完成；可能已计费或提交平台，请核对执行历史，不重复运行'}, 503)
@@ -199,6 +217,9 @@ def tool_directory():
 def tool_browser_sources(name):
     """只读列出所选托管ASIN的冻结资料与此工具真实调用记录。"""
     from services.ai_operations.tools import browser
+    target,_,_=browser.boundary(request.args.get('product_id',request.args.get('managed_id')),'product_id' in request.args)
+    from services.ai_workspace import access
+    access.product(request.current_user['id'],target,'ai_tools:manage')
     return browser.sources(name,request.args)
 
 
@@ -208,7 +229,12 @@ def tool_browser_sources(name):
 def tool_browser_preview(name):
     """只读浏览查询/测算返回，不创建AI任务、不允许提交方案或写Amazon。"""
     from services.ai_operations.tools import browser
-    return browser.preview(name,configuration_body())
+    body=configuration_body()
+    if not isinstance(body,dict):raise DomainError('查询参数无效',422)
+    target,_,_=browser.boundary(body.get('product_id',body.get('managed_id')),'product_id' in body)
+    from services.ai_workspace import access
+    access.product(request.current_user['id'],target,'ai_tools:manage')
+    return browser.preview(name,body)
 
 
 def configuration_body():
@@ -263,7 +289,41 @@ def save_tool(name):
 def conversation_memory(session_id):
     """只读已生成的会话摘要及覆盖范围，不触发收费压缩。"""
     session,_=conversation_queries.require_session(session_id)
-    return natural_history.describe(session['id'])
+    return {**natural_history.describe(session['id']),'retry_question':prompt_settings.snapshot()['config']['prompts']['summary_retry_question']}
+
+
+@ai_operations_bp.get('/products')
+@login_required
+@endpoint
+def workspace_products():
+    from services.ai_workspace import products
+    return products.listing(request.args,request.current_user['id'],'ai_tools:manage' if request.args.get('purpose')=='tools' else 'ai_chat:use')
+
+
+@ai_operations_bp.get('/products/resolve')
+@login_required
+@endpoint
+def workspace_resolve():
+    from services.ai_workspace import products,access
+    target=products.resolve(request.args.get('shop_id'),request.args.get('asin')) if request.args.get('asin') else products.resolve_sku(request.args.get('shop_id'),request.args.get('seller_sku'))
+    access.product(request.current_user['id'],target)
+    text=''
+    if request.args.get('entry')=='performance':
+        text=prompt_settings.snapshot()['config']['prompts']['performance_question']
+        values={'asin':target['asin'],'sku':target['sku'],'report_date':str(request.args.get('report_date',''))[:10],'days':str(request.args.get('days',''))[:3]}
+        for key,value in values.items():text=text.replace('{{ '+key+' }}',value)
+    return {**products.public(target),'entry_question':text}
+
+
+@ai_operations_bp.route('/products/<product_id>/conversations',methods=['GET','POST'])
+@login_required
+@endpoint
+def workspace_conversations(product_id):
+    from services.ai_workspace import products,sessions
+    target=products.get(product_id)
+    value=sessions.listing(target,request.args) if request.method=='GET' else sessions.create(target,request_body(),request.current_user['id'])
+    if 'capabilities' in value:value['capabilities']['confirm_execution']='ai_chat:execute' in get_user_permission_codes(request.current_user['id'])
+    return {**value,'viewer_id':str(request.current_user['id'])}
 
 
 @ai_operations_bp.get('/conversations/<session_id>/messages/<message_id>/documents/<binding_id>')

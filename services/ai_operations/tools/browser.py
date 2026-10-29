@@ -16,17 +16,20 @@ def allowed(name):
     return definition
 
 
-def boundary(managed_id):
+def boundary(identifier,product=False):
     """按实时托管账户建立只读边界，不能靠输入ASIN切换广告账户。"""
-    managed,identity=conversation_queries.managed_identity(managed_id)
-    return managed,identity,conversation_store.scope(identity)[1]
+    from services.ai_workspace import products
+    if product:target=products.get(identifier)
+    else:
+        managed,identity=conversation_queries.managed_identity(identifier);target=products.resolve(managed['shop_id'],managed['asin'])
+    return target,target['identity'],target['scope_key']
 
 
 def sources(name,params):
     """返回可复查冻结任务与近期实际调用元信息，不读取大请求正文。"""
     allowed(name)
-    if set(params)!={'managed_id'}:raise DomainError('请选择托管ASIN',422)
-    managed,identity,key=boundary(params['managed_id']);archives=[]
+    if set(params) not in ({'managed_id'},{'product_id'}):raise DomainError('请选择商品',422)
+    managed,identity,key=boundary(params.get('product_id',params.get('managed_id')),'product_id' in params);archives=[]
     safe="(CASE WHEN JSON_VALID(m.payload_json) THEN m.payload_json ELSE '{}' END)"
     fields=[]
     for index in range(8):
@@ -112,10 +115,10 @@ def preview(name,body):
     """显式点击后只读试查，或查看历史原回包；绝无模型请求和Amazon写入口。"""
     allowed(name)
     if not isinstance(body,dict):raise DomainError('查询参数必须是对象',422)
-    mode=body.get('mode');base={'managed_id','mode'}
+    mode=body.get('mode');base={'product_id' if 'product_id' in body else 'managed_id','mode'}
     keys={'actual':{'message_id','call_id'},'snapshot':{'archive_id','archive_kind','arguments'},'current':{'report_date','arguments'}}
     if not isinstance(mode,str) or mode not in keys or set(body)!=base|keys[mode]:raise DomainError('请选择有效数据来源和查询参数',422)
-    managed,identity,key=boundary(body['managed_id'])
+    managed,identity,key=boundary(body.get('product_id',body.get('managed_id')),'product_id' in body)
     if mode=='actual':return actual(name,body,key)
     if not isinstance(body['arguments'],dict):raise DomainError('工具参数必须是JSON对象',422)
     if mode=='snapshot':pack,data,session=frozen(body,key)

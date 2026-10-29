@@ -29,8 +29,8 @@ def build(pack,data,management):
              'recent_runs':[],'observations':[],'pending_executions':[],'execution_facts':[],'unstarted_actions':[],
              'notes':['下列为正式提交及真实回读；属性一致不证明经营收益由该操作产生。',
                       '观察日龄按北京时间日期；完整改后报告区间从操作次日开始，报表未到或缺失不能认定效果。']}
-    from . import confirmations
-    context['human_decisions']=confirmations.context(management['managed_id'])
+    from . import confirmations,conversation_store
+    context['human_decisions']=confirmations.context(management['managed_id'],conversation_store.scope(identity)[1])
     with plan_store.transaction() as cur:
         cur.execute('''SELECT p.*,r.id managed_run_id,r.run_date management_date,r.status daily_status
             FROM ai_operation_daily_runs r JOIN ai_operation_plans p ON p.id=r.plan_id

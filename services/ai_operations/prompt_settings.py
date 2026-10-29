@@ -39,6 +39,8 @@ FIELDS=(
 )
 ORIGINAL_KEYS={row[0] for row in FIELDS}
 FIELDS+= (
+    ('performance_question','绩效页默认分析问题','编辑框 · 从绩效页进入对话时','只准备草稿，发送才计费。变量asin、sku、report_date、days仅简单替换。',
+     '请分析ASIN {{ asin }}（SKU {{ sku }}）截至 {{ report_date }} 最近 {{ days }} 天的经营变化，自行查询需要的数据，说明主要问题和优化建议；允许保持观察，不强制修改。'),
     ('plan_submission','方案提交与中文结论','system · 每日及生成方案模式','中文summary直接作为最终回复，不再额外调用模型收尾。',
      '提交方案时，在summary中给出可直接展示给运营人员的中文分析结论、改动或不改动理由及观察安排。校验成功后ERP直接使用该结论形成回复，无需再发起一次总结。'),
     ('budget_normal','任务额度说明','user · 每次模型请求前，与结构化预算一起发送','额度包含重复携带的上下文；不是新增资料额度。',
@@ -108,7 +110,7 @@ def snapshot():
 def listing():
     """配置页返回实际生效内容、默认值与各触发说明，不查询经营数据。"""
     return {**snapshot(),'fields':[{'key':key,'label':label,'trigger':trigger,'help':help_text,'default':value} for key,label,trigger,help_text,value in FIELDS],
-            'note':'仅AI托管。保存生成不可变发布版本，在任务开始准备时固定；进行中的任务不受影响。工具说明另在AI工具管理。旧草稿和旧发布版本保留，不参与新编排。'}
+            'note':'通用AI对话与托管共用。保存生成不可变发布版本，在任务开始准备时固定；进行中的任务不受影响。工具说明另在AI工具管理。旧草稿和旧发布版本保留。'}
 
 
 def publish(body,actor):

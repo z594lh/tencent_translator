@@ -14,7 +14,6 @@ from services.listing_performance import performance_service as service
 from services.listing_performance import breakdown_service as breakdown
 from services.listing_performance import analysis_service as analysis
 from services.listing_performance import analysis_export
-from services.listing_performance import analysis_history
 from services.permissions_service import get_user_permission_codes
 from services.listing_performance.common import positive_id, DomainError
 
@@ -127,7 +126,7 @@ def config():
                 'analysis_access': {'user_id': request.current_user['id'],
                     'self': 'performance:analysis_self' in codes and bool(codes.intersection({'performance:view_self','performance:view_all'})),
                     'ads': 'performance:analysis_ads' in codes,
-                    'ai': {'performance:analysis_ads','performance:analysis_ai'}.issubset(codes),
+                    'ai': 'ai_chat:use' in codes,
                     'all': {'performance:view_all','performance:analysis_all'}.issubset(codes)},
                 'shops':shops,'markets':{key:{k:v for k,v in market_config(key).items() if k in
             ('timezone','currency','report_currency')} for key in configured}}
@@ -213,69 +212,15 @@ def export_analysis():
     return response
 
 
-@performance_bp.post('/analysis/ai')
-@login_required
-@domain_response
-def ai_analysis():
-    """明确确认后分析单SKU：人员/广告资料/收费权限分开验证，不接收外部提示词或模型。
-
-    Service复用下载资料和deepseekAI，限制并发/输入/费用重试，返回可安全文本展示的JSON；
-    成功结果保存历史，但不执行建议、不生成任务。费用提示由前端确认，服务端也要求confirm_ai=true。
-    """
-    params = request.get_json(silent=True)
-    owner = analysis_owner(params)
-    include_pricing = bool(permissions().intersection({'pricing:calculate', 'performance:view_costs'}))
-
-    def check_permissions():
-        """调用前后重新读取DB授权，避免分析期间撤权后仍返回结果。"""
-        if analysis_owner(params) != owner or not {'performance:analysis_ads','performance:analysis_ai'}.issubset(permissions()):
-            raise DomainError('需要SKU广告资料导出及SKU AI分析权限', 403)
-        if include_pricing and not permissions().intersection({'pricing:calculate', 'performance:view_costs'}):
-            raise DomainError('售价/成本查看权限已变更，请重新查询', 403)
-
-    check_permissions()
-    if any(key in params for key in ('document', 'prompt', 'model', 'messages')):
-        raise DomainError('AI分析资料和模型由系统确定，不接受自定义提示词或模型')
-    result = analysis_export.analyze_document(params, owner, check_permissions, include_pricing=include_pricing,
-                                             actor=request.current_user['id'])
-    # 明确构造JSON包络Response以设置no-store；domain_response保留业务错误处理。
-    from flask import jsonify
-    from services.listing_performance.common import json_data
-    import json
-    response = jsonify(json.loads(json_data({'status': 'success', 'data': result})))
-    response.headers['Cache-Control'] = 'no-store'
-    return response
-
-
+@performance_bp.route('/analysis/ai',methods=['POST'])
 @performance_bp.get('/analysis/ai/history')
 @performance_bp.get('/analysis/ai/latest')
 @performance_bp.get('/analysis/ai/history/<int:record_id>')
 @login_required
 @domain_response
-def ai_history(record_id=None):
-    """只读AI历史列表/最近可查看记录/指定详情；沿用分析权限，不调用收费模型。
-
-    每次按登录用户核对人员范围和售价/成本资格；Service再限制当前负责SKU及记录身份。
-    不把旧config_version当历史读取条件，查看历史不会改变关注配置或分析快照。
-    """
-    from flask import jsonify
-    from services.listing_performance.common import json_data
-    import json
-    owner = analysis_owner(request.args)
-    codes = permissions()
-    if not {'performance:analysis_ads', 'performance:analysis_ai'}.issubset(codes):
-        raise DomainError('需要SKU广告资料导出及SKU AI分析权限', 403)
-    include_pricing = bool(codes.intersection({'pricing:calculate', 'performance:view_costs'}))
-    result = analysis_history.query(request.args, owner, include_pricing=include_pricing,
-                                    latest=request.path.endswith('/latest'), record_id=record_id)
-    current = permissions()
-    if (analysis_owner(request.args) != owner or
-            not {'performance:analysis_ads', 'performance:analysis_ai'}.issubset(current) or
-            (include_pricing and not current.intersection({'pricing:calculate', 'performance:view_costs'}))):
-        raise DomainError('分析查看权限已变更，请重新登录确认', 403)
-    response = jsonify(json.loads(json_data({'status': 'success', 'data': result})))
-    response.headers['Cache-Control'] = 'no-store'
-    return response
+def retired_ai_analysis(record_id=None):
+    """旧页面安全停用，不再调用模型或读取已删除的旧历史表。"""
+    raise DomainError('一次性AI分析已停用，请使用商品AI对话',410)
 
 
 @performance_bp.get('/analysis/candidates')
