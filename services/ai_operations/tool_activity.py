@@ -36,9 +36,12 @@ def query_text(name,args):
 
 def result_status(result):
     """没有status的历史概况/观察返回也保留成功、空缺和异常差别。"""
+    if result.get('status')=='provided' and (result.get('has_more') or result.get('byte_limited')):return 'partial'
     if result.get('status'):return result['status']
     if result.get('error'):return 'error'
-    if 'rows' in result:return 'provided' if result['rows'] else 'unavailable'
+    if 'rows' in result:
+        if result.get('byte_limited') and not result['rows']:return 'budget_exceeded'
+        return ('partial' if result.get('has_more') else 'provided') if result['rows'] else 'empty'
     return 'provided'
 
 
@@ -51,14 +54,14 @@ def call_summary(name,args,result):
             children.append({'name':tool,'label':label(tool),'query':query_text(tool,query),'window':query.get('window','all'),
                 'ref_type':str(query.get('ref') or '').split(':')[0][:40], 'status':result_status(value),
                 'returned':value.get('returned',len(value['rows']) if isinstance(value.get('rows'),list) else None),
-                'message':str(value.get('message') or value.get('error') or '')[:500]})
+                'message':str(value.get('message') or value.get('reason') or value.get('error') or '')[:500]})
     if name=='get_operation_overview' and isinstance(result.get('advertising'),list):
         children.insert(0,{'name':'read_advertising','label':label('read_advertising'),'query':'全部广告报告汇总 · 全部统计窗口',
             'window':'all','ref_type':'','status':'provided','returned':len(result['advertising']),'message':'各报告范围独立，不可相加销售'})
     status=result_status(result)
     if children and any(r['status'] not in ('provided','validated') for r in children):status='partial'
     return {'status':status,'returned':result.get('returned',len(result['rows']) if isinstance(result.get('rows'),list) else None),
-            'message':str(result.get('message') or result.get('error') or '')[:800],'children':children}
+            'message':str(result.get('message') or result.get('reason') or result.get('error') or '')[:800],'children':children}
 
 
 def json_value(raw,default):
@@ -85,6 +88,7 @@ def projection_sql():
         CHAR_LENGTH(JSON_UNQUOTE(JSON_EXTRACT(m.payload_json,'$.response.reply')))>20000 text_truncated,
         JSON_UNQUOTE(JSON_EXTRACT(m.payload_json,'$.error_code')) error_code,
         LEFT(JSON_UNQUOTE(JSON_EXTRACT(m.payload_json,'$.message')),1000) message,
+        JSON_EXTRACT(m.payload_json,'$.budget') budget_json,
         CASE WHEN m.event_type='model_response' THEN JSON_ARRAY("""+','.join(calls)+") END calls_json,"+\
         "CASE WHEN m.event_type='data_response' THEN JSON_ARRAY("+','.join(results)+") END results_json,"+\
         "JSON_OBJECT("+usage+") usage_json FROM ai_operation_messages m JOIN ai_operation_conversations c ON c.id=m.conversation_id WHERE "
@@ -105,6 +109,7 @@ def load(where,params,limit):
             for key in ('bytes','returned','elapsed_ms'):
                 if isinstance(result.get(key),str) and result[key].isdecimal():result[key]=int(result[key])
         row['usage']=json_value(row.pop('usage_json'),{})
+        row['budget']=json_value(row.pop('budget_json'),{})
     return sorted(rows,key=lambda r:r['id']),more
 
 
@@ -114,7 +119,7 @@ def rounds(rows):
     for row in rows:
         n=row['round_no'];current=grouped.setdefault(n,{'round':n,'created_at':row['created_at'],'tools':[],'usage':{},'text':'','has_request':False})
         kind=row['event_type']
-        if kind=='model_request':current.update(has_request=True,request_id=str(row['id']))
+        if kind=='model_request':current.update(has_request=True,request_id=str(row['id']),budget=row.get('budget',{}))
         elif kind=='model_response':
             current.update(response_id=str(row['id']),text=row['reply'] or '',text_truncated=bool(row['text_truncated']),usage=row['usage'],error_code=row['error_code'],message=row['message'] or '')
             current['tools']=[]
@@ -146,9 +151,13 @@ def detail(session_id,message_id):
     if not anchor:raise DomainError('本会话没有此消息',404)
     field,value=('task_id',anchor['task_id']) if anchor['task_id'] is not None else ('plan_id',anchor['plan_id'])
     if value is None:raise DomainError('消息没有可核对的任务或方案',422)
-    rows,more=load("m.conversation_id=%s AND m."+field+"=%s AND m.event_type IN ('model_request','model_response','data_response') AND JSON_UNQUOTE(JSON_EXTRACT(m.payload_json,'$.engine'))='native-tools-v1'",[session['id'],value],100)
+    rows,more=load("m.conversation_id=%s AND m."+field+"=%s AND m.event_type IN ('model_request','model_response','data_response') AND JSON_UNQUOTE(JSON_EXTRACT(m.payload_json,'$.engine'))='native-tools-v1'",[session['id'],value],250)
     items=rounds(rows)
-    return {'list':items,'model_rounds':sum(r['has_request'] for r in items),'tool_calls':sum(len(r['tools']) for r in items),'truncated':more,
+    measured=[r['budget'] for r in items if r.get('has_request') and r.get('budget',{}).get('next_request_bytes') is not None]
+    usage={'total_input_bytes':max((r['projected_total_bytes'] for r in measured),default=0),'max_request_bytes':max((r.get('max_request_bytes',r['next_request_bytes']) for r in measured),default=None),
+           'input_limit_bytes':measured[0]['limit_bytes'] if measured else None,
+           'tool_result_bytes':sum(t.get('result_bytes') or 0 for r in items for t in r['tools'])}
+    return {'list':items,'budget_usage':usage if measured else None,'model_rounds':sum(r['has_request'] for r in items),'tool_calls':sum(len(r['tools']) for r in items),'truncated':more,
             'note':'只展示模型公开回复和实际工具记录，不展示隐式思维链。查看不会调用AI；历史没有耗时记录时显示未知。'}
 
 

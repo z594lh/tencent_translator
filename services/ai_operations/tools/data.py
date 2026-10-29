@@ -108,7 +108,7 @@ def fetch(data, request, session=None, max_bytes=MAX_DATA_BYTES):
             result['returned']=len(result['rows']);result['byte_limited']=len(result['rows'])<len(original)
             result['has_more']=request['offset']+len(result['rows'])<result['total_in_archive']
             result['next_offset']=request['offset']+len(result['rows']) if result['rows'] and result['has_more'] else None
-            if result['byte_limited'] and not result['rows']:result.update(status='unavailable',reason='单条历史超过当前结果预算，请在页面查看原文')
+            if result['byte_limited'] and not result['rows']:result.update(status='budget_exceeded',reason='单条历史超过当前结果预算，正文未交付')
             return result
         if ref.startswith('task:') and ref[5:].isdigit():
             from .. import chat_tasks
@@ -126,7 +126,7 @@ def fetch(data, request, session=None, max_bytes=MAX_DATA_BYTES):
     offset, limit = request['offset'],request['limit']
     selected = deepcopy(rows[offset:offset+limit])
     selected=fit(selected,max(0,max_bytes-3000))
-    result = {'status':'provided' if selected else 'unavailable','source':source,'ref':ref,'window':window,
+    result = {'status':('partial' if offset+len(selected)<len(rows) else 'provided') if selected else ('budget_exceeded' if rows[offset:offset+limit] else 'empty'),'source':source,'ref':ref,'window':window,
         'report_end':content['time']['report_end'],'offset':offset,'total_in_archive':len(rows),
         'rows':selected,'returned':len(selected),
         'requested_limit':limit,'has_more':offset+len(selected)<len(rows),
@@ -134,7 +134,7 @@ def fetch(data, request, session=None, max_bytes=MAX_DATA_BYTES):
         'byte_limited':len(selected)<len(rows[offset:offset+limit]),
         'source_coverage':coverage(data,source),
         'note':'来自本次本地冻结资料；total_in_archive不是平台全部对象；检查source_coverage和has_more，缺项/缺日不补0'}
-    if not selected:result['reason']='对象/窗口没有可提供资料，或单个完整对象超过本次字节预算；不截断全文，不把缺失当0'
+    if not selected:result['reason']='完整记录超过本次返回预算，正文未交付' if result['status']=='budget_exceeded' else '该对象/窗口/分页没有匹配记录'
     result['data_hash'] = digest(result)
     return result
 

@@ -52,7 +52,8 @@ def read(ctx,name,args):
                 'execution_facts':management.get('execution_facts',[])[:10],
                 'note':'真实执行账本优先；未发送、拒绝、未知都不是成功。观察未满期不能当完整改后效果。'}
         if data.size(result)>budget:result.pop('execution_facts')
-        if rows and not selected:result['error']='单个完整观察超限，请用read_plan_history按execution引用查询；不能据此推定没有观察'
+        result['status']=('partial' if result['has_more'] else 'provided') if selected else ('budget_exceeded' if rows[query['offset']:query['offset']+query['limit']] else 'empty')
+        if result['status']=='budget_exceeded':result['reason']='单个完整观察超过本次返回预算，正文未交付'
         ctx.observe_checked=True
         ctx.capture(result)
         return result

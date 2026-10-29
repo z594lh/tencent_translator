@@ -7,6 +7,7 @@ from . import plan_store
 from .metrics import digest
 
 SCHEMA='native-prompts-v1'
+LIMIT_DEFAULTS={'total_input_bytes':1000000,'warn_percent':50,'urgent_percent':75}
 FIELDS=(
     ('system','通用身份与事实边界','system · 每次分析请求',
      '两种模式共用。告诉AI如何查询事实和输出自然回答；工具参数及业务限制另由代码校验。',
@@ -23,8 +24,8 @@ FIELDS=(
     ('plan_required','尚未提交方案时提醒','user · 方案模式直接回答但尚无校验计划',
      '只在生成方案/每日模式触发，占原有分析轮数；讨论模式不会发送。',
      '当前任务需要保存运营计划，请调用submit_optimization_plan；允许actions为空，然后给最终自然回答。'),
-    ('plan_accepted','计划校验通过后收尾','user · 计划工具校验通过后的下一轮',
-     'ERP此时撤去工具，只让AI总结已通过的方案；人工仍需确认，每日随后走原执行流程。',
+    ('plan_accepted','旧版收尾话术（已停用）','历史配置 · 新任务不再发送',
+     '保留历史配置内容供核对；新版直接使用已校验方案的中文summary，不再请求额外收尾。',
      '本任务计划已校验，尚未执行。请直接用自然语言总结该计划及观察安排，不再调用工具或另提不同计划。人工仍须明确确认，每日按ERP原托管流程执行。'),
     ('summary_system','历史问答压缩要求','system · 问答超过30组或60KB时单独调用',
      'DeepSeek只压缩旧摘要及较早自然问答；不发送本轮工具资料，保留近期原话。摘要调用单独计费。',
@@ -36,23 +37,43 @@ FIELDS=(
      '用户确认重试后登记为新的讨论问题；输入框已有问题时使用用户原话，不替换。',
      '请恢复此前的对话，继续讨论当前ASIN。'),
 )
+ORIGINAL_KEYS={row[0] for row in FIELDS}
+FIELDS+= (
+    ('plan_submission','方案提交与中文结论','system · 每日及生成方案模式','中文summary直接作为最终回复，不再额外调用模型收尾。',
+     '提交方案时，在summary中给出可直接展示给运营人员的中文分析结论、改动或不改动理由及观察安排。校验成功后ERP直接使用该结论形成回复，无需再发起一次总结。'),
+    ('budget_normal','任务额度说明','user · 每次模型请求前，与结构化预算一起发送','额度包含重复携带的上下文；不是新增资料额度。',
+     '预算数据由ERP计算。累计输入包含各轮重复发送的资料，不是仅统计新增查询。按需取数，区分未交付与确实无数据。'),
+    ('budget_warning','额度达到第一阈值','user · 预计本次发送后达到第一阈值','默认50%，不额外发起AI请求。',
+     '本任务已进入额度提醒阶段。优先查询影响结论的关键缺口，避免重复取得已有资料；保留提交方案和纠错所需空间。'),
+    ('budget_urgent','额度达到第二阈值','user · 预计本次发送后达到第二阈值','默认75%，仍可查询必要资料，不强制改动。',
+     '本任务剩余额度有限。尽快收敛已有事实，只补查必要缺口，然后提交结论；不能把未交付资料当已读，也不能为完成任务编造依据。'),
+    ('tool_delivery','资料未完整交付时的指导','tool · 查询因分页或预算未完整返回','结构化原因、返回量和续查参数由程序生成。',
+     '这是资料交付状态，不等于业务数据不存在。根据返回的查询参数分页或单独查询；未交付正文不能作为已读依据。'),
+    ('plan_repair','方案校验失败时的指导','tool · 提交方案未通过校验','错误位置和相关已读引用由程序计算，不自动修正方案。',
+     '根据错误路径修正方案，只使用本任务实际读取的精确引用。不要自行拼接、猜测或模糊替换编号；缺少依据时先查询。'),
+)
 
 
 def defaults():
     """返回独立默认配置，不引用或迁移旧多场景话术。"""
-    return {'schema':SCHEMA,'prompts':{key:value for key,_,_,_,value in FIELDS}}
+    return {'schema':SCHEMA,'prompts':{key:value for key,_,_,_,value in FIELDS},'limits':deepcopy(LIMIT_DEFAULTS)}
 
 
 def validate(config):
-    """只接受9个纯文本字段，不执行模板表达式、代码或自定义条件。"""
-    if not isinstance(config,dict) or set(config)!={'schema','prompts'} or config['schema']!=SCHEMA:
+    """校验纯文本与数值；旧版本仅补新增默认项，不改写原9项。"""
+    if not isinstance(config,dict) or set(config)-{'schema','prompts','limits'} or config.get('schema')!=SCHEMA:
         raise DomainError('不是当前精简提示词配置',422)
-    values=config['prompts']
-    if not isinstance(values,dict) or set(values)!={r[0] for r in FIELDS}:raise DomainError('提示词字段缺失或包含未知项',422)
+    values=config.get('prompts')
+    if not isinstance(values,dict) or not ORIGINAL_KEYS<=set(values) or set(values)-{r[0] for r in FIELDS}:raise DomainError('提示词字段缺失或包含未知项',422)
     for text in values.values():
         if not isinstance(text,str) or not text.strip() or len(text)>6000 or any(ord(c)<32 and c not in '\n\t' for c in text):
             raise DomainError('提示词不能为空、超过6000字符或含控制字符',422)
-    return deepcopy(config)
+    result=deepcopy(config)
+    result['prompts']={**defaults()['prompts'],**values}
+    limits=result.setdefault('limits',deepcopy(LIMIT_DEFAULTS))
+    if not isinstance(limits,dict) or set(limits)!=set(LIMIT_DEFAULTS) or any(type(v) is not int for v in limits.values()):raise DomainError('任务额度配置格式无效',422)
+    if not 100000<=limits['total_input_bytes']<=20000000 or not 1<=limits['warn_percent']<limits['urgent_percent']<=99:raise DomainError('累计输入须为100000～20000000字节，提醒阈值须递增且介于1～99%',422)
+    return result
 
 
 def version(row):
@@ -121,7 +142,7 @@ def history():
 def system(frozen,mode):
     """两模式共享通用提示；只叠加对应的最终输出要求，旧agent仍可自然回复。"""
     values=frozen['config']['prompts']
-    return values['system']+('\n\n'+values[mode] if mode in ('discussion','proposal') else '')
+    return values['system']+('\n\n'+values[mode] if mode in ('discussion','proposal') else '')+('\n\n'+values.get('plan_submission',defaults()['prompts']['plan_submission']) if mode=='proposal' else '')
 
 
 def preview(body):
@@ -138,6 +159,10 @@ def preview(body):
                   {'role':'user','content':json.dumps({'current_scope':{'identity':{'asin':'示例ASIN','shop_id':'示例店铺'},'time':{'report_end':'示例报表截止日'}},'past_question_answers':history},ensure_ascii=False)},
                   {'role':'user','content':values['daily_question'] if mode=='daily' else '用户实际输入的自然问题（示例，不会发送）'}]
         toolset=tools.snapshot(allow_plan=mode!='discussion')
+        from . import task_budget
+        messages,_,_=task_budget.request(messages,toolset['tools'],0,config)
     return {'messages':messages,'tools':toolset['tools'] if mode!='summary' else [],
-            'later_messages':[{'when':'尚未提交计划','role':'user','content':values['plan_required']},{'when':'计划校验通过后','role':'user','content':values['plan_accepted']}] if mode in ('proposal','daily') else [],
+            'later_messages':([{'when':'尚未提交计划','role':'user','content':values['plan_required']}] if mode in ('proposal','daily') else [])+[
+                {'when':key,'role':'tool' if key in ('plan_repair','tool_delivery') else 'user','content':values[key]}
+                for key in ('budget_normal','budget_warning','budget_urgent','plan_repair','tool_delivery')] if mode!='summary' else [],
             'note':'这是用当前编辑文本和示例历史组装的免费预览，未发布也不会请求模型。实际历史和查询返回以任务原始请求为准；工具的结果及动态错误不是可编辑固定话术。'}

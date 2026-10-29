@@ -138,7 +138,7 @@
       "case_sensitive": false,
       "labels": {
         "provided": "已提供", "unavailable": "不可用 / 未提供", "disabled": "工具已关闭",
-        "too_large": "超出返回预算", "error": "查询失败", "failed": "失败",
+        "too_large": "超出返回预算", "budget_exceeded": "预算不足，正文未交付", "empty": "没有匹配记录", "error": "查询失败", "failed": "失败",
         "complete": "完整覆盖", "partial": "部分覆盖", "unknown": "未知 / 待核实",
         "not_sent": "未发送", "pending": "待处理", "submitted": "已提交，待回读",
         "confirmed": "平台回读已确认", "rejected": "平台拒绝", "observing": "仍在观察期",

@@ -24,10 +24,43 @@ def repair_hint(ctx,args):
     management=ctx.data['content'].get('management_context',{})
     known={str(r['execution_id']):r for field in ('observations','pending_executions') for r in management.get(field,[])}
     scoped=review_scope(ctx,args)
-    return {'required_execution_ids':sorted({str(r['execution_id']) for field in ('observations','pending_executions') for r in scoped.get(field,[])}),
+    issues=[];related=set()
+    for field in ('actions','history_reviews'):
+        for index,row in enumerate(args.get(field,[]) if isinstance(args.get(field),list) else []):
+            if not isinstance(row,dict):continue
+            candidates=set()
+            if field=='history_reviews':
+                ref='history:execution:'+str(row.get('execution_id',''))
+                if ref in ctx.evidence:candidates.add(ref)
+                record=known.get(str(row.get('execution_id')),{});candidates.update(record.get('evidence_refs',[]))
+                candidates.update(ctx.data.get('catalog',{}).get(record.get('ref'),{}).get('evidence_refs',[]))
+                object_ref=record.get('ref','')
+                prefix='spTargeting:' if object_ref.startswith(('target:','keyword:')) else 'spCampaignsPlacement:' if 'PLACEMENT_' in object_ref else None
+                subject=ctx.data.get('catalog',{}).get(object_ref,{}).get('subject',{})
+                if prefix:
+                    for ref in ctx.evidence:
+                        if not ref.startswith(prefix):continue
+                        dimensions=ctx.data['evidence'].get(ref,{}).get('data',{}).get('dimensions',{})
+                        if subject.get('entity_id') and str(dimensions.get('keyword_id'))!=str(subject['entity_id']):continue
+                        candidates.add(ref)
+            else:
+                action_ref=row.get('ref')
+                if isinstance(action_ref,str):candidates.update(ctx.data.get('catalog',{}).get(action_ref,{}).get('evidence_refs',[]))
+            candidates&=ctx.evidence;related.update(candidates)
+            if field=='actions':
+                from .specs import OBSERVATION
+                observation=row.get('observation')
+                if isinstance(observation,dict):
+                    expected=set(OBSERVATION['required']);actual=set(observation)
+                    if expected!=actual:issues.append({'path':f'actions[{index}].observation','missing_fields':sorted(expected-actual),'unknown_fields':sorted(actual-expected)})
+            refs=row.get('evidence_refs')
+            if isinstance(refs,list):
+                for j,ref in enumerate(refs):
+                    if not isinstance(ref,str) or ref not in ctx.evidence:
+                        issues.append({'path':f'{field}[{index}].evidence_refs[{j}]','invalid_ref':ref,'related_read_refs':sorted(candidates)})
+    return {'invalid_evidence':issues,'required_execution_ids':sorted({str(r['execution_id']) for field in ('observations','pending_executions') for r in scoped.get(field,[])}),
             'read_history_items':[{'execution_id':eid,'evidence_ref':'history:execution:'+eid} for eid in sorted(ctx.observations) if eid in known],
-            'available_evidence_refs':sorted(ctx.evidence)[:100],
-            'note':'execution_id只填原编号，例如1，不填history:execution:1。evidence_refs仅使用工具返回的真实引用，不自行拼接字段后缀；可用对应history:execution:编号支持复盘。未读对象须先查询，未知或重复历史仍会拒绝。'}
+            'related_read_evidence_refs':sorted(related)}
 
 
 def submit(ctx,args):
@@ -48,4 +81,4 @@ def submit(ctx,args):
     all_refs.update(ref for review in validated['history_reviews'] for ref in review['evidence_refs'])
     if all_refs-ctx.evidence:raise DomainError('方案包含未通过本次工具实际读取的证据，请先查询对应资料',422)
     ctx.plan=validated;ctx.plan_input_hash=digest(args)
-    return {'status':'validated','action_count':len(validated['actions']),'message':'计划已校验，等待本任务最终回答后归档；人工需明确确认，每日按托管流程执行。此刻尚未修改Amazon。'}
+    return {'status':'validated','action_count':len(validated['actions']),'message':'计划已校验并形成分析成果；人工需明确确认，每日按托管流程执行。此刻尚未修改Amazon。'}

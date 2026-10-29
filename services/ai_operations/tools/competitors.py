@@ -99,7 +99,9 @@ def read(ctx,args):
         'total_in_archive':len(rows),'returned':len(fitted),'offset':args['offset'],'requested_limit':args['limit'],
         'has_more':end<len(rows),'next_offset':end if fitted and end<len(rows) else None,
         'byte_limited':len(fitted)<len(selected),'note':frozen['note']}
-    if selected and not fitted:result.update(status='unavailable',reason='单条完整竞品报告超过结果预算，请减少其他资料或在页面查看原文')
+    if fitted and result['has_more']:result['status']='partial'
+    if selected and not fitted:result.update(status='budget_exceeded',reason='完整竞品报告超过本次剩余返回预算，正文未交付')
+    if not rows and not args['ref']:result.update(status='empty',reason='当前冻结资料没有绑定竞品')
     if args['ref'] and not rows:result.update(status='unavailable',reason='该引用不在本任务冻结的绑定竞品集合中')
     result['data_hash']=digest(result);ctx.capture(result)
     return result

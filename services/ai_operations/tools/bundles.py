@@ -62,7 +62,7 @@ def query(ctx,snapshot,request,remaining,summary=False):
         entry={'tool':name,'query':args,'result':result,'elapsed_ms':round((time.monotonic()-started)*1000)}
         if data.size(entry)>remaining:
             restore(ctx,state)
-            entry['result']={'status':'too_large','message':'本项完整结果超过剩余批量预算，未返回正文，请减少limit或单独查询'}
+            entry['result']={'status':'budget_exceeded','message':'本项超过剩余批量预算，正文未交付','returned':0}
         return entry
     except DomainError as error:
         restore(ctx,state);return {'tool':name,'query':args,'result':{'status':'error','message':str(error)}}
