@@ -348,7 +348,8 @@ def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, d
     返回 (headway_cny, headway_usd, detail_dict)
 
     计算逻辑：
-      1. 找到包含该 SKU 的最新有效货件（排除 CANCELLED）。
+      1. 找到包含该 SKU 的最新有效货件（排除 CANCELLED，跳过 shipment_id 为空的箱子记录）。
+         "最新"按该货件绑定运单的创建时间(created_at)倒序，时间相同按 shipment_id 升序兜底。
       2. 读取该货件绑定的运单总费用(CNY)。
       3. 读取该货件绑定的运单计费总重量(KG)（货代为准，可能为实重或泡重；
          运单无重量时回退为按该货件下所有箱子重量求和）。
@@ -357,14 +358,20 @@ def get_headway_allocation(cursor, seller_sku: str) -> Tuple[Decimal, Decimal, d
       6. headway_usd = headway_cny * 汇率（汇率由调用方提供，避免在此再次查表）
     """
     like_pattern = f'%"msku": "{seller_sku}"%'
+    # shipment_id 为空的箱子是计划/包裹级的历史脏数据，无法对应货件与运单，必须过滤；
+    # 排序用运单创建时间，避免同一计划内 s.sync_time 完全相同导致结果随机
     cursor.execute(
         """
-        SELECT DISTINCT b.shipment_id, s.sync_time
+        SELECT DISTINCT b.shipment_id, w.created_at AS waybill_created_at
         FROM amazon_inbound_plan_boxes b
         INNER JOIN amazon_inbound_shipments s
             ON b.inbound_plan_id = s.inbound_plan_id AND s.shop_id = b.shop_id
-        WHERE b.items_json LIKE %s AND s.status != 'CANCELLED'
-        ORDER BY s.sync_time DESC
+        LEFT JOIN logistics_waybills w
+            ON w.shipment_id = b.shipment_id
+        WHERE b.items_json LIKE %s
+          AND s.status != 'CANCELLED'
+          AND b.shipment_id IS NOT NULL AND b.shipment_id <> ''
+        ORDER BY w.created_at IS NULL, w.created_at DESC, b.shipment_id ASC
         LIMIT 1
         """,
         (like_pattern,),
