@@ -36,7 +36,7 @@ ALI_ENDPOINT = os.getenv("ALI_ENDPOINT", "")
 ALI_BUCKET_NAME = os.getenv("ALI_BUCKET_NAME", "")
 
 
-def _get_bucket():
+def _get_bucket(*, secure=False, connect_timeout=None):
     """获取 OSS Bucket 实例（延迟初始化）"""
     if not all([ALI_ACCESS_KEY_ID, ALI_ACCESS_KEY_SECRET, ALI_ENDPOINT, ALI_BUCKET_NAME]):
         missing = []
@@ -51,7 +51,8 @@ def _get_bucket():
         raise ValueError(f"缺少阿里云 OSS 环境变量: {', '.join(missing)}")
 
     auth = oss2.Auth(ALI_ACCESS_KEY_ID, ALI_ACCESS_KEY_SECRET)
-    bucket = oss2.Bucket(auth, ALI_ENDPOINT, ALI_BUCKET_NAME)
+    endpoint = 'https://' + ALI_ENDPOINT.split('://')[-1] if secure else ALI_ENDPOINT
+    bucket = oss2.Bucket(auth, endpoint, ALI_BUCKET_NAME, connect_timeout=connect_timeout)
     return bucket
 
 
@@ -164,17 +165,8 @@ def listing_image_prefix(shop_id, marketplace_id, sku, position):
     return f'amazon/listing/images/managed/{int(shop_id)}/{marketplace_id}/{sku_folder}/{position}/'
 
 
-def upload_image_for_listing(file_obj, filename: str = None, *, shop_id=None, marketplace_id=None, sku=None, position=None) -> dict:
-    """
-    专用于亚马逊 Listing 图片上传的快捷方法
-    自动添加 amazon/listing/images/ 前缀
-    """
-    if filename is None and hasattr(file_obj, "filename"):
-        filename = file_obj.filename
-    if not filename:
-        filename = "image.jpg"
-    prefix = listing_image_prefix(shop_id, marketplace_id, sku, position)
-    data = file_obj.read(10 * 1024 * 1024 + 1)
+def prepare_listing_image(data):
+    """共用真实字节校验与预览生成；直传完成时也执行同一套检查。"""
     if not data or len(data) > 10 * 1024 * 1024:
         raise ValueError('图片须大于0且不超过10MB')
     try:
@@ -196,17 +188,8 @@ def upload_image_for_listing(file_obj, filename: str = None, *, shop_id=None, ma
             preview.save(buffer, 'JPEG', quality=72, optimize=True)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
         raise ValueError('无法读取图片，文件损坏或不是有效图片') from None
-    version = datetime.now().strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:12]
-    directory = prefix + version + '/'
-    key, preview_key = directory + 'original' + extension, directory + 'preview.jpg'
-    bucket = _get_bucket()
-    headers = {'Content-Type': mime, 'Cache-Control': 'public, max-age=31536000, immutable', 'x-oss-forbid-overwrite': 'true'}
-    # 两对象任一失败不重试、不删除原图，保留可排查证据。
-    bucket.put_object(key, data, headers=headers)
-    bucket.put_object(preview_key, buffer.getvalue(), headers={**headers, 'Content-Type': 'image/jpeg'})
-    return {'success': True, 'url': _build_url(key), 'oss_key': key, 'filename': filename,
-            'preview_url': _build_url(preview_key), 'position': position, 'sha256': hashlib.sha256(data).hexdigest(),
-            'width': width, 'height': height, 'size': len(data), 'preview_size': len(buffer.getvalue()), 'signature': signature}
+    return {'extension': extension, 'mime': mime, 'width': width, 'height': height,
+            'signature': signature, 'preview': buffer.getvalue(), 'sha256': hashlib.sha256(data).hexdigest()}
 
 
 def delete_object(oss_key: str) -> dict:

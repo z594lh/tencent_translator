@@ -14,7 +14,6 @@ import threading
 from flask import Blueprint, request, jsonify
 from blueprints.user_auth import login_required, permission_required
 from services.shop_service import get_sp_api_client
-from services.oss_uploader import upload_image_for_listing
 from services.mysql_service import get_db_connection
 from services.cron_tasks.execution import resource_guard
 from services import listing_product_sync
@@ -22,6 +21,7 @@ from services import listing_competitors
 from services import listing_pricing_service as pricing
 from services import listing_text_service as text_editor
 from services import listing_image_service as image_editor
+from services.listing_images import uploads as image_uploads
 from services import listing_history_service as listing_history
 from blueprints.asin_bsr import attach_bsr_info, get_bsr_trend
 
@@ -912,52 +912,39 @@ def switch_listing_language(sku):
     return jsonify({"status": "error", "message": "请使用新版文字语言编辑，逐项核对后提交；旧整份覆盖入口已停止"}), 409
 
 
+@amazon_listing_bp.route('/amazon/listings/upload-image/<action>', methods=['POST'])
+@login_required
+@permission_required('amazon_listings:upload_image')
+def direct_listing_image_upload(action):
+    """只处理直传授权和确认；大原图不通过Web请求体中转。"""
+    if action not in ('prepare', 'complete'):
+        return jsonify({'status': 'error', 'message': '上传操作不存在'}), 404
+    if request.content_length is not None and request.content_length > 16384:
+        return jsonify({'status': 'error', 'message': '直传接口只接收图片参数，不接收图片文件'}), 413
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError('上传参数须为对象')
+        if action == 'prepare':
+            result = image_uploads.prepare(data.get('shop_id'), data.get('sku', ''), data)
+        else:
+            result = image_uploads.complete(data.get('shop_id'), data.get('sku', ''), data.get('ticket'))
+        return jsonify({'status': 'success', 'data': result})
+    except pricing.PricingError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), exc.code
+    except ValueError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 400
+    except Exception as exc:
+        print(f'[Listing Image Direct] action={action} error_type={type(exc).__name__}', flush=True)
+        return jsonify({'status': 'error', 'message': '图片存储或校验暂未完成，请重试；已有原图会自动核对复用'}), 502
+
+
 @amazon_listing_bp.route('/amazon/listings/upload-image', methods=['POST'])
 @login_required
 @permission_required('amazon_listings:upload_image')
 def upload_listing_image():
-    """
-    上传 Listing 图片到阿里云 OSS，返回可用于亚马逊 SP-API 的 HTTPS URL
-    请求方式: multipart/form-data
-    字段: image、shop_id、sku、position；不自动提交Amazon。
-    """
-    try:
-        if 'image' not in request.files:
-            return jsonify({"status": "error", "message": "缺少文件字段: image"}), 400
-
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({"status": "error", "message": "未选择文件"}), 400
-
-        shop_id = request.form.get('shop_id')
-        sku = request.form.get('sku', '')
-        position = request.form.get('position', '')
-        client, context = pricing.account(shop_id, sku)
-        result = upload_image_for_listing(file, filename=file.filename, shop_id=context['shop_id'],
-                                          marketplace_id=context['marketplace_id'], sku=sku, position=position)
-        result['asset_token'] = image_editor.upload_proof(client, context, result)
-
-        if not result.get('success'):
-            return jsonify({
-                "status": "error",
-                "message": result.get('error', '上传失败')
-            }), 500
-
-        return jsonify({
-            "status": "success",
-            "message": "图片上传成功",
-            "data": {
-                **result
-            }
-        })
-
-    except pricing.PricingError as e:
-        return jsonify({'status': 'error', 'message': str(e)}), e.code
-    except ValueError as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 400
-    except Exception as e:
-        print(f"[Amazon Listing] 图片上传异常类型: {type(e).__name__}")
-        return jsonify({"status": "error", "message": "图片上传未完成，请核对上传记录，勿反复重传"}), 502
+    # 旧缓存前端明确要求刷新，不再走跨境中转并反复生成随机版本。
+    return jsonify({'status': 'error', 'message': '图片上传已升级，请刷新页面后重新选择图片，使用新版直传'}), 410
 
 
 @amazon_listing_bp.route('/amazon/listings/delete-image', methods=['DELETE'])
