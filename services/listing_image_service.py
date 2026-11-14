@@ -92,7 +92,9 @@ def build_patches(client, ctx, snapshot, data):
                 raise pricing.PricingError('不能清空主图，请用替换或设为主图')
             if not old['rows']:
                 continue
-            patch = {'op': 'delete', 'path': '/attributes/' + ATTRIBUTES[position], 'value': old['rows']}
+            # 图片属性按站点选择器清除；处理后的展示URL不一定等于卖家提交源URL。
+            patch = {'op': 'delete', 'path': '/attributes/' + ATTRIBUTES[position],
+                     'value': [{'marketplace_id': ctx['marketplace_id']}]}
             url = None
         else:
             url = action.get('url')
