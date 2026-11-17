@@ -1,13 +1,13 @@
 """纯问答持久化和增量摘要；工具返回、附件、规则及旧memory不进入续聊记忆。"""
 import json
+from datetime import timedelta, timezone
 from . import plan_store,plan_provider,prompt_settings
 from .metrics import digest,dumps
 from services.listing_performance.common import DomainError
 
 MAX_HISTORY_BYTES=60000
-KEEP_TURNS=10
+KEEP_TURNS=5
 MAX_SOURCE_BYTES=90000
-MAX_SUMMARY_BYTES=16000
 MAX_SUMMARY_CALLS=3
 
 
@@ -32,9 +32,12 @@ def latest(cur,sid):
     return row
 
 
-def turns(cur,sid,after=0,limit=201):
+def turns(cur,sid,after=0,limit=201,newest=False):
     """只读自然问答并逐对校验，不读取审计messages。"""
-    cur.execute('SELECT * FROM ai_operation_chat_turns WHERE conversation_id=%s AND id>%s ORDER BY id LIMIT %s',(sid,after,limit));rows=list(cur.fetchall())
+    order = 'DESC' if newest else 'ASC'
+    cur.execute(f'SELECT * FROM ai_operation_chat_turns WHERE conversation_id=%s AND id>%s ORDER BY id {order} LIMIT %s',(sid,after,limit))
+    rows=list(cur.fetchall())
+    if newest:rows.reverse()
     for row in rows:
         if digest([row['question'],row['answer']])!=row['content_hash']:raise DomainError('问答原文校验失败，未继续调用AI',503)
     return rows
@@ -43,6 +46,34 @@ def turns(cur,sid,after=0,limit=201):
 def dialogue(rows):
     """恢复准确user/assistant消息，不夹带计划JSON或数据库附件。"""
     return [message for row in rows for message in ({'role':'user','content':row['question']},{'role':'assistant','content':row['answer']})]
+
+
+def memory_info(previous, rows, messages, usage):
+    return {'summary_id':str(previous['id']) if previous else None,
+            'covered_turn_id':str(previous['covered_turn_id']) if previous else None,
+            'recent_turns':len(rows),'summary_calls':usage,'history_bytes':len(dumps(messages).encode('utf8'))}
+
+
+def limited_context(session,previous,prefix,usage,reason,permitted):
+    """原文仍在库中，按最新连续整组问答填入预算。"""
+    permitted()
+    after = previous['covered_turn_id'] if previous else 0
+    with plan_store.transaction() as cur:
+        cur.execute('SELECT COUNT(*) n FROM ai_operation_chat_turns WHERE conversation_id=%s AND id>%s',(session['id'],after))
+        total = cur.fetchone()['n']
+        recent = turns(cur,session['id'],after,30,newest=True)
+    summary_omitted = bool(prefix and len(dumps(prefix).encode('utf8'))>MAX_HISTORY_BYTES)
+    if summary_omitted:
+        prefix = []
+    kept = []
+    for row in reversed(recent):
+        candidate = [row,*kept]
+        if len(dumps([*prefix,*dialogue(candidate)]).encode('utf8'))>MAX_HISTORY_BYTES:
+            break
+        kept = candidate
+    messages = [*prefix,*dialogue(kept)]
+    return messages,{**memory_info(previous,kept,messages,usage),'limited':True,
+                     'omitted_turns':total-len(kept),'summary_omitted':summary_omitted,'reason':reason}
 
 
 def context(session,invoke,permitted,prompt_snapshot=None):
@@ -54,45 +85,68 @@ def context(session,invoke,permitted,prompt_snapshot=None):
         prefix=[{'role':'user','content':frozen['config']['prompts']['summary_prefix']+'\n'+previous['summary_text']}] if previous else []
         messages=[*prefix,*dialogue(rows)]
         if len(rows)<201 and len(rows)<=30 and len(dumps(messages).encode('utf8'))<=MAX_HISTORY_BYTES:
-            return messages,{'summary_id':str(previous['id']) if previous else None,'covered_turn_id':str(previous['covered_turn_id']) if previous else None,
-                'recent_turns':len(rows),'summary_calls':usage,'history_bytes':len(dumps(messages).encode('utf8'))}
-        if len(usage)>=MAX_SUMMARY_CALLS:raise plan_provider.Failure('context_limit','本次问答压缩已达3批，成功摘要保留；请明确继续或新建会话',{'summary_calls':usage})
-        keep=KEEP_TURNS if len(rows)>KEEP_TURNS else 2
-        if len(rows)<=keep:raise plan_provider.Failure('context_limit','最近完整问答本身过长，未静默删除；请查看原文后新建会话',{'summary_calls':usage})
+            return messages,memory_info(previous,rows,messages,usage)
+        if len(usage)>=MAX_SUMMARY_CALLS or len(rows)<=KEEP_TURNS:
+            return limited_context(session,previous,prefix,usage,'context_limit',permitted)
         batch=[]
-        for row in rows[:-keep]:
+        for row in rows[:-KEEP_TURNS]:
             if len(dumps([*prefix,*dialogue([*batch,row])]).encode('utf8'))>MAX_SOURCE_BYTES:break
             batch.append(row)
-        if not batch:raise plan_provider.Failure('context_limit','单个原问答超过摘要输入限制，未截断原文；请新建会话',{'summary_calls':usage})
+        if not batch:
+            return limited_context(session,previous,prefix,usage,'context_limit',permitted)
         try:usage.append(summarize(session,previous,batch,invoke,permitted,frozen))
         except plan_provider.Failure as error:
             info=error.usage or {}
-            raise plan_provider.Failure(error.code,str(error),{**info,'summary_calls':[*usage,*info.get('summary_calls',[])]}) from None
+            return limited_context(session,previous,prefix,[*usage,*info.get('summary_calls',[])],error.code,permitted)
     raise DomainError('会话压缩未完成',422)
 
 
+def retry_batch(session,attempt,rows):
+    """仅在北京时间跨日后补试已明确截断的范围。"""
+    scheduled = session.get('summary_retry_at')
+    if not scheduled or attempt['status']!='failed':
+        return []
+    beijing = timezone(timedelta(hours=8))
+    failed_at = attempt.get('completed_at') or attempt['created_at']
+    if scheduled.replace(tzinfo=timezone.utc).astimezone(beijing).date() <= failed_at.replace(tzinfo=timezone.utc).astimezone(beijing).date():
+        return []
+    usage = json.loads(attempt['usage_json'] or 'null')
+    if not isinstance(usage,dict) or usage.get('finish_reason')!='length':
+        return []
+    same_range = [row for row in rows if row['id']<=attempt['covered_turn_id']]
+    return same_range[:max(1,len(same_range)//2)]
+
+
 def summarize(session,previous,rows,invoke,permitted,prompt_snapshot=None):
-    """先登记唯一摘要意图再收费；游标CAS，失败保留旧摘要，显式重试才允许再次请求。"""
-    source={'previous_summary':previous['summary_text'] if previous else None,'dialogue':dialogue(rows)}
-    hashed=digest(source);base=digest([session['id'],previous['id'] if previous else None,rows[-1]['id'],hashed])
+    """登记后才发出摘要请求。同一覆盖位置最多一次自动补试。"""
     frozen=prompt_snapshot or prompt_settings.snapshot()
-    messages=[{'role':'system','content':frozen['config']['prompts']['summary_system']},
-              {'role':'user','content':dumps(source)}]
+    previous_id = previous['id'] if previous else None
     permitted()
     with plan_store.transaction(True) as cur:
         from . import chat_tasks
         if session.get('task_id'):chat_tasks.fence(cur,session['task_id'],session.get('owner_token'))
-        cur.execute('SELECT id,status FROM ai_operation_chat_summaries WHERE request_key=%s',(base,));old=cur.fetchone();key=base
+        cur.execute("SELECT id FROM ai_operation_conversations WHERE id=%s AND state='active' FOR UPDATE",(session['id'],))
+        if not cur.fetchone():raise DomainError('会话已归档，未开始压缩',409)
+        current=latest(cur,session['id'])
+        if (current['id'] if current else None)!=previous_id:raise DomainError('摘要覆盖已变化，请重新读取会话',409)
+        cur.execute("""SELECT id,status,usage_json,created_at,completed_at,covered_turn_id FROM ai_operation_chat_summaries
+                       WHERE conversation_id=%s AND previous_id <=> %s ORDER BY id DESC LIMIT 1""",(session['id'],previous_id))
+        old=cur.fetchone()
+        key=None
         if old:
-            if old['status']=='ready':raise DomainError('摘要覆盖已变化，请重新读取会话',409)
-            retry=session.get('retry_summary_id');allowed=False
-            if retry:
-                cur.execute('SELECT status,source_hash,previous_id FROM ai_operation_chat_summaries WHERE id=%s AND conversation_id=%s',(retry,session['id']));attempt=cur.fetchone()
-                allowed=bool(attempt and attempt['status']!='ready' and attempt['source_hash']==hashed and attempt['previous_id']==(previous['id'] if previous else None))
-            if not allowed:raise plan_provider.Failure('summary_blocked','摘要请求 #'+str(old['id'])+' 已登记未成功，可能已计费；请在会话记忆中明确重试或新建会话')
-            key=digest([base,'explicit-retry',session.get('task_id')])
+            if str(session.get('retry_summary_id'))==str(old['id']) and session.get('task_id'):
+                key=digest([session['id'],previous_id,'explicit-summary-retry',session['task_id']])
+            else:
+                rows=retry_batch(session,old,rows)
+                if not rows:raise plan_provider.Failure('summary_blocked','历史摘要暂未更新')
+                key=digest([session['id'],previous_id,'next-day-summary-retry'])
             cur.execute('SELECT id FROM ai_operation_chat_summaries WHERE request_key=%s',(key,))
-            if cur.fetchone():raise plan_provider.Failure('summary_blocked','本次显式摘要重试已登记，不重复收费')
+            if cur.fetchone():raise plan_provider.Failure('summary_blocked','摘要补试已登记')
+        source={'previous_summary':previous['summary_text'] if previous else None,'dialogue':dialogue(rows)}
+        hashed=digest(source)
+        key=key or digest([session['id'],previous_id,rows[-1]['id'],hashed])
+        messages=[{'role':'system','content':frozen['config']['prompts']['summary_system']},
+                  {'role':'user','content':dumps(source)}]
         cur.execute('''INSERT INTO ai_operation_chat_summaries(conversation_id,task_id,request_key,previous_id,covered_turn_id,source_hash,status,input_json,created_at)
             VALUES(%s,%s,%s,%s,%s,%s,'registered',%s,UTC_TIMESTAMP(3))''',
             (session['id'],session.get('task_id'),key,previous['id'] if previous else None,rows[-1]['id'],hashed,dumps(messages)))
@@ -101,7 +155,7 @@ def summarize(session,previous,rows,invoke,permitted,prompt_snapshot=None):
     try:
         reply,usage=invoke(None,{'messages':messages,'summary':True});permitted()
         value=reply.get('content') if isinstance(reply,dict) else None
-        if not isinstance(value,str) or not value.strip() or len(value.encode('utf8'))>MAX_SUMMARY_BYTES or reply.get('tool_calls'):raise plan_provider.Failure('invalid_output','摘要文本无效或超限，旧摘要和原文保留',usage)
+        if not isinstance(value,str) or not value.strip() or reply.get('tool_calls'):raise plan_provider.Failure('invalid_output','摘要文本无效，旧摘要和原文保留',usage)
         with plan_store.transaction(True) as cur:
             if session.get('task_id'):chat_tasks.fence(cur,session['task_id'],session.get('owner_token'))
             cur.execute("SELECT id FROM ai_operation_conversations WHERE id=%s AND state='active' FOR UPDATE",(session['id'],))
@@ -118,7 +172,9 @@ def summarize(session,previous,rows,invoke,permitted,prompt_snapshot=None):
         message=str(error) if isinstance(error,(DomainError,plan_provider.Failure)) else '摘要回执未知，保留旧摘要及原文，不自动重复收费'
         with plan_store.transaction(True) as cur:
             cur.execute("UPDATE ai_operation_chat_summaries SET status=%s,usage_json=%s,message=%s,completed_at=UTC_TIMESTAMP(3) WHERE id=%s AND status='registered'",('unknown' if code=='unknown' else 'failed',dumps(usage),message[:500],sid))
-        raise plan_provider.Failure('summary_failed',message,{'summary_id':str(sid),'summary_calls':[usage] if usage else [],'billable':True}) from None
+        billable = (usage or {}).get('billable',True)
+        receipt = {'summary_id':str(sid),'billable':billable,**(usage or {})}
+        raise plan_provider.Failure('summary_failed',message,{'summary_id':str(sid),'summary_calls':[receipt],'billable':billable}) from None
 
 
 def describe(sid):

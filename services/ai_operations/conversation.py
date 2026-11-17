@@ -45,6 +45,8 @@ def prepare(data,queue_task=None):
     """每日同样从一句自然任务开始，不再使用多场景话术或全量资料首包。"""
     session=store.open_session(data['content']['identity']);session['purpose']='daily'
     if queue_task:session.update(task_id=queue_task['id'],owner_token=queue_task['owner_token'])
+    if queue_task and queue_task.get('trigger_source')=='scheduled':
+        session['summary_retry_at']=queue_task.get('scheduled_at')
     frozen=prompt_settings.snapshot()
     prepared=prepare_human(data,session,frozen['config']['prompts']['daily_question'],'proposal',frozen)
     if 'read_observations' not in prepared['tools_snapshot']['names']:
@@ -97,8 +99,11 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
         total['billable']=prior.get('billable',False)
         raise plan_provider.Failure(error.code,str(error),total) from None
     # 跨任务仅自然问答作为引用资料；不伪造旧assistant工具消息/思考字段，避免供应商协议不完整。
+    context_input={'current_scope':prepared['scope'],'past_question_answers':history}
+    if memory.get('limited'):
+        context_input['history_coverage']={key:memory[key] for key in ('limited','omitted_turns','summary_omitted')}
     messages=[{'role':'system','content':prepared['system']},
-              {'role':'user','content':dumps({'current_scope':prepared['scope'],'past_question_answers':history})},
+              {'role':'user','content':dumps(context_input)},
               {'role':'user','content':prepared['question']}]
     def permitted():
         """中途停止仍带回已发生用量，不因权限/租约变化丢失之前的计费回执。"""

@@ -19,9 +19,12 @@ class Failure(Exception):
 
 def request_spec(summary=False):
     """描述真实参数；不再启用整段JSON回答或自定义final_plan协议。"""
-    return {'provider':PROVIDER,'model':contract.MODEL,'timeout_seconds':TIMEOUT,'max_retries':0,
-            'thinking':{'type':'disabled' if summary else 'enabled'},'max_tokens':4000 if summary else contract.MAX_OUTPUT_TOKENS,
+    spec = {'provider':PROVIDER,'model':contract.MODEL,'timeout_seconds':TIMEOUT,'max_retries':0,
+            'thinking':{'type':'disabled' if summary else 'enabled'},
             'stream':False,'response_format':'text','protocol':VERSION}
+    if not summary:
+        spec['max_tokens'] = contract.MAX_OUTPUT_TOKENS
+    return spec
 
 
 def create_client():
@@ -52,9 +55,11 @@ def generate(client,prepared):
     summary=bool(prepared.get('summary'));usage={'provider':PROVIDER,'billable':True,'requested_model':contract.MODEL}
     started=time.monotonic()
     try:
-        params={'model':contract.MODEL,'messages':prepared['messages'],'stream':False,
-                'max_tokens':4000 if summary else contract.MAX_OUTPUT_TOKENS,
-                'extra_body':{'thinking':{'type':'disabled' if summary else 'enabled'}}}
+        spec = request_spec(summary)
+        params={'model':spec['model'],'messages':prepared['messages'],'stream':spec['stream'],
+                'extra_body':{'thinking':spec['thinking']}}
+        if 'max_tokens' in spec:
+            params['max_tokens'] = spec['max_tokens']
         if prepared.get('tools'):params.update(tools=prepared['tools'],tool_choice='auto')
         if not summary:params['extra_body']['reasoning_effort']='high'
         reply=client.chat.completions.create(**params)
@@ -66,7 +71,7 @@ def generate(client,prepared):
         choice=reply.choices[0];message=choice.message;content=message.content;calls=getattr(message,'tool_calls',None) or []
         usage['finish_reason']=choice.finish_reason
         if isinstance(content,str) and len(content.encode('utf8'))<=160000:usage['raw_output']=content
-        if choice.finish_reason not in ('stop','tool_calls') or len(calls)>8 or (content is not None and (not isinstance(content,str) or len(content.encode('utf8'))>160000)):
+        if choice.finish_reason not in ('stop','tool_calls') or len(calls)>8 or (content is not None and (not isinstance(content,str) or (not summary and len(content.encode('utf8'))>160000))):
             raise Failure('incomplete_output','模型输出被截断、超限或未正常结束；保留原回执，不自动重发',usage)
         wire={'role':'assistant','content':content or ''}
         if calls:

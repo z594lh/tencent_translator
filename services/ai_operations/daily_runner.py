@@ -118,7 +118,7 @@ def run_one(managed_id,actor=None,source='manual',now=None,authorize=None,task=N
             plan=plans.generate({'shop_id':managed['shop_id'],'asin':managed['asin'],'report_date':str(run['report_date']),
                                  'request_token':digest(['managed-day',run['id'],interfaces.MODE])[:32],'confirm_ai':True},
                 actor,active,management={'managed_id':managed['id'],'run_id':run['id'],'run_date':today,'now':now.astimezone(timezone.utc)},
-                on_registered=registered,queue_task=task)
+                on_registered=registered,queue_task={**task,'trigger_source':source} if task else None)
             store.update(run['id'],'executing','已保存AI结论，正在正式执行并独立回读',plan_id=plan['id'])
             if plan['status']!='ready':raise DomainError(plan.get('message') or '未形成有效方案',409)
             actions=plan['result']['actions'];unsupported=[]
