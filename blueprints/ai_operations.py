@@ -308,9 +308,9 @@ def workspace_resolve():
     target=products.resolve(request.args.get('shop_id'),request.args.get('asin')) if request.args.get('asin') else products.resolve_sku(request.args.get('shop_id'),request.args.get('seller_sku'))
     access.product(request.current_user['id'],target)
     text=''
-    if request.args.get('entry')=='performance':
-        text=prompt_settings.snapshot()['config']['prompts']['performance_question']
-        values={'asin':target['asin'],'sku':target['sku'],'report_date':str(request.args.get('report_date',''))[:10],'days':str(request.args.get('days',''))[:3]}
+    if request.args.get('entry') in ('performance','storage'):
+        text=prompt_settings.snapshot()['config']['prompts']['storage_question' if request.args.get('entry')=='storage' else 'performance_question']
+        values={'asin':target['asin'],'sku':target['sku'],'report_date':str(request.args.get('report_date',''))[:10],'days':str(request.args.get('days',''))[:3], 'month':str(request.args.get('month',''))[:7]}
         for key,value in values.items():text=text.replace('{{ '+key+' }}',value)
     return {**products.public(target),'entry_question':text}
 

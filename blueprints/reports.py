@@ -2949,6 +2949,28 @@ def fba_storage_fee_monthly_trend():
 _SKU_EXPR = "COALESCE(NULLIF(seller_sku, ''), fnsku)"
 
 
+@reports_bp.route('/reports/fba-storage-fees/workspace/<view>', methods=['GET'])
+@login_required
+@permission_required('reports:page')
+def storage_monthly_workspace(view):
+    """仓储费月表、SKU、仓库及条件预测；业务归集集中在Service。"""
+    from services import storage_fees
+    handlers = {'months': storage_fees.history, 'skus': storage_fees.sku_list, 'ages': storage_fees.current_ages,
+                'warehouses': storage_fees.warehouse_detail, 'forecast': storage_fees.forecast}
+    if view not in handlers:
+        return jsonify({'status': 'error', 'message': '查询类型不存在'}), 404
+    try:
+        shop_id = _require_shop_id_from_args()
+        if shop_id <= 0:
+            raise ValueError('shop_id必须为正整数')
+        result = handlers[view](shop_id, request.args)
+        response = jsonify({'status': 'success', 'data': result})
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except ValueError as error:
+        return jsonify({'status': 'error', 'message': str(error)}), 400
+
+
 @reports_bp.route('/reports/fba-storage-fees/analysis', methods=['GET'])
 @login_required
 @permission_required('reports:page')

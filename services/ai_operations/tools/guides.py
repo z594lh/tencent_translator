@@ -4,6 +4,7 @@ from services.business_dictionary import DictionaryMapping, entry
 
 WINDOWS = DictionaryMapping('data.window')
 REF_HELP = {
+    'read_storage_fees':'留空或当前ASIN查历史月费，shop查本店月度汇总。estimate查当前ASIN原生滚动估算，shop_estimate查本店按日期/币种估算小计，不返回其他SKU明细；原生估算含超龄费，不是下个自然月账单。仅window=all，按next_offset续查。',
     'read_competitors':'留空列出当前ASIN绑定竞品；可填绑定竞品ASIN或本次返回的竞品证据引用。不能查询未绑定ASIN。仅window=all，数据时间见每条采集日期。',
     'read_advertising':'可填 spAdvertisedProduct（本ASIN商品广告）、spCampaigns（关联活动）、spCampaignsPlacement（广告位）、spTargeting（投放）、spSearchTerm（搜索词），或返回的精确证据编号。',
     'read_keywords':'输入完整关键词精确匹配，例如 egg slicer；留空列出当前快照。',

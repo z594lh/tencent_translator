@@ -39,8 +39,9 @@ def build_data(shop, asin, report_date, management=None):
     """预览和正式任务共用真实资料组包，只读本地数据，不创建会话或调用AI。"""
     pack = facts.preview({'shop_id': shop, 'asin': asin, 'report_date': report_date})
     data = dataset.build(pack)
-    from .tools import competitors
+    from .tools import competitors, storage
     competitors.attach(data,management.get('now') if management else None)
+    storage.attach(data,management.get('now') if management else None)
     if management is not None:
         from . import management_context
         management_context.attach(data,management_context.build(pack,data,management))

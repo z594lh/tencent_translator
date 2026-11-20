@@ -102,7 +102,42 @@ def save(batch_row, rows):
             raise ValueError('报告请求已变化，本次结果不保存')
         if batch_row['kind'] == 'health' and current['snapshot_date'] and snapshot and snapshot < current['snapshot_date'].isoformat():
             raise ValueError('报告快照早于已保存数据，未覆盖原资料')
+        if batch_row['kind'] == 'health':
+            # 替换前保留原快照；历史按真实库龄月份归档，不复制今天的库存到过去。
+            cursor.execute('SELECT * FROM fba_storage_analysis_rows WHERE batch_id=%s', (batch_row['id'],))
+            previous = []
+            for value in cursor.fetchall():
+                payload = json.loads(value['payload']) if isinstance(value['payload'], str) else value['payload']
+                previous.append({**value, 'payload': payload, 'country': value['country_code'], 'fc': value['fulfillment_center']})
+            _archive_age(cursor, current, previous)
+            _archive_age(cursor, current, rows)
         _replace(cursor, batch_row['id'], rows, snapshot)
+
+
+def _archive_age(cursor, batch_row, rows):
+    """复用既有批次及明细结构，每月保留最后一次完整库龄快照；与最新保存同事务。"""
+    groups = {}
+    for row in rows:
+        age_date = row['payload'].get('age_snapshot_date')
+        if age_date:
+            groups.setdefault(age_date[:7], []).append(row)
+    binding = tuple(batch_row[k] for k in ('shop_id','marketplace_id','credential_group_id','region'))
+    for month, values in sorted(groups.items()):
+        snapshot = max(r['payload']['age_snapshot_date'] for r in values)
+        cursor.execute('''SELECT id,snapshot_date FROM fba_storage_analysis_batches
+            WHERE shop_id=%s AND marketplace_id=%s AND credential_group_id=%s AND region=%s
+            AND kind='age_history' AND period_key=%s FOR UPDATE''', (*binding, month))
+        target = cursor.fetchone()
+        if target and target['snapshot_date'] and target['snapshot_date'].isoformat() >= snapshot:
+            continue
+        if not target:
+            cursor.execute('''INSERT INTO fba_storage_analysis_batches
+                (shop_id,marketplace_id,credential_group_id,region,kind,period_key,attempt_status,requested_at,checked_at)
+                VALUES (%s,%s,%s,%s,'age_history',%s,'ready',%s,%s)''', (*binding, month, datetime.utcnow(), datetime.utcnow()))
+            target_id = cursor.lastrowid
+        else:
+            target_id = target['id']
+        _replace(cursor, target_id, values, snapshot)
 
 
 def _replace(cursor, batch_id, rows, snapshot):
@@ -190,6 +225,7 @@ def read_sources(binding, month, prior=None):
         with transaction() as cursor:
             cursor.execute('''SELECT * FROM fba_storage_analysis_batches
                 WHERE shop_id=%s AND marketplace_id=%s AND credential_group_id=%s AND region=%s
+                AND kind IN ('health','monthly','aged','overage')
                 AND ((kind='health' AND period_key='latest') OR period_key=%s
                      OR (kind='monthly' AND period_key=%s))''', (*binding, month, prior or month))
             batches = cursor.fetchall()
