@@ -1,4 +1,6 @@
 """结构化计划工具：只校验计划，不直接执行；复用原Listing/金额/观察约束。"""
+from ..language import text as model_text
+
 from copy import deepcopy
 from services.listing_performance.common import DomainError
 from .. import plan_contract
@@ -66,19 +68,19 @@ def repair_hint(ctx,args):
 def submit(ctx,args):
     """要求行动/证据来自实际工具查询；完整计划校验通过后交给原归档和执行链路。"""
     if ctx.plan is not None:
-        if digest(args)==ctx.plan_input_hash:return {'status':'validated','message':'复用本任务相同计划，尚未执行'}
-        raise DomainError('本任务已校验一份不同计划，请结束回复后另发新问题调整，未覆盖原计划',422)
+        if digest(args)==ctx.plan_input_hash:return {'status':'validated','message':model_text('planning.df51762e34c2')}
+        raise DomainError(model_text('planning.9181e13591cd'),422)
     plan_contract.fields(args,('summary','actions','notes','history_reviews'),'工具方案')
-    if not isinstance(args['actions'],list) or len(args['actions'])>12:raise DomainError('行动列表无效或超过12项',422)
+    if not isinstance(args['actions'],list) or len(args['actions'])>12:raise DomainError(model_text('planning.8c763d3999e7'),422)
     refs={r.get('ref') for r in args['actions'] if isinstance(r,dict) and isinstance(r.get('ref'),str)}
-    if refs-ctx.settings:raise DomainError('请先用read_current_settings查询方案涉及的每个精确对象及完整前值',422)
+    if refs-ctx.settings:raise DomainError(model_text('planning.36f6b7e516c9'),422)
     management=review_scope(ctx,args)
     known={str(r['execution_id']) for key in ('observations','pending_executions') for r in management.get(key,[])}
-    if (ctx.purpose=='daily' and not ctx.observe_checked) or known-ctx.observations:raise DomainError('请先分页查询read_observations，覆盖本次计划相关的全部待观察/待核实项',422)
+    if (ctx.purpose=='daily' and not ctx.observe_checked) or known-ctx.observations:raise DomainError(model_text('planning.dacb61fd518c'),422)
     provided={**ctx.data,'content':{**ctx.data['content'],'management_context':management}}
     validated=plan_contract.validate(args,provided)
     all_refs={ref for row in validated['actions'] for ref in row['evidence_refs']}
     all_refs.update(ref for review in validated['history_reviews'] for ref in review['evidence_refs'])
-    if all_refs-ctx.evidence:raise DomainError('方案包含未通过本次工具实际读取的证据，请先查询对应资料',422)
+    if all_refs-ctx.evidence:raise DomainError(model_text('planning.d915d33d0088'),422)
     ctx.plan=validated;ctx.plan_input_hash=digest(args)
-    return {'status':'validated','action_count':len(validated['actions']),'message':'计划已校验并形成分析成果；人工需明确确认，每日按托管流程执行。此刻尚未修改Amazon。'}
+    return {'status':'validated','action_count':len(validated['actions']),'message':model_text('planning.f076e3283e25')}

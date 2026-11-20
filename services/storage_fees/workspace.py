@@ -90,7 +90,7 @@ def _month_rows(fees, sources, months, asin=''):
 def freeze_history(identity, today):
     """同一次事务冻结商品和店铺汇总，避免两个范围碰上报告更新而不一致。"""
     expected = (int(identity['id']), identity['marketplace_id'], identity['credential_group_id'], identity['region'])
-    if repo.scope(identity['id']) != expected:
+    if tuple(str(value) for value in repo.scope(identity['id'])) != tuple(str(value) for value in expected):
         raise ValueError('店铺范围已变化，请刷新后再查询仓储费')
     end = today.strftime('%Y-%m')
     fees, sources, names = _load(identity['id'], '0001-01', end)

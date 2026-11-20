@@ -139,7 +139,9 @@ def preview(name,body):
         # 试查可以检查已关闭工具，但组合查询继续尊重其他工具开关；不保存读取证据。
         snapshot=registry.snapshot(allow_plan=False)
         if name not in snapshot['names']:snapshot['names'].append(name)
-        result=registry.dispatch(ctx,snapshot,name,body['arguments'])
+        from .. import language, prompt_settings
+        frozen_config=data.get('text_snapshot') or prompt_settings.snapshot()
+        with language.bind(frozen_config['config']):result=language.external_tree(registry.dispatch(ctx,snapshot,name,body['arguments']))
     return {'mode':mode,'result':result,'arguments':body['arguments'],'identity':identity,
             'report_end':data['content']['time']['report_end'],'created_at':datetime.now(timezone.utc),
             'result_bytes':len(dumps(result).encode('utf8')),

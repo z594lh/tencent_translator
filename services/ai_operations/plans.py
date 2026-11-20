@@ -1,4 +1,7 @@
 """真实DeepSeek分析→契约校验；已支持行动由正式接口执行。"""
+from .language import text as model_text
+from .language import freeze_build
+
 from contextlib import contextmanager
 import re
 from services.listing_performance.common import DomainError, positive_id
@@ -25,7 +28,7 @@ def lock(shop, asin):
         with conn.cursor() as cur:
             cur.execute('SELECT GET_LOCK(%s,0) acquired', (name,));got = cur.fetchone()['acquired'] == 1
         conn.rollback()
-        if not got:raise DomainError('该商品正在生成方案，请刷新方案历史；未新建模型请求', 409)
+        if not got:raise DomainError(model_text('plans.8360b3fc31a3'), 409)
         yield
     finally:
         if got:
@@ -35,6 +38,7 @@ def lock(shop, asin):
         conn.close()
 
 
+@freeze_build
 def build_data(shop, asin, report_date, management=None):
     """预览和正式任务共用真实资料组包，只读本地数据，不创建会话或调用AI。"""
     pack = facts.preview({'shop_id': shop, 'asin': asin, 'report_date': report_date})
@@ -48,33 +52,33 @@ def build_data(shop, asin, report_date, management=None):
     data['content']['analysis']={'provider':plan_provider.PROVIDER,'model':plan_contract.MODEL,
         'execution_mode':interfaces.MODE,'history_is_explicit':True,
         'output_metrics':sorted(plan_contract.METRICS),
-        'note':'AI提出可执行方案；ERP以实时前值预检后提交，接受不等于属性生效，业绩变化不直接归因于单次改动。'}
-    data['content']['reading_guide']={'windows':'d1/d3/d7/d14/d30=截止日向前对应天数；p7/p14/p30=前等长区间，互相重叠不可累加',
-        'matrices':'columns给字段顺序，rows给逐行值；coverage表示日期覆盖，null未知不等于0',
-        'ads':'spAdvertisedProduct仅本ASIN；spCampaigns/Placement为关联活动；spTargeting/SearchTerm为关联组，可能含其他SKU。五类报表不是五份可累加销售',
-        'keywords':'卖家精灵snapshot为近30日关键词曝光流量结构；月搜索量等是市场级，不能当本ASIN经营量',
-        'history':'recent_runs给近期AI结论及实际执行状态；observations给仍需复盘的具体改动、执行基线和改后区间证据；pending_executions不可认定已改成功'}
+        'note':model_text('plans.4ab6c1643ba8')}
+    data['content']['reading_guide']={'windows':model_text('plans.4d512a3e1d90'),
+        'matrices':model_text('plans.d453db158eae'),
+        'ads':model_text('plans.55bc1260f946'),
+        'keywords':model_text('plans.05b2c73b7fb0'),
+        'history':model_text('plans.3d20f8addbb9')}
     data['content_hash']=digest(data['content']);data['size_bytes']=len(dumps(data['content']).encode('utf8'))
-    if data['size_bytes']>dataset.MAX_INPUT_BYTES:raise DomainError('本地冻结资料超过8MB，本次未调用模型',422)
+    if data['size_bytes']>dataset.MAX_INPUT_BYTES:raise DomainError(model_text('plans.3b488bbc0013'),422)
     return pack, data
 
 
 def generate(body, actor, check_permissions, management=None,on_registered=None,queue_task=None):
     """整合每日资料并调用持久会话，登记精确输入、结果与记忆检查点。"""
     if not isinstance(body, dict) or set(body) != {'shop_id', 'asin', 'report_date', 'request_token', 'confirm_ai'} or body['confirm_ai'] is not True:
-        raise DomainError('选择店铺、ASIN和截止日后确认生成，不接受浏览器提交的模型资料')
+        raise DomainError(model_text('plans.e6fddb8ca45e'))
     shop = positive_id(body['shop_id'], '店铺')
     if not isinstance(body['report_date'], str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', body['report_date']):
         raise DomainError('必须明确选择报表截止日')
     asin = str(body['asin']).strip().upper();token = body['request_token']
     if not re.fullmatch('[A-Z0-9]{10}', asin) or not isinstance(token, str) or not re.fullmatch('[a-f0-9]{32}', token):
-        raise DomainError('ASIN或本次请求标识无效')
+        raise DomainError(model_text('plans.49026f859dd9'))
     def reused(row):
         """同范围同请求直接返回已有会话计划，不再次调用模型。"""
         if str(row['shop_id']) != str(shop) or row['asin'] != asin or str(row['report_date']) != str(body['report_date']):
-            raise DomainError('请求标识已用于其他分析范围', 409)
+            raise DomainError(model_text('plans.79f92cd7c4ec'), 409)
         if row.get('runtime_mode') != interfaces.MODE:
-            raise DomainError('此请求不属于当前正式执行模式，不允许继续调用', 409)
+            raise DomainError(model_text('plans.f39d8837297c'), 409)
         check_permissions()
         return {**plan_store.serialize(row, True), 'reused': True}
     check_permissions()
@@ -97,7 +101,7 @@ def generate(body, actor, check_permissions, management=None,on_registered=None,
         try:
             check_permissions()
         except DomainError:
-            plan_store.finish(plan_id, 'failed', code='not_sent', message='AI调用前权限或托管状态变化，本次尚未发出模型请求')
+            plan_store.finish(plan_id, 'failed', code='not_sent', message=model_text('plans.a295aba9ccb2'))
             raise
         try:
             result, usage, next_memory = conversation.run(data,prepared,session,plan_id,analyze,check_permissions)
@@ -107,14 +111,14 @@ def generate(body, actor, check_permissions, management=None,on_registered=None,
             result.update(runtime_mode=interfaces.MODE,
                           analysis_provider=(usage or {}).get('provider',plan_provider.PROVIDER),
                           execution_available=any(r['execution_available'] for r in result['actions']))
-            state, message = 'ready', 'DeepSeek分析已完成；行动将通过正式接口提交并独立回读'
+            state, message = 'ready', model_text('plans.dccbe58697f8')
         except plan_provider.Failure as error:
             usage=error.usage or {'provider':plan_provider.PROVIDER,'billable':error.code!='configuration'}
             state,code,message=('unknown' if error.code=='unknown' else 'invalid' if error.code=='invalid_output' else 'failed'),error.code,str(error)
         except DomainError as error:
             state, code, message = 'invalid', 'contract', str(error)
         except Exception:
-            state, code, message = 'unknown', 'analysis_error', '分析回执或校验未完成，可能已计费；请核对历史，不自动重发。Amazon未真实修改'
+            state, code, message = 'unknown', 'analysis_error', model_text('plans.c8a9b0b8c83a')
         def checkpoint(cur):
             """每日方案和记忆入库前同事务检查统一队列租约，迟到实例不得覆盖新状态。"""
             if queue_task:

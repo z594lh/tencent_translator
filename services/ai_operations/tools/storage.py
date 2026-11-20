@@ -1,4 +1,6 @@
 """仓储费工具只读本任务冻结月表；不查其他店铺、ASIN或即时报告。"""
+from ..language import text as model_text, external_tree
+
 from copy import deepcopy
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -14,7 +16,8 @@ def attach(dataset, now=None):
     identity = dataset['content']['identity']
     now = now or datetime.now(ZoneInfo('Asia/Shanghai'))
     today = now.astimezone(ZoneInfo('Asia/Shanghai')).date()
-    scopes = freeze_history(identity, today)
+    # 此处的reason为原生估算可用性说明，显式适配；历史行动理由不做文字替换。
+    scopes = external_tree(freeze_history(identity, today), fields=('reason',))
     shop, asin = scopes['shop'], scopes['asin']
     rows = []
     for scope, result in (('asin', asin), ('shop', shop)):
@@ -24,7 +27,7 @@ def attach(dataset, now=None):
         for estimate in estimates:
             ref = 'storage-estimate:' + digest([identity, scope, estimate])[:24]
             estimate['evidence_id'] = ref
-            entry = {'kind': 'storage', 'label': f'{estimate.get("snapshot_date") or "日期未知"} · 亚马逊原生仓储成本估算'}
+            entry = {'kind': 'storage', 'label': model_text('storage.c90a2c11e49d', p0=f"{estimate.get('snapshot_date') or '日期未知'}")}
             dataset['evidence'][ref] = {**entry, 'data': estimate}
             dataset['content']['evidence_index'][ref] = entry
         for value in result['rows']:
@@ -34,24 +37,24 @@ def attach(dataset, now=None):
             entry = {'kind': 'storage', 'label': f'{value["month"]} · {"店铺" if scope == "shop" else identity["asin"]}仓储费'}
             dataset['evidence'][ref] = {**entry, 'data': row}
             dataset['content']['evidence_index'][ref] = entry
-    dataset['content']['storage_fees'] = {'rows': rows, 'native_estimates': {scope: value['native_estimate'] for scope, value in scopes.items()}, 'as_of': now.isoformat(), 'note': shop['note']+' 附带库龄为注明日期的库存快照，不是当月计费数量。', 'age_bands': shop['age_bands']}
+    dataset['content']['storage_fees'] = {'rows': rows, 'native_estimates': {scope: value['native_estimate'] for scope, value in scopes.items()}, 'as_of': now.isoformat(), 'note': model_text('storage.ba1122905799', p0=shop['note']), 'age_bands': shop['age_bands']}
 
 
 def read(ctx, args):
     """ref为空/当前ASIN查本商品，shop查同店汇总；只返回完整月行并披露续查位置。"""
     identity = ctx.data['content']['identity']
     if args['window'] != 'all' or args['ref'] not in ('', 'shop', identity['asin'], 'estimate', 'shop_estimate'):
-        raise DomainError('仓储费仅支持window=all；ref为当前ASIN/shop，原生估算使用estimate/shop_estimate', 422)
+        raise DomainError(model_text('storage.f74693a663f7'), 422)
     frozen = ctx.data['content'].get('storage_fees')
     if frozen is None:
-        return {'status': 'unavailable', 'rows': [], 'reason': '旧任务未冻结仓储费资料，不用当前数据补写历史'}
+        return {'status': 'unavailable', 'rows': [], 'reason': model_text('storage.bb693ac8a038')}
     scope = 'shop' if args['ref'] in ('shop','shop_estimate') else 'asin'
     native = None
     rows = [r for r in frozen['rows'] if r['scope'] == scope]
     if args['ref'] in ('estimate','shop_estimate'):
         native = frozen.get('native_estimates', {}).get(scope)
         if native is None:
-            return {'status': 'unavailable', 'rows': [], 'reason': '此旧任务未冻结原生估算，不补查当前数据'}
+            return {'status': 'unavailable', 'rows': [], 'reason': model_text('storage.e22d18883641')}
         rows = native['fees'] if scope == 'shop' else native['rows']
     selected = rows[args['offset']:args['offset']+args['limit']]
     returned = deepcopy(tool_data.fit(selected, max(0, getattr(ctx, 'output_budget', tool_data.MAX_DATA_BYTES)-3000)))
@@ -65,6 +68,6 @@ def read(ctx, args):
         result.update(note=native['note']+' '+native['scope_note'], estimate_status=native['status'],
                       source_field=native['source_field'], source_url=native['source_url'], result_type='native_estimate')
     if selected and not returned:
-        result.update(status='budget_exceeded', reason='完整月行超过本次剩余预算，正文未交付')
+        result.update(status='budget_exceeded', reason=model_text('storage.cc27d88bfaad'))
     ctx.capture(result)
     return result

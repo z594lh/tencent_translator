@@ -1,4 +1,6 @@
 """P1-A经营事实包：每日及7/14/30窗口、自动/手动广告、搜索词和关键词快照。"""
+from .language import text as model_text
+
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
@@ -11,29 +13,29 @@ from .metrics import ADS_FIELDS, SKU_FIELDS, dates, digest, dumps, group_reports
 
 LABELS = DictionaryMapping('ads.report',builtin_only=True)
 NOTES = [
-    '本资料用于生成具体运营方案；读取资料本身不调用AI或执行修改，当前设置不作为历史回测资料。',
-    '统计窗口7/14/30日均汇总原始7日归因指标，不是7/14/30日归因模型。重叠窗口不能当成独立证据。',
-    '经营日期沿用源报表固定UTC-7；广告账户历史时区、profile及币种来源未独立核实，不能精确跨源归因。',
-    '广告按report_date使用每日采集时的现有指标；用户接受后续归因修订可能带来的偏差，不要求历史重抓、生成时间或等待归因窗口结束。',
-    'SKU净利润与分摊沿用用户已确认的现有报表口径；不重算历史利润，不重复扣除广告费。',
-    '本地利润表唯一键为店铺/ASIN/日期，旧生成器按产品SKU写入且广告费按ASIN映射；多SKU关联时利润归属不能直接信任。',
-    '商品广告按推广商品统计；搜索词/投放为组范围，活动/广告位为活动范围，不代表该ASIN独占，也不能互加。',
-    '当前配置、库存及最新卖家精灵快照是读取时状态，不是报表截止日的历史状态。未采集的日期和排名不伪造。',
+    model_text('facts.e04784ad3b64'),
+    model_text('facts.4e9b4f0d912c'),
+    model_text('facts.bb6f5939a4ec'),
+    model_text('facts.f858792db4b1'),
+    model_text('facts.67c552717d27'),
+    model_text('facts.2b16c44e6622'),
+    model_text('facts.12ef581b0c25'),
+    model_text('facts.25a2abb99e80'),
 ]
 
 ADS_REPORTING_POLICY = {
     'version': 'daily_report_date_v1', 'date_field': 'report_date',
-    'collection': '沿用现有每日15:30采集前一整天报告的任务配置，不在本模块更改调度',
+    'collection': model_text('facts.922e871038c2'),
     'backfill_enabled': False, 'require_generated_at': False, 'require_attribution_maturity': False,
     'later_attribution_revisions': 'accepted_by_user',
-    'notice': '按已采集报告日期分析；不代表最终结算或零偏差，真实缺失、账户/币种不符仍需披露',
+    'notice': model_text('facts.536ce93c80ff'),
 }
 
 PROFIT_POLICY = {
     'version': 'user_confirmed_profit_v1', 'report_profit': 'sku_profit.net_profit',
     'allocation_method': 'user_confirmed_existing_method', 'recalculate_historical_profit': False,
     'unit_profit_role': 'optional_reference_before_advertising_and_refunds',
-    'notice': '现有利润及分摊口径已由用户确认，直接使用报表；仅真实资料缺失或冲突提示异常',
+    'notice': model_text('facts.5e094afb25b0'),
 }
 
 
@@ -83,12 +85,12 @@ def build(data, asin, end):
     gaps = []
     profit_ambiguous = len(skus) > 1 or len(data.get('profit_product_skus', [])) > 1
     if profit_ambiguous:
-        gaps.append({'code': 'multi_sku_asin', 'message': '该ASIN存在多个Listing或活跃产品SKU；源利润表按ASIN唯一，归属可能被覆盖，本次不展示利润及经营汇总。'})
+        gaps.append({'code': 'multi_sku_asin', 'message': model_text('facts.9b0bd4d5cd56')})
     if not relevant:
-        gaps.append({'code': 'no_ads_relation', 'message': '没有可核实的当前/窗口内商品广告关系；空结果不等于未投广告。'})
+        gaps.append({'code': 'no_ads_relation', 'message': model_text('facts.5c20dcbf42ce')})
     if data.get('unmapped_historical_links'):
         gaps.append({'code': 'unmapped_historical_campaign',
-                     'message': f"有{len(data['unmapped_historical_links'])}组历史商品广告无法关联当前账户活动，未强行归属；广告资料不是完整账户历史。"})
+                     'message': model_text('facts.951b6518f67b', p0=f"{len(data['unmapped_historical_links'])}")})
     # 资料中的商品描述取允许字段，禁止把完整属性中的任意内容/凭据带入。
     for listing in data['listings']:
         raw = listing.pop('attributes_json', None)
@@ -111,7 +113,7 @@ def build(data, asin, end):
         counts = Counter(r['report_date'] for r in observed)
         duplicates = [day for day, count in counts.items() if count > 1]
         if duplicates or any(r['asin'] != asin for r in observed):
-            raise DomainError('SKU日报存在同日重复或历史ASIN不一致，不能安全汇总，请先核对源数据', 409)
+            raise DomainError(model_text('facts.f8c52777c53d'), 409)
         complete = [r['report_date'] for r in observed
                     if generation.get(str(r['report_date']), {}).get('status') == 'success'
                     and all(r.get(f) is not None for f in SKU_FIELDS)]
@@ -146,7 +148,7 @@ def build(data, asin, end):
         # 按用户报告日期口径，有合法明细的日期可纳入观察，不要求额外生成时间证据。
         complete = sorted((set(complete) | {r['report_date'] for r in observed}) - null_days)
         if excluded:
-            gaps.append({'code': 'currency_excluded', 'message': f'{kind}有{len(excluded)}行币种非USD或未知，未汇入USD小计。'})
+            gaps.append({'code': 'currency_excluded', 'message': model_text('facts.f68f1c8a249f', p0=f'{kind}', p1=f'{len(excluded)}')})
             complete = [day for day in complete if day not in {r['report_date'] for r in excluded}]
         items, detail_sources = [], {}
         for dimensions, group in group_reports(observed):
@@ -185,7 +187,7 @@ def build(data, asin, end):
                         'total_objects': len(items), 'selected_objects': len(selected),
                         'omitted_objects': len(items) - len(selected),
                         'selected_cost_share': selected_cost / total_cost if total_cost and total_cost > 0 else None,
-                        'selection_basis': '60日花费/归因购买/曝光分层选取；全量小计单独保留；未展示对象不能获得执行建议',
+                        'selection_basis': model_text('facts.b9ed0b341300'),
                         'details': selected})
     # 来源只作追溯；不因缺少生成时间/旧留痕而要求回补或阻断分析。
     for module in modules:
@@ -198,10 +200,10 @@ def build(data, asin, end):
             period['coverage_basis'] = 'report_date'
             period['maturity'] = 'not_required'
         if any(r.get('account_matches') is False for r in module['source_provenance']):
-            gaps.append({'code': 'ads_account_mismatch', 'message': f"{module['kind']}存在已记录来源账户与当前店铺不符的日期，请核对真实归属。"})
+            gaps.append({'code': 'ads_account_mismatch', 'message': model_text('facts.851acb08f5ea', p0=f"{module['kind']}")})
         if any(r.get('content_matches') is False and r.get('content_check') != 'row_limit'
                for r in module['source_provenance']):
-            gaps.append({'code': 'ads_content_mismatch', 'message': f"{module['kind']}存在已记录内容与当前明细不符的日期；这与缺少生成时间不同，请核对实际数据变化。"})
+            gaps.append({'code': 'ads_content_mismatch', 'message': model_text('facts.8beaac118222', p0=f"{module['kind']}")})
     relationships = []
     for cid, gid in sorted(relevant):
         # 当前及历史共享关系都展示；不把当前只有一个SKU当成历史独占。
@@ -220,17 +222,17 @@ def build(data, asin, end):
               'selected': len(sprite_selected), 'omitted': len(sprite_rows) - len(sprite_selected),
               'items': [{**r, 'evidence_id': f"sellersprite:{r['id']}"} for r in sprite_selected],
               'history': data.get('sprite_history', []),
-              'note': '最新最多1000个完整词组，total/omitted披露未归档数量；历史按实际成功文件比较；近30日快照不是单日自然曝光，市场月指标不是本ASIN销量。'}
+              'note': model_text('facts.bb863521ea2a')}
     if not snapshot:
-        gaps.append({'code': 'missing_sprite', 'message': '该ASIN暂无成功卖家精灵快照。'})
+        gaps.append({'code': 'missing_sprite', 'message': model_text('facts.daffce61f324')})
     verified_zones = {r['timezone'] for m in modules for r in m['source_provenance']
                       if r['state'] == 'verified' and r['timezone']}
     result = identity_values({
         'schema_version': 'ai_facts_v1_preview', 'execution_eligible': False, 'persisted': False,
         'identity': {**data['shop'], 'asin': asin, 'skus': sorted(skus), 'currency': 'USD'},
         'time': {'report_end': end, 'read_start': end - timedelta(days=59), 'windows': periods,
-                 'business_timezone': 'UTC-07:00（源报表固定偏移）', 'ads_timezone': next(iter(verified_zones)) if len(verified_zones) == 1 else 'unverified_or_mixed',
-                 'notice': '当前商品/配置和最新快照独立于报表截止日；不可当作历史回测资料'},
+                 'business_timezone': model_text('facts.ac9d059e6f76'), 'ads_timezone': next(iter(verified_zones)) if len(verified_zones) == 1 else 'unverified_or_mixed',
+                 'notice': model_text('facts.ff7f5875eb8e')},
         'ads_reporting_policy': ADS_REPORTING_POLICY,
         'profit_policy': PROFIT_POLICY,
         'notes': NOTES, 'gaps': gaps, 'products': data['listings'], 'business': profits,
@@ -242,13 +244,13 @@ def build(data, asin, end):
         'pricing': data.get('pricing', []),
         'recent_operations': {'listing': data['listing_history'][:30], 'ads': data['ads_history'][:30],
                               'listing_total': len(data['listing_history']), 'ads_total': len(data['ads_history']),
-                              'note': '当前向前60天内最近最多各30条本地已知记录，独立于报表截止日；非完整平台历史，缺失不代表无人修改'},
+                              'note': model_text('facts.610b82da10b8')},
     })
     result['content_hash'] = digest(result)
     result['generated_at'] = datetime.now(timezone.utc).isoformat()
     size = len(dumps(result).encode('utf-8'))
     if size > 2 * 1024 * 1024:
-        raise DomainError('事实包超过2MiB预览上限，未截断或提交AI；需要进一步拆分广告范围', 422)
+        raise DomainError(model_text('facts.e03ecf96fc22'), 422)
     result['size_bytes'] = size
     return result
 
@@ -257,12 +259,12 @@ def preview(params):
     shop = positive_id(params.get('shop_id'), 'shop_id')
     asin = str(params.get('asin') or '').strip().upper()
     if not re.fullmatch(r'[A-Z0-9]{10}', asin):
-        raise DomainError('请输入有效10位ASIN')
+        raise DomainError(model_text('facts.c762711baf30'))
     # 仅支持当前已核实的源报表固定UTC-7，不依赖服务器本地时区。
     today = datetime.now(timezone(timedelta(hours=-7))).date()
     end = parse_date(params.get('report_date') or str(today - timedelta(days=1)))
     if end >= today:
-        raise DomainError('截止日须为已结束的业务日')
+        raise DomainError(model_text('facts.4e7c1330efe1'))
     with repo.session() as cur:
         data = repo.read(cur, shop, asin, end - timedelta(days=59), end)
     return build(data, asin, end)

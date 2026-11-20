@@ -5,6 +5,7 @@ from services.listing_performance.common import DomainError, positive_id
 from services.operation_identity import ai_operation
 from . import managed_store as store, plan_store, plans, executions, conversation_store, platform_operations as interfaces
 from .metrics import digest
+from .observation_status import review_due
 
 BJ=timezone(timedelta(hours=8))
 SOURCE_ZONE=timezone(timedelta(hours=-7))
@@ -50,7 +51,7 @@ def summarize(plan,records):
     """根据已保存方案和执行事实统计本次结果，不虚构收益。"""
     actions=(plan.get('result') or {}).get('actions',[])
     context=plan['dataset']['content'].get('management_context',{})
-    watching={r['ref'] for r in context.get('observations',[]) if r['phase'] in ('observing','waiting_data')}
+    watching={r['ref'] for r in context.get('observations',[]) if not review_due(r)}
     watching.update(r['action']['ref'] for r in records if r['status']=='confirmed')
     return {'conclusion':(plan.get('result') or {}).get('summary',''),'action_count':len(actions),
             'analysis_provider':(plan.get('usage') or {}).get('provider','deepseek'),'execution_mode':'real',

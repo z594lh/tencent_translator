@@ -1,4 +1,6 @@
 """工具只读数据适配：复用本地归档、完整词组与历史来源，不包含提示词或会话首包。"""
+from ..language import text as model_text
+
 from copy import deepcopy
 from services.listing_performance.common import DomainError
 from .. import plan_contract, plan_store, management_context
@@ -27,14 +29,14 @@ def brief(value, ref):
     """对长字段生成带原文引用的明确预览，不截断原始归档。"""
     if size(value) <= 1400:return deepcopy(value)
     return {'preview':dumps(value)[:350], 'complete_value_ref':ref, 'truncated':True,
-            'note':'仅供识别改动；完整原值/新值可用history索取，不能据此拼接新文案'}
+            'note':model_text('data.1a808817e69f')}
 
 
 def watch(row):
     """构造完整观察事项和紧凑基线，保留周期与缺失状态。"""
     ref = 'history:execution:'+str(row['execution_id'])
     fields = ('execution_id','plan_id','ref','label','unit','kind','changed_at','confirmed_at',
-              'duration_days','started_on','due_on','elapsed_days','remaining_days','phase',
+              'duration_days','started_on','due_on','elapsed_days','remaining_days','phase','review_due','data_complete',
               'progress_note','report_date','observation_plan','status')
     result = {k:row[k] for k in fields if k in row}
     result.update(evidence_ref=ref,before=brief(row.get('before'),ref),after=brief(row.get('after'),ref))
@@ -54,7 +56,7 @@ def period(row, window):
     result = deepcopy(row)
     if window=='daily':
         result = {k:v for k,v in result.items() if k!='periods'}
-        if 'daily' not in result:result.update(daily=None,availability_note='此对象日明细未包含于本次归档，不能当0')
+        if 'daily' not in result:result.update(daily=None,availability_note=model_text('data.21553ba6a788'))
         return result
     result.pop('daily',None)
     if window!='all' and 'periods' in result:
@@ -108,19 +110,19 @@ def fetch(data, request, session=None, max_bytes=MAX_DATA_BYTES):
             result['returned']=len(result['rows']);result['byte_limited']=len(result['rows'])<len(original)
             result['has_more']=request['offset']+len(result['rows'])<result['total_in_archive']
             result['next_offset']=request['offset']+len(result['rows']) if result['rows'] and result['has_more'] else None
-            if result['byte_limited'] and not result['rows']:result.update(status='budget_exceeded',reason='单条历史超过当前结果预算，正文未交付')
+            if result['byte_limited'] and not result['rows']:result.update(status='budget_exceeded',reason=model_text('data.3fe5669452af'))
             return result
         if ref.startswith('task:') and ref[5:].isdigit():
             from .. import chat_tasks
             try:task,task_session,managed=chat_tasks.checked_task(ref[5:])
-            except DomainError:return {'status':'unavailable','reason':'历史问答不存在或账户范围不符'}
-            if task['scope_key']!=chat_tasks.messages.scope(content['identity'])[1]:return {'status':'unavailable','reason':'历史问答不属于本账户ASIN'}
+            except DomainError:return {'status':'unavailable','reason':model_text('data.77788e3483cb')}
+            if task['scope_key']!=chat_tasks.messages.scope(content['identity'])[1]:return {'status':'unavailable','reason':model_text('data.66eb3f88a8ff')}
             with plan_store.transaction() as cur:
                 cur.execute('SELECT * FROM ai_operation_messages WHERE id=%s',(task['user_message_id'],))
                 question=chat_tasks.messages.checked(cur.fetchone(),'payload_json','payload_hash')
             rows=[{'task_id':str(task['id']),'status':task['status'],'user_question':question,
                    'result':chat_tasks.messages.checked(task,'result_json','result_hash') if task['result_json'] else None,
-                   'note':'这是历史问答或未执行建议，不是平台执行事实'}]
+                   'note':model_text('data.c6f2a09d8d21')}]
         else:
             rows=history_rows(data,ref,content)
     offset, limit = request['offset'],request['limit']
@@ -133,8 +135,8 @@ def fetch(data, request, session=None, max_bytes=MAX_DATA_BYTES):
         'next_offset':offset+len(selected) if selected and offset+len(selected)<len(rows) else None,
         'byte_limited':len(selected)<len(rows[offset:offset+limit]),
         'source_coverage':coverage(data,source),
-        'note':'来自本次本地冻结资料；total_in_archive不是平台全部对象；检查source_coverage和has_more，缺项/缺日不补0'}
-    if not selected:result['reason']='完整记录超过本次返回预算，正文未交付' if result['status']=='budget_exceeded' else '该对象/窗口/分页没有匹配记录'
+        'note':model_text('data.86906f995525')}
+    if not selected:result['reason']=model_text('data.412e556779c9') if result['status']=='budget_exceeded' else model_text('data.b9fd839cad1e')
     result['data_hash'] = digest(result)
     return result
 

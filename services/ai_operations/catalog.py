@@ -1,4 +1,6 @@
 """把现有商品/广告设置转成明确的行动对象，中文映射复用广告展示规则。"""
+from .language import text as model_text
+
 import json
 from decimal import Decimal, InvalidOperation
 from services.ads_display import auto_label, PLACEMENTS
@@ -51,7 +53,7 @@ def build(pack):
                     {**subject, 'field': field}, before, 'text_list', [resource],
                     constraints=rules['fields'][field], policy_version=rules['version'],
                     output_format={'type':'array_of_strings','min_items':rules['fields'][field]['min_items'],'max_items':rules['fields'][field]['max_items'],
-                                   'note':'五点每条一个字符串，返回完整列表' if field=='bullet_point' else '整个字段仅一个完整字符串；后台搜索词的多个词组也放在同一个字符串里'})
+                                   'note':model_text('catalog.b44c3649458d') if field=='bullet_point' else model_text('catalog.c537f4e77718')})
     for pricing in pack.get('pricing', []):
         for offer in pricing['offers']:
             audience = offer.get('audience')
@@ -89,7 +91,7 @@ def build(pack):
                 if value is not None and value == value.to_integral_value() and 0 <= value <= 900:
                     add(base + ':' + code, 'ads_placement_update', (campaign.get('name') or cid) + ' · ' + PLACEMENTS[label_code],
                         {**subject, 'placement': code}, int(value), 'percent', [base],
-                        note='广告位竞价加价比例，不是曝光流量分配比例')
+                        note=model_text('catalog.86360909ae67'))
     for kind, key, identifier, price in (('group', 'groups', 'ad_group_id', 'default_bid'),
                                         ('keyword', 'keywords', 'keyword_id', 'bid'),
                                         ('target', 'targets', 'target_id', 'bid')):

@@ -1,8 +1,11 @@
 """连续托管记忆：历史结论、执行快照与观察周期；不调用模型，不生成虚构效果。"""
+from .language import text as model_text
+
 from datetime import date, datetime, timedelta, timezone
 import json
 from . import plan_store, execution_store, platform_operations as interfaces
 from .metrics import digest, dumps, ADS_FIELDS, SKU_FIELDS, totals, ratios
+from .observation_status import review_due
 from services.listing_performance.common import DomainError
 
 BJ=timezone(timedelta(hours=8))
@@ -27,8 +30,8 @@ def build(pack,data,management):
     resource_keys=keys
     context={'run_id':str(management['run_id']),'run_date':today,'runtime_mode':interfaces.MODE,
              'recent_runs':[],'observations':[],'pending_executions':[],'execution_facts':[],'unstarted_actions':[],
-             'notes':['下列为正式提交及真实回读；属性一致不证明经营收益由该操作产生。',
-                      '观察日龄按北京时间日期；完整改后报告区间从操作次日开始，报表未到或缺失不能认定效果。']}
+             'notes':[model_text('management_context.49e51c525166'),
+                      model_text('management_context.2f4d1ffb3d31')]}
     from . import confirmations,conversation_store
     context['human_decisions']=confirmations.context(management['managed_id'],conversation_store.scope(identity)[1])
     with plan_store.transaction() as cur:
@@ -49,7 +52,7 @@ def build(pack,data,management):
                 if action['mode']=='change' and action['action_id'] not in actual:
                     context['unstarted_actions'].append({'plan_id':plan['id'],'run_id':str(row['managed_run_id']),
                         'action_id':action['action_id'],'ref':action['ref'],'label':action['label'],
-                        'status':'not_started','note':'没有对应执行意图，ERP尚未提交该行动；不能将模型原建议解释为已修改'})
+                        'status':'not_started','note':model_text('management_context.f3c14d09dab4')})
             context['recent_runs'].append({'run_id':str(row['managed_run_id']),'run_date':row['management_date'],
                 'conversation_id':plan['ai_call']['prompt']['conversation']['id'],
                 'status':row['daily_status'],'executions':completed,'plan_id':plan['id'],'report_date':plan['report_date'],
@@ -73,14 +76,14 @@ def build(pack,data,management):
             (identity['id'],identity['marketplace_id'],identity['asin'],*resource_keys,
              management['now'].replace(tzinfo=None)-timedelta(days=60)))
         rows=cur.fetchall()
-        if len(rows)>200:raise DomainError('托管近期执行超过200条，需按对象拆分记忆；未截断观察事项或调用AI',422)
+        if len(rows)>200:raise DomainError(model_text('management_context.d78f4b748bd9'),422)
     for row in rows:
         from .protocol import native_prompt
         if not native_prompt(row.get('origin_prompt')):
             # 只保留旧真实状态用于防重，不解析旧action/baseline或恢复旧观察格式。
             context['execution_facts'].append({'execution_id':str(row['id']),'plan_id':str(row['plan_id']),
                 'label':'旧版执行 #'+str(row['id']),'ref':'legacy:execution:'+str(row['id']),
-                'status':row['status'],'legacy':True,'note':'旧版真实执行账本，仅状态留存；不重放旧操作，不作为新观察数据'})
+                'status':row['status'],'legacy':True,'note':model_text('management_context.923de6cd2357')})
             continue
         record=execution_store.serialize(row);action=record['action'];baseline=record['baseline']
         if not same_account(baseline['identity'],identity):continue
@@ -90,8 +93,8 @@ def build(pack,data,management):
             'action_id':action['action_id'],'ref':action['ref'],'label':action['label'],'status':row['status'],
             'before':action['before'],'proposed_after':action['after'],'accepted':receipt.get('accepted'),
             'submitted_at':receipt.get('submitted_at'),'verified_at':row['verified_at'],
-            'note':'未发送，不可按改后效果观察' if row['status']=='not_sent' else
-                   '属性回读一致，不代表商城合规或收益改善' if row['status']=='confirmed' else '以本项状态为准，不以旧模型记忆为准'})
+            'note':model_text('management_context.74c37b96d16f') if row['status']=='not_sent' else
+                   model_text('management_context.c7ae760ef53d') if row['status']=='confirmed' else model_text('management_context.ed1dfc2e3f42')})
         if row['last_execution_id']!=row['id']:continue
         if row['status'] in ('preparing','submitting','submitted','pending','unknown','issues'):
             context['pending_executions'].append({'execution_id':record['id'],'ref':action['ref'],'label':action['label'],
@@ -102,20 +105,21 @@ def build(pack,data,management):
         operated=confirmed.astimezone(BJ).date()
         start=confirmed.astimezone(SOURCE_ZONE).date()+timedelta(days=1);end=start+timedelta(days=duration-1)
         elapsed=min(duration,max(0,(today-operated).days));remaining=max(0,duration-elapsed)
-        still_observing=elapsed<duration or day(pack['time']['report_end'])<end
-        phase='observing' if still_observing else 'waiting_data'
-        progress='仍在观察周期，不能仅凭今天滚动窗口判定完整周期效果。'
+        due=review_due({'elapsed_days':elapsed,'duration_days':duration})
+        phase='ready_review' if due else 'observing'
+        progress=model_text('management_context.108ba443476a')
         post=post_evidence(pack,action,start,end)
-        if not still_observing:
-            progress='观察日历已到期，需核对新报告/关键词快照；缺新资料时继续等待，不编造效果。'
+        if due:
+            progress=model_text('management_context.38dd32c0cbdd')
             if post['ready']:
-                phase='ready_review';progress='已有覆盖观察区间的来源，可结合前后快照复评；不自动推断因果。'
+                progress=model_text('management_context.e7fe11d97387')
         context['observations'].append({'execution_id':record['id'],'plan_id':record['plan_id'],
             'ref':action['ref'],'label':action['label'],'before':action['before'],'after':action['after'],
             'unit':action['unit'],'kind':action['kind'],
             'changed_at':(record['receipt'] or {}).get('submitted_at') or row['created_at'],'confirmed_at':row['verified_at'],
             'reason':action['reason'],'duration_days':duration,'started_on':start,'due_on':end,
-            'elapsed_days':elapsed,'remaining_days':remaining,'phase':phase,'progress_note':progress,
+            'elapsed_days':elapsed,'remaining_days':remaining,'phase':phase,'review_due':due,
+            'data_complete':bool(post['ready']),'progress_note':progress,
             'report_date':pack['time']['report_end'],'observation_plan':action['observation'],
             'baseline_snapshot':baseline,'post_evidence':post})
     return context
@@ -128,11 +132,11 @@ def post_evidence(pack,action,start,end):
     if action['kind'] in ('listing_text_update','listing_price_update'):
         snap=pack['keywords'].get('snapshot') or {}
         needs_keywords=any(m in ('organic_rank','sponsored_rank','traffic_share','organic_share','sponsored_share','weekly_impressions') for m in action['observation']['metrics'])
-        return {'source':'卖家精灵实际版本与关联SKU经营','ready':business['ready'] and (not needs_keywords or bool(snap.get('record_date') and day(snap['record_date'])>=end and report_end>=end)),
+        return {'source':model_text('management_context.4deb6f8ef4d9'),'ready':business['ready'] and (not needs_keywords or bool(snap.get('record_date') and day(snap['record_date'])>=end and report_end>=end)),
                 'business':business,'business_metrics':business['metrics'],
                 'snapshot':snap,'items':[{k:r.get(k) for k in ('keyword','organic_rank','sponsored_rank','traffic_share','organic_share')}
                     for r in pack['keywords']['items'] if r['keyword'] in action['observation']['keywords']],
-                'note':'实际快照对比，不是精确7日自然曝光；自然曝光/Sessions缺失不伪造。'}
+                'note':model_text('management_context.9b6c448f873e')}
     kind={'ads_placement_update':'spCampaignsPlacement','ads_budget_update':'spCampaigns'}.get(action['kind'],'spTargeting')
     subject=action['subject'];identity=pack['identity']
     where="shop_id=%s AND report_type=%s AND campaign_id=%s AND currency='USD' AND report_date BETWEEN %s AND %s"
@@ -159,7 +163,7 @@ def post_evidence(pack,action,start,end):
             'not_yet_reported_days':sorted(d for d in expected if d>report_end),
             'metrics':ratios(totals(rows,ADS_FIELDS),True),
             'scope':'活动广告位' if kind=='spCampaignsPlacement' else '指定组/投放对象',
-            'note':'真实本地报表的指定观察区间小计；缺日不补0，可能含其他SKU，不能直接归因于某一次改动。'}
+            'note':model_text('management_context.4ffadc313296')}
 
 
 def business_evidence(pack,action,start,end):
@@ -180,8 +184,8 @@ def business_evidence(pack,action,start,end):
             'ready':bool(sku) and expected.issubset(present),'metrics':ratios(totals(rows,SKU_FIELDS)),
             'missing_days':sorted(d for d in expected-present if d<=report_end),
             'not_yet_reported_days':sorted(d for d in expected if d>report_end),
-            'scope':'关联SKU整体经营，不是该活动/广告组独占利润' if sku else '多SKU未指定经营对象，未合并利润',
-            'note':'沿用用户确认的sku_profit与report_date；空值不补0，部分报告小计不是完整观察周期。'}
+            'scope':model_text('management_context.1287a8ab7d8b') if sku else model_text('management_context.a6d1c19f2931'),
+            'note':model_text('management_context.87acb6e3b436')}
 
 
 def attach(data,context):
@@ -201,4 +205,4 @@ def attach(data,context):
     data['content_hash']=digest(data['content']);data['size_bytes']=len(dumps(data['content']).encode('utf8'))
     from .dataset import MAX_INPUT_BYTES
     if data['size_bytes']>MAX_INPUT_BYTES:
-        raise DomainError('本地冻结资料及持续托管记录超过8MB，需分对象组包；未丢弃观察记录或调用AI',422)
+        raise DomainError(model_text('management_context.91d2e87cc0d6'),422)

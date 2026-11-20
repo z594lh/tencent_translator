@@ -1,4 +1,7 @@
 """原生工具调用任务；长期上下文仅问答，工具数据只在本任务循环内回传。"""
+from .language import text as model_text
+from . import language
+
 import time
 from copy import deepcopy
 from services.listing_performance.common import DomainError
@@ -33,8 +36,8 @@ class ToolContext:
 
 def prepare_human(data,session,question,mode='discussion',prompt_snapshot=None):
     """人工自然问题仅绑定工具、身份和会话；不预加载报表/Listing/关键词资料。"""
-    enabled=tools.snapshot(allow_plan=mode!='discussion')
-    frozen=prompt_snapshot or prompt_settings.snapshot()
+    frozen=prompt_snapshot or data.get('text_snapshot') or prompt_settings.snapshot()
+    with language.bind(frozen['config']):enabled=tools.snapshot(allow_plan=mode!='discussion')
     return {'system':prompt_settings.system(frozen,mode),'question':question,'prompt_snapshot':frozen,'tools_snapshot':enabled,'request':plan_provider.request_spec(),
             'scope':{key:data['content'][key] for key in ('identity','time')},
             'conversation':{'id':str(session['id']),'purpose':'chat','mode':mode,'protocol':VERSION,
@@ -47,10 +50,10 @@ def prepare(data,queue_task=None):
     if queue_task:session.update(task_id=queue_task['id'],owner_token=queue_task['owner_token'])
     if queue_task and queue_task.get('trigger_source')=='scheduled':
         session['summary_retry_at']=queue_task.get('scheduled_at')
-    frozen=prompt_settings.snapshot()
+    frozen=data.get('text_snapshot') or prompt_settings.snapshot()
     prepared=prepare_human(data,session,frozen['config']['prompts']['daily_question'],'proposal',frozen)
     if 'read_observations' not in prepared['tools_snapshot']['names']:
-        raise DomainError('每日优化必须复盘已有执行和观察，请先在AI工具管理开放“执行事实与观察”；尚未调用模型',422)
+        raise DomainError(model_text('conversation.9e8f9a71729c'),422)
     prepared['conversation']['purpose']='daily'
     return prepared,session
 
@@ -76,6 +79,7 @@ def usage_summary(calls,started,input_bytes,memory=None,stats=None):
     return result
 
 
+@language.task_bound
 def run(data,prepared,session,plan_id,invoke,check_permissions):
     """原生工具循环；模型自然回答与已校验计划独立，任何失败都不会进入执行。"""
     started=time.monotonic();calls=[];input_bytes=0;tool_count=0;ids=set();ctx=ToolContext(data,session,prepared['conversation']['purpose'])
@@ -86,7 +90,7 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
         nonlocal input_bytes
         length=task_budget.size(request['messages'])+task_budget.size(request.get('tools',[]))
         if input_bytes+length>config['limits']['total_input_bytes']:
-            raise plan_provider.Failure('task_input_limit','历史摘要所需输入超过任务剩余额度',{'billable':False,'input_bytes':0})
+            raise plan_provider.Failure('task_input_limit',model_text('conversation.98d39307a3df'),{'billable':False,'input_bytes':0})
         input_bytes+=length;stats['summary_input_bytes']=stats.get('summary_input_bytes',0)+length
         stats['max_request_bytes']=max(stats['max_request_bytes'],length)
         try:answer,usage=invoke(source,request)
@@ -127,9 +131,9 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
         elif time.monotonic()-started>MAX_ELAPSED_SECONDS-plan_provider.TIMEOUT:code='elapsed_limit'
         if code:
             stats['stop_reason']=code;stats['blocked_request_bytes']=length
-            note={'task_input_limit':f"任务累计输入额度不足：已发送{input_bytes}字节，下一轮需{length}字节，上限{config['limits']['total_input_bytes']}字节",
-                  'request_safety_limit':f'单次请求体超过技术保护：{length}/{task_budget.TECH_CONTEXT_BYTES}字节',
-                  'elapsed_limit':'任务达到耗时保护，未发送下一轮请求'}[code]
+            note={'task_input_limit':model_text('conversation.2019e4daf955', p0=f'{input_bytes}', p1=f'{length}', p2=f"{config['limits']['total_input_bytes']}"),
+                  'request_safety_limit':model_text('conversation.82bd18c4f7b1', p0=f'{length}', p1=f'{task_budget.TECH_CONTEXT_BYTES}'),
+                  'elapsed_limit':model_text('conversation.afa435bb78bb')}[code]
             if last_tool_error:note+='；最后校验原因：'+last_tool_error[:200]
             emit(round_no,'model_response',{'error_code':code,'message':note,'usage':{},'budget':budget})
             raise plan_provider.Failure(code,note,usage_summary(calls,started,input_bytes,memory,stats))
@@ -137,7 +141,7 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
                 'question':prepared['question'],'request':{**prepared['request'],'tools':active_tools},
                 'memory':memory,'prompt_version':{'id':frozen['version_id'],'hash':frozen['hash']},
                 'tools_hash':digest(active_tools),'tools_snapshot_hash':prepared['tools_snapshot']['hash']}):
-            raise plan_provider.Failure('unknown','本轮请求已登记，不重复收费',usage_summary(calls,started,input_bytes,memory,stats))
+            raise plan_provider.Failure('unknown',model_text('conversation.f3fb60f122f2'),usage_summary(calls,started,input_bytes,memory,stats))
         input_bytes+=length
         stats['max_request_bytes']=max(stats['max_request_bytes'],length)
         stats['request_sizes'].append({'round_no':round_no,'input_bytes':length,'cumulative_input_bytes':input_bytes,'stage':budget['stage']})
@@ -147,16 +151,16 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
             emit(round_no,'model_response',{'error_code':error.code,'message':str(error),'usage':error.usage})
             raise plan_provider.Failure(error.code,str(error),usage_summary(calls,started,input_bytes,memory,stats)) from None
         calls.append({**usage,'round_no':round_no,'input_bytes':length,'cumulative_input_bytes':input_bytes});wire=deepcopy(wire)
-        if not isinstance(wire,dict) or wire.get('role')!='assistant':raise plan_provider.Failure('invalid_output','模型没有返回原生assistant消息，未执行计划',usage_summary(calls,started,input_bytes,memory,stats))
+        if not isinstance(wire,dict) or wire.get('role')!='assistant':raise plan_provider.Failure('invalid_output',model_text('conversation.60e4f4c7fe80'),usage_summary(calls,started,input_bytes,memory,stats))
         pending=wire.get('tool_calls') or []
         if ctx.plan is not None and pending:
-            note='计划已校验，但模型在收尾阶段仍返回工具调用，未形成最终回答；本次未执行，不自动重发'
+            note=model_text('conversation.64ff6796a4ee')
             total=usage_summary(calls,started,input_bytes,memory,stats)
             emit(round_no,'model_response',{'error_code':'invalid_output','message':note,'usage':usage})
             raise plan_provider.Failure('invalid_output',note,total)
         if not pending:
             answer=wire.get('content')
-            if not isinstance(answer,str) or not answer.strip():raise plan_provider.Failure('invalid_output','模型没有给出最终自然回答，未执行计划',usage_summary(calls,started,input_bytes,memory,stats))
+            if not isinstance(answer,str) or not answer.strip():raise plan_provider.Failure('invalid_output',model_text('conversation.b59ed799b7cc'),usage_summary(calls,started,input_bytes,memory,stats))
             if (ctx.purpose=='daily' or prepared['conversation'].get('mode')=='proposal') and ctx.plan is None:
                 emit(round_no,'model_response',{'response':{'type':'tool_progress','reply':answer},'usage':usage})
                 messages.append(wire);messages.append({'role':'user','content':texts['plan_required']})
@@ -170,7 +174,7 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
         messages.append(wire);results=[];batch_bytes=0
         for call in pending:
             permitted();tool_count+=1;tool_started=time.monotonic()
-            if tool_count>MAX_TOOL_CALLS or call.get('id') in ids:raise plan_provider.Failure('tool_limit','工具次数超限或调用编号重复，未执行计划',usage_summary(calls,started,input_bytes,memory,stats))
+            if tool_count>MAX_TOOL_CALLS or call.get('id') in ids:raise plan_provider.Failure('tool_limit',model_text('conversation.5f1aafd3a4c7'),usage_summary(calls,started,input_bytes,memory,stats))
             ids.add(call['id']);name=call['function']['name'];args=call['function']['arguments']
             before=(set(ctx.settings),set(ctx.evidence),set(ctx.observations),ctx.observe_checked)
             # 剩余额度必须能再次携带已有协议；资料分页边界不再绑定220KB单轮业务上限。
@@ -181,7 +185,7 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
                 size=len(dumps(result).encode('utf8'))
                 if name!='submit_optimization_plan' and (size>ctx.output_budget or batch_bytes+size>160000):
                     ctx.settings,ctx.evidence,ctx.observations,ctx.observe_checked=before
-                    result={'status':'budget_exceeded','reason_code':'delivery_budget','message':'查询正文未交付：本批剩余返回预算不足','returned':0}
+                    result={'status':'budget_exceeded','reason_code':'delivery_budget','message':model_text('conversation.806dd6645f12'),'returned':0}
                 batch_bytes+=len(dumps(result).encode('utf8'))
             except DomainError as error:
                 result={'status':'error','message':str(error)}
@@ -189,9 +193,10 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
                     from .tools.planning import repair_hint
                     result['repair']=repair_hint(ctx,arguments)
                     result['instruction']=texts['plan_repair']
-            except (ValueError,TypeError,RecursionError):result={'status':'error','message':'工具参数JSON或字段类型无效','instruction':texts['plan_repair']}
-            except Exception:result={'status':'error','message':'ERP工具未完成，可能是本地资料/结构异常；缺失不是0，本工具没有写入Amazon'}
+            except (ValueError,TypeError,RecursionError):result={'status':'error','message':model_text('conversation.687908a6bb43'),'instruction':texts['plan_repair']}
+            except Exception:result={'status':'error','message':model_text('conversation.0efd7476915c')}
             if result.get('status')=='error':last_tool_error=result.get('message')
+            result=language.external_tree(result)
             result=task_budget.delivery(result,name,arguments,texts['tool_delivery'])
             stats['tool_result_bytes']+=task_budget.size(result)
             results.append({'tool_call_id':call['id'],'name':name,'arguments':args,'result':result,
@@ -206,7 +211,7 @@ def run(data,prepared,session,plan_id,invoke,check_permissions):
             state={'engine':VERSION,'question':prepared['question'],'answer':answer,'memory':{k:v for k,v in memory.items() if k!='summary_calls'}}
             result={'type':'propose_plan','reply':answer,'execution_status':'尚未执行','evidence_refs':[],'plan':ctx.plan}
             return (ctx.plan if ctx.purpose=='daily' else result),usage_summary(calls,started,input_bytes,memory,stats),state
-    note='本次AI分析已达'+str(MAX_CALLS)+'轮上限，未形成可提交结果，未执行任何改动，不自动重发'
+    note=model_text('conversation.80a8feaf699b', p0=str(MAX_CALLS))
     if last_tool_error:note+='；最后校验原因：'+last_tool_error[:200]
     total=usage_summary(calls,started,input_bytes,memory,stats)
     # 这只是本地结束事件，不登记model_request、不再收费；让主对话直接看到失败原因。

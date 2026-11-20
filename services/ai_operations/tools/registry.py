@@ -6,6 +6,7 @@ from .. import plan_store
 from ..metrics import digest
 from .specs import definitions
 from .guides import describe
+from .. import language
 
 
 def check_schema(cur):
@@ -29,6 +30,11 @@ def listing():
         result.append({**base,'guide':describe(base),'enabled':True if base['required'] else bool(row.get('enabled',True)),
                        'description':row.get('description',base['description']),'default_description':base['description'],
                        'revision':row.get('revision',0),'updated_at':row.get('updated_at'),'updated_by':row.get('updated_by')})
+    config=language.current_config()
+    if config is None:
+        from .. import prompt_settings
+        config=prompt_settings.snapshot()['config']
+    with language.bind(config):result=language.render_tree(result)
     return {'list':result,'note':'只管理代码注册工具的可见性和说明。新任务固定一份快照；关闭工具不撤回已执行操作，不影响在途任务。'}
 
 
@@ -38,7 +44,12 @@ def update(name,body,actor):
     if not base:raise DomainError('工具不在代码注册目录',404)
     if not isinstance(body,dict) or set(body)!={'revision','enabled','description','reset'} or type(body['revision']) is not int or body['revision']<0 or type(body['enabled']) is not bool or type(body['reset']) is not bool:
         raise DomainError('工具编辑参数无效')
-    description=base['description'] if body['reset'] else body['description'];enabled=True if body['reset'] else body['enabled']
+    description=body['description'];enabled=True if body['reset'] else body['enabled']
+    if body['reset']:
+        from .. import prompt_settings
+        config=language.current_config() or prompt_settings.snapshot()['config']
+        # 恢复页面展示的生效默认说明，不能绕过提示词配置写回旧代码默认值。
+        with language.bind(config):description=language.render_tree(base['description'])
     if not isinstance(description,str) or not description.strip() or len(description)>2000 or any(ord(c)<32 and c not in '\n\t' for c in description):raise DomainError('工具说明不能为空、超过2000字符或包含控制字符')
     if base['required'] and not enabled:raise DomainError('提交计划是必要能力，不能关闭',422)
     try:
@@ -54,14 +65,15 @@ def update(name,body,actor):
 def snapshot(allow_plan=True):
     """冻结本任务可调用工具及参数；可选工具关闭后不发送，也不允许模型强行调用。"""
     rows=[r for r in listing()['list'] if r['enabled'] and (allow_plan or not r['required'])]
+    # listing已按生效或任务冻结版本渲染；离开其作用域后不能再次退回默认文字。
     tools=[{'type':'function','function':{'name':r['name'],'description':r['description'],'parameters':deepcopy(r['parameters'])}} for r in rows]
     return {'tools':tools,'hash':digest(tools),'names':[r['name'] for r in rows]}
 
 
 def dispatch(context,snapshot,name,args):
     """只分发到固定业务函数，运行时再次核对任务白名单和对象范围。"""
-    if name not in snapshot['names']:raise DomainError('此工具未对本任务开放',422)
-    if not isinstance(args,dict):raise DomainError('工具参数必须是JSON对象',422)
+    if name not in snapshot['names']:raise DomainError(language.text('registry.not_enabled'),422)
+    if not isinstance(args,dict):raise DomainError(language.text('registry.invalid_arguments'),422)
     from . import readers, planning, bundles
     if name=='get_operation_overview':return bundles.overview(context,snapshot,args)
     if name=='read_data_bundle':return bundles.batch(context,snapshot,args)

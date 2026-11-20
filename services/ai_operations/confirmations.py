@@ -1,4 +1,6 @@
 """人工行动确认：原方案不变，决策只追加；聊天文字永远不能代替明确平台授权。"""
+from .language import text as model_text
+
 import json
 import re
 from datetime import timedelta
@@ -14,14 +16,14 @@ TTL_HOURS=24
 def source(plan_id):
     """读取原人工建议和实际账户会话；不信任浏览器提交的身份、参数或目标值。"""
     plan=plan_store.get(positive_id(plan_id,'方案'))
-    if plan.get('legacy'):raise DomainError('旧数据，无法查看或执行；请重新分析',410)
+    if plan.get('legacy'):raise DomainError(model_text('confirmations.99b855a91859'),410)
     if plan['status']!='ready' or plan['runtime_mode']!='real' or not plan.get('task_id'):
-        raise DomainError('只能确认已完成的人工对话建议',409)
+        raise DomainError(model_text('confirmations.06b18751ec00'),409)
     task,session,managed=chat_tasks.checked_task(plan['task_id'])
     if task['task_type']!='chat' or task.get('chat_mode')=='discussion' or task['status']!='completed' or str(task['plan_id'])!=plan['id']:
         raise DomainError('原人工建议尚未归档完成',409)
     if conversation_store.scope(plan['dataset']['content']['identity'])[1]!=task['scope_key']:
-        raise DomainError('建议账户范围与当前配置不符',409)
+        raise DomainError(model_text('confirmations.a0c328dd74fa'),409)
     return plan,task,session,managed
 
 
@@ -40,14 +42,14 @@ def state(cur,plan,session,managed):
     now=daily_runner.clock().replace(tzinfo=None)
     deadline=plan['completed_at']+timedelta(hours=TTL_HOURS)
     reason=None
-    if now>=deadline:reason='建议已超过24小时，请重新分析'
+    if now>=deadline:reason=model_text('confirmations.282996bec5a3')
     if session['state']!='active' or str(managed.get('current_conversation_id'))!=str(session['id']):reason='原对话已归档'
-    if (managed['id'] and not managed['enabled']) or managed['shop_status']!=1:reason='托管或店铺已暂停，恢复并复核后才能确认'
+    if (managed['id'] and not managed['enabled']) or managed['shop_status']!=1:reason=model_text('confirmations.3839bb513cda')
     cur.execute('''SELECT p.result_json,p.result_hash FROM ai_operation_plans p JOIN ai_operation_tasks t ON t.id=p.task_id
         WHERE t.scope_key=%s AND t.task_type='chat' AND t.status='completed' AND p.status='ready'
         AND p.id>%s AND t.conversation_id=%s ORDER BY p.id LIMIT 101''',(session['scope_key'],plan['id'],session['id']))
     newer=cur.fetchall()
-    if len(newer)>100:raise DomainError('后续建议超过100份，请新建对话再分析',422)
+    if len(newer)>100:raise DomainError(model_text('confirmations.1492cc801a4d'),422)
     superseded={a['ref'] for row in newer for a in conversation_store.checked(row,'result_json','result_hash')['actions']}
     decided=decisions(cur,plan['id'])
     cur.execute('SELECT action_id,id,status,receipt_json,verification_json,verified_at FROM ai_operation_executions WHERE plan_id=%s',(plan['id'],))
@@ -56,11 +58,11 @@ def state(cur,plan,session,managed):
     identity=plan['dataset']['content']['identity']
     for action in plan['result']['actions']:
         aid=action['action_id'];decision=decided.get(aid);record=records.get(aid);why=reason
-        if action['ref'] in superseded:why='已有较新的同对象人工建议，旧项不再确认'
+        if action['ref'] in superseded:why=model_text('confirmations.7ac9b187a428')
         key=interfaces.resource_key(identity,action['ref'])
         cur.execute("SELECT id FROM ai_operation_executions WHERE resource_key=%s AND plan_id<>%s AND created_at>=%s AND status NOT IN ('not_sent','conflict','rejected') LIMIT 1",(key,plan['id'],plan['created_at']))
-        if cur.fetchone():why='该对象已有后续实际提交，请重新分析'
-        if action['mode']!='change' or not interfaces.supports(action):why='观察项或尚未支持的行动不执行'
+        if cur.fetchone():why=model_text('confirmations.487ec8074859')
+        if action['mode']!='change' or not interfaces.supports(action):why=model_text('confirmations.44b24b138178')
         status='invalid' if why else 'pending'
         if decision:status='rejected' if decision['decision']=='reject' else decision['task_status'] or 'queued'
         if record:status=record['status']
@@ -110,13 +112,13 @@ def decide(plan_id,body,actor):
     access.authorize(actor,'ai_chat:execute')
     plan,task,session,managed=source(plan_id)
     access.product(actor,managed,'ai_chat:execute')
-    if body['plan_hash']!=digest(plan['result']):raise DomainError('方案版本已变化，请刷新原建议',409)
+    if body['plan_hash']!=digest(plan['result']):raise DomainError(model_text('confirmations.27efcb674ddc'),409)
     with plan_store.transaction(True) as cur:
         latest=products.lock_current(cur,managed)
         cur.execute('SELECT * FROM ai_operation_confirmations WHERE request_token=%s',(token,));old=cur.fetchone()
         if old:
             if old['plan_id']!=int(plan['id']) or old['actor_id']!=actor or old['decision']!=decision or set(json.loads(old['action_ids_json']))!=set(ids) or old['plan_hash']!=body['plan_hash']:
-                raise DomainError('确认标识已用于另一项决策',409)
+                raise DomainError(model_text('confirmations.9db22ad170c8'),409)
             return public(old,True)
         cur.execute('SELECT * FROM ai_operation_conversations WHERE id=%s',(session['id'],));session=cur.fetchone()
         managed={**managed,**latest}
@@ -128,9 +130,9 @@ def decide(plan_id,body,actor):
         if len(batches)==1 and None not in batches:
             cur.execute('SELECT * FROM ai_operation_confirmations WHERE id=%s',(next(iter(batches)),));old=cur.fetchone()
             if old['decision']==decision and set(json.loads(old['action_ids_json']))==set(ids):return public(old,True)
-        if any(not r['can_confirm'] for r in chosen):raise DomainError('部分行动已处理或失效，请刷新后重新选择',409)
+        if any(not r['can_confirm'] for r in chosen):raise DomainError(model_text('confirmations.53ebfe87a247'),409)
         if decision=='execute':
-            if not chat_tasks.health()['online']:raise DomainError('消费者离线，本次未确认执行',503)
+            if not chat_tasks.health()['online']:raise DomainError(model_text('confirmations.dee25ee9d9d5'),503)
             validate_dependencies(plan,ids,lookup)
         person=operator_accounts.get_user(cur,actor)
         if person['account_type']!='human' or person['status']!=1:raise DomainError('需要有效人工确认人',403)
@@ -149,7 +151,7 @@ def decide(plan_id,body,actor):
                  (person.get('nickname') or person['username'])[:100],cid,plan['id'],dumps(frozen),digest(frozen)))
             cur.execute('UPDATE ai_operation_confirmations SET task_id=%s WHERE id=%s',(cur.lastrowid,cid))
         payload={'confirmation_id':str(cid),'plan_id':plan['id'],'decision':decision,'action_ids':ids,
-                 'actor':operator_accounts.snapshot(person),'note':'明确拒绝，未修改平台' if decision=='reject' else '明确确认后进入执行队列，不代表平台已接受'}
+                 'actor':operator_accounts.snapshot(person),'note':model_text('confirmations.90c2c0cd8544') if decision=='reject' else model_text('confirmations.154114bdaee1')}
         cur.execute('''INSERT INTO ai_operation_messages(conversation_id,plan_id,round_no,event_type,payload_json,payload_hash,created_at)
             VALUES (%s,%s,%s,'human_decision',%s,%s,UTC_TIMESTAMP(3))''',(session['id'],plan['id'],cid,dumps(payload),digest(payload)))
         cur.execute('SELECT * FROM ai_operation_confirmations WHERE id=%s',(cid,))
@@ -163,7 +165,7 @@ def validate_dependencies(plan,ids,lookup):
         titles=[a for a in plan['result']['actions'] if a['mode']=='change' and a['kind']=='listing_text_update'
                 and a['subject']['field']=='item_name' and a['subject']['sku']==action['subject']['sku']]
         if any(a['action_id'] not in ids and lookup[a['action_id']]['status']!='confirmed' for a in titles):
-            raise DomainError('该亮点依赖同SKU标题，请一起选择标题，或等待标题回读确认',409)
+            raise DomainError(model_text('confirmations.588e26941d8d'),409)
 
 
 def blocks_daily(plan,action,managed_id):
@@ -175,7 +177,7 @@ def blocks_daily(plan,action,managed_id):
             WHERE t.conversation_id=%s AND t.task_type='chat' AND t.status='completed'
             AND p.status='ready' AND p.completed_at>%s ORDER BY p.id DESC LIMIT 101''',(sid,cutoff))
         rows=cur.fetchall()
-        if len(rows)>100:raise DomainError('待处理人工建议过多，停止自动修改并先核对对话',409)
+        if len(rows)>100:raise DomainError(model_text('confirmations.1fab164df42c'),409)
         for row in rows:
             from .protocol import native_prompt
             if not native_prompt(row['prompt_json']):continue
@@ -197,11 +199,11 @@ def require_execution(cur,plan,proof,action=None):
         (proof['confirmation_id'],proof['task_id']))
     batch=cur.fetchone()
     if not batch or batch['decision']!='execute' or batch['task_status']!='running' or not batch['lease_valid'] or batch['stop_requested']:
-        raise DomainError('人工确认执行任务不存在、已停止或租约失效',409)
+        raise DomainError(model_text('confirmations.9b79adb58dc4'),409)
     frozen=conversation_store.checked(batch,'input_json','input_hash')
     if batch['plan_id']!=int(plan['id']) or batch['plan_hash']!=digest(plan['result']) or str(proof['executor']['id'])!=frozen['executor_user_id'] or batch['confirmer']!=proof['initiated_by']['id']:
-        raise DomainError('确认原文或执行身份不符，未提交',409)
-    if action and action['action_id'] not in json.loads(batch['action_ids_json']):raise DomainError('该行动未被明确确认，未提交',403)
+        raise DomainError(model_text('confirmations.50c80fac97ef'),409)
+    if action and action['action_id'] not in json.loads(batch['action_ids_json']):raise DomainError(model_text('confirmations.f4f8447bdeae'),403)
 
 
 def context(managed_id,scope_key=None):
@@ -214,7 +216,7 @@ def context(managed_id,scope_key=None):
             WHERE t.scope_key=%s AND t.task_type='chat' AND t.status='completed' AND p.status='ready'
               AND p.completed_at>%s ORDER BY p.id DESC LIMIT 101''',(scope_key,cutoff))
         rows=cur.fetchall()
-        if len(rows)>100:raise DomainError('有效人工方案超过100份，请处理或新建对话后再分析',422)
+        if len(rows)>100:raise DomainError(model_text('confirmations.db3c406b7350'),422)
         result=[];seen=set()
         for row in rows:
             from .protocol import native_prompt
@@ -229,5 +231,5 @@ def context(managed_id,scope_key=None):
                     'proposed_by':row['actor_name'],'mode':action['mode'],
                     'status':record['status'] if record else 'rejected' if decision and decision['decision']=='reject' else decision['task_status'] if decision else 'pending_confirmation',
                     'execution_id':str(record['id']) if record else None,
-                    'note':'未确认/拒绝/排队不等于已执行；同对象待人工决策时每日自动修改会暂停，该事实优先于旧模型记忆'})
+                    'note':model_text('confirmations.87540054c24e')})
         return result

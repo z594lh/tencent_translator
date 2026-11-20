@@ -1,4 +1,6 @@
 """主干模型资料：完整Listing/售价、紧凑指标矩阵、分层对象和关键词历史。"""
+from .language import text as model_text
+
 from . import catalog
 from .metrics import ADS_FIELDS, SKU_FIELDS, digest, dumps
 from services.listing_performance.common import DomainError
@@ -31,7 +33,7 @@ def build(pack):
         row['content_policy'] = listing_content_policy.policy(pack['identity']['marketplace_id'], product.get('product_type'), product.get('brand'))
         row['pricing_attributes'] = product.get('pricing_attributes', {})
         result['listing'].append(row)
-        index[ref] = {'label': (product.get('product_name') or product['sku']) + ' · 当前Listing', 'kind': 'listing', 'data': row}
+        index[ref] = {'label': model_text('dataset.4569f668bb65', p0=product.get('product_name') or product['sku']), 'kind': 'listing', 'data': row}
     for pricing in pack['pricing']:
         ref = 'pricing:' + digest(pricing['sku'])[:16]
         index[ref] = {'label': pricing['sku'] + ' · 计算售价', 'kind': 'pricing', 'data': pricing}
@@ -84,6 +86,6 @@ def build(pack):
     raw = dumps(result)
     size = len(raw.encode('utf8'))
     if size > MAX_INPUT_BYTES:
-        raise DomainError('本ASIN本地冻结资料超过8MB入口上限，需按广告组拆分；未压成少量词或调用AI', 422)
+        raise DomainError(model_text('dataset.c1068801d0b8'), 422)
     return {'content': result, 'content_hash': digest(result), 'size_bytes': size,
             'evidence': index, 'catalog': actions, 'schema_version': 'ai_operations_dataset_v2'}

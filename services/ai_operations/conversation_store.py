@@ -1,4 +1,6 @@
 """ERP会话、不可变调用事件与有界记忆；不持有网络期间的业务行锁。"""
+from .language import text as model_text
+
 import json
 from services.listing_performance.common import DomainError
 from . import plan_store
@@ -12,7 +14,7 @@ def checked(row, field, hash_field):
     """解析持久化JSON并验证摘要，防止用损坏记忆继续分析。"""
     value = json.loads(row[field])
     if digest(value) != row[hash_field]:
-        raise DomainError('会话资料摘要不符，请核对存储；不会重新调用AI', 503)
+        raise DomainError(model_text('conversation_store.6787af0dbd1d'), 503)
     return value
 
 
@@ -20,7 +22,7 @@ def scope(identity):
     """计算不随会话代次变化的账户范围，明确隔离凭证组、区域、站点及Profile。"""
     boundary = {key: str(identity.get(key) or '') for key in ACCOUNT_FIELDS}
     if not boundary['id'] or not boundary['asin'] or not boundary['marketplace_id']:
-        raise DomainError('会话账户或ASIN边界不完整', 422)
+        raise DomainError(model_text('conversation_store.289cc0c353d3'), 422)
     return boundary, digest([boundary, 'real'])
 
 
@@ -44,7 +46,7 @@ def open_session(identity):
             WHERE shop_id=%s AND marketplace_id=%s AND BINARY asin=BINARY %s FOR UPDATE''',
             (identity['id'],identity['marketplace_id'],identity['asin']))
         managed = cur.fetchone()
-        if not managed:raise DomainError('ASIN尚未配置托管，不创建游离会话',409)
+        if not managed:raise DomainError(model_text('conversation_store.48baabaa8fc7'),409)
         sid = managed['current_conversation_id']
         if not sid:
             cur.execute("SELECT id FROM ai_operation_conversations WHERE scope_key=%s AND state='active' ORDER BY generation DESC LIMIT 1",(key,))
@@ -54,7 +56,7 @@ def open_session(identity):
         cur.execute('SELECT * FROM ai_operation_conversations WHERE id=%s', (sid,))
         session = cur.fetchone()
         if not session or session['state']!='active' or session['scope_key']!=key:
-            raise DomainError('当前会话已归档或账户配置变化，请新建对话后再分析',409)
+            raise DomainError(model_text('conversation_store.0f40d242798a'),409)
         restore(cur, session)
     return session
 
@@ -71,7 +73,7 @@ def peek_session(identity):
         cur.execute("SELECT * FROM ai_operation_conversations WHERE scope_key=%s AND state='active'"+(' AND id=%s' if sid else ' ORDER BY generation DESC LIMIT 1'),(key,sid) if sid else (key,))
         session=cur.fetchone()
         if not session:
-            if sid:raise DomainError('当前会话范围已变化，请核对后新建对话',409)
+            if sid:raise DomainError(model_text('conversation_store.06f9ff26135c'),409)
             cur.execute('SELECT COALESCE(MAX(generation),0)+1 generation FROM ai_operation_conversations WHERE scope_key=%s',(key,))
             generation=cur.fetchone()['generation']
             return {'id':None,'revision':0,'generation':generation,'daily_baseline_pending':True,'memory':None,
@@ -94,21 +96,21 @@ def append(session_id, plan_id, round_no, event_type, payload, task_id=None, own
             from . import chat_tasks
             task=chat_tasks.fence(cur,task_id,owner_token,allow_stop=event_type!='model_request')
             if str(task['conversation_id'])!=str(session_id):raise DomainError('任务消息会话不一致',409)
-            phases={'model_request':('analyzing','AI正在分析，可能计费；关闭页面不会中断任务'),
-                    'model_response':('processing_reply','已保存本轮回答，正在检查内容'),
-                    'data_response':('supplementing','已保存补充资料，等待AI继续分析'),
-                    'validation_feedback':('correcting','回复未通过校验，正在用剩余轮次纠错')}
+            phases={'model_request':('analyzing',model_text('conversation_store.299101759c07')),
+                    'model_response':('processing_reply',model_text('conversation_store.ad3533f01378')),
+                    'data_response':('supplementing',model_text('conversation_store.9c8d396f49b1')),
+                    'validation_feedback':('correcting',model_text('conversation_store.45bf11301f3e'))}
             if event_type in phases:
                 phase,note=phases[event_type]
                 cur.execute('UPDATE ai_operation_tasks SET phase=%s,message=%s WHERE id=%s',(phase,note,task_id))
-        elif plan_id is None:raise DomainError('消息必须有原方案或交互任务',422)
+        elif plan_id is None:raise DomainError(model_text('conversation_store.eaa213713627'),422)
         field,value=('task_id',task_id) if task_id is not None else ('plan_id',plan_id)
         cur.execute('SELECT * FROM ai_operation_messages WHERE '+field+'=%s AND round_no=%s AND event_type=%s',
                     (value, round_no, event_type))
         old = cur.fetchone()
         if old:
             if old['payload_hash'] != digest(payload) or str(old['conversation_id']) != str(session_id):
-                raise DomainError('会话已有不同事件，请查看已保存记录，不重新调用AI',409)
+                raise DomainError(model_text('conversation_store.f9b2f97744d5'),409)
             return False
         cur.execute('''INSERT INTO ai_operation_messages
             (conversation_id,plan_id,task_id,round_no,event_type,payload_json,payload_hash,created_at)
@@ -122,7 +124,7 @@ def checkpoint(cur, session, plan_id, memory):
     cur.execute('SELECT revision,state FROM ai_operation_conversations WHERE id=%s FOR UPDATE', (session['id'],))
     current = cur.fetchone()
     if not current or current['revision'] != session['revision'] or current['state']!='active':
-        raise DomainError('会话版本已改变，保留本次分析，不覆盖其他记忆',409)
+        raise DomainError(model_text('conversation_store.c67ff319babc'),409)
     from . import natural_history
     natural_history.save(cur,session,'plan:'+str(plan_id),memory['question'],memory['answer'],'daily','ERP',session.get('task_id'),plan_id)
     cur.execute('UPDATE ai_operation_conversations SET revision=revision+1,updated_at=UTC_TIMESTAMP(3) WHERE id=%s', (session['id'],))
@@ -163,7 +165,7 @@ def execution_feedback(plan, records, status, message):
     """把已发生的正式执行与独立回读事实追加到同一会话。"""
     info = plan.get('ai_call',{}).get('prompt',{}).get('conversation')
     if not info:return
-    note='ERP真实接口回读事实；属性一致不代表收益改善'
+    note=model_text('conversation_store.d05e8e75b0ad')
     # 执行JSON只供工具查询和折叠审计，不加入后续自然问答上下文。
     payload = {'plan_id':plan['id'],'report_date':plan['report_date'],'status':status,'message':message,
                'execution_mode':'real','note':note,

@@ -1,4 +1,5 @@
 """AI运营售价资料，复用统一成本/售价公式，只读，不刷新API或重算历史利润。"""
+from .language import text as model_text
 from decimal import Decimal
 from services import profit_calculator as calculator
 
@@ -14,7 +15,7 @@ def read(cur, shop, market, sku, reference=None):
     currency_ok = not fee or fee['currency'] == 'USD'
     warnings = list((reference or {}).get('warnings', []))
     if not currency_ok and not any('费用币种' in item for item in warnings):
-        warnings.append('费用币种不是USD，不混入USD售价场景')
+        warnings.append(model_text('pricing.371b708405a4'))
     fixed = costs.purchase_cost_usd + costs.headway_cost_usd + costs.fba_fee_usd
     scenarios = []
     if currency_ok and len(ordinary) == 1 and ordinary[0]['our_price'] is not None:
@@ -31,4 +32,4 @@ def read(cur, shop, market, sku, reference=None):
                 'target_profit_rate': margin, **calculator.calculate_suggested_price(
                     fixed, costs.commission_rate, Decimal('.20'), Decimal(0), margin)}
                 for margin in (Decimal('.10'), Decimal('.20'))] if currency_ok else [],
-            'note': '当前售价模型，假设费率明确列出；不是历史实际收益或销量预测。普通/促销/企业价不得混用。'}
+            'note': model_text('pricing.96624933f6b1')}

@@ -1,4 +1,6 @@
 """纯问答持久化和增量摘要；工具返回、附件、规则及旧memory不进入续聊记忆。"""
+from .language import text as model_text
+
 import json
 from datetime import timedelta, timezone
 from . import plan_store,plan_provider,prompt_settings
@@ -13,11 +15,11 @@ MAX_SUMMARY_CALLS=3
 
 def save(cur,session,source_key,question,answer,source,actor_name,task_id=None,plan_id=None,created_at=None):
     """在原任务完成事务保存准确自然问答；同来源不同内容拒绝覆盖。"""
-    if not isinstance(question,str) or not question.strip() or not isinstance(answer,str) or not answer.strip():raise DomainError('自然问答不能为空',422)
+    if not isinstance(question,str) or not question.strip() or not isinstance(answer,str) or not answer.strip():raise DomainError(model_text('natural_history.a99388353f1a'),422)
     hashed=digest([question,answer]);sid=session['id'] if isinstance(session,dict) else session
     cur.execute('SELECT id,content_hash FROM ai_operation_chat_turns WHERE source_key=%s',(source_key,));old=cur.fetchone()
     if old:
-        if old['content_hash']!=hashed:raise DomainError('原问答已有不同内容，未覆盖历史',409)
+        if old['content_hash']!=hashed:raise DomainError(model_text('natural_history.2907d132104c'),409)
         return old['id']
     cur.execute('''INSERT INTO ai_operation_chat_turns(conversation_id,source_key,task_id,plan_id,question,answer,content_hash,source,actor_name,created_at,completed_at)
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,UTC_TIMESTAMP(3)),UTC_TIMESTAMP(3))''',
@@ -28,7 +30,7 @@ def save(cur,session,source_key,question,answer,source,actor_name,task_id=None,p
 def latest(cur,sid):
     """读取最后成功摘要并校验，失败版本不会替代旧记忆。"""
     cur.execute("SELECT * FROM ai_operation_chat_summaries WHERE conversation_id=%s AND status='ready' ORDER BY id DESC LIMIT 1",(sid,));row=cur.fetchone()
-    if row and digest(row['summary_text'])!=row['summary_hash']:raise DomainError('会话摘要校验失败，未继续调用AI',503)
+    if row and digest(row['summary_text'])!=row['summary_hash']:raise DomainError(model_text('natural_history.81ec700b3063'),503)
     return row
 
 
@@ -39,7 +41,7 @@ def turns(cur,sid,after=0,limit=201,newest=False):
     rows=list(cur.fetchall())
     if newest:rows.reverse()
     for row in rows:
-        if digest([row['question'],row['answer']])!=row['content_hash']:raise DomainError('问答原文校验失败，未继续调用AI',503)
+        if digest([row['question'],row['answer']])!=row['content_hash']:raise DomainError(model_text('natural_history.7ff87cf3198a'),503)
     return rows
 
 
@@ -98,7 +100,7 @@ def context(session,invoke,permitted,prompt_snapshot=None):
         except plan_provider.Failure as error:
             info=error.usage or {}
             return limited_context(session,previous,prefix,[*usage,*info.get('summary_calls',[])],error.code,permitted)
-    raise DomainError('会话压缩未完成',422)
+    raise DomainError(model_text('natural_history.67f1bd8245e4'),422)
 
 
 def retry_batch(session,attempt,rows):
@@ -126,9 +128,9 @@ def summarize(session,previous,rows,invoke,permitted,prompt_snapshot=None):
         from . import chat_tasks
         if session.get('task_id'):chat_tasks.fence(cur,session['task_id'],session.get('owner_token'))
         cur.execute("SELECT id FROM ai_operation_conversations WHERE id=%s AND state='active' FOR UPDATE",(session['id'],))
-        if not cur.fetchone():raise DomainError('会话已归档，未开始压缩',409)
+        if not cur.fetchone():raise DomainError(model_text('natural_history.168acb3877ad'),409)
         current=latest(cur,session['id'])
-        if (current['id'] if current else None)!=previous_id:raise DomainError('摘要覆盖已变化，请重新读取会话',409)
+        if (current['id'] if current else None)!=previous_id:raise DomainError(model_text('natural_history.f0d426251ab7'),409)
         cur.execute("""SELECT id,status,usage_json,created_at,completed_at,covered_turn_id FROM ai_operation_chat_summaries
                        WHERE conversation_id=%s AND previous_id <=> %s ORDER BY id DESC LIMIT 1""",(session['id'],previous_id))
         old=cur.fetchone()
@@ -155,21 +157,21 @@ def summarize(session,previous,rows,invoke,permitted,prompt_snapshot=None):
     try:
         reply,usage=invoke(None,{'messages':messages,'summary':True});permitted()
         value=reply.get('content') if isinstance(reply,dict) else None
-        if not isinstance(value,str) or not value.strip() or reply.get('tool_calls'):raise plan_provider.Failure('invalid_output','摘要文本无效，旧摘要和原文保留',usage)
+        if not isinstance(value,str) or not value.strip() or reply.get('tool_calls'):raise plan_provider.Failure('invalid_output',model_text('natural_history.7d708768d11d'),usage)
         with plan_store.transaction(True) as cur:
             if session.get('task_id'):chat_tasks.fence(cur,session['task_id'],session.get('owner_token'))
             cur.execute("SELECT id FROM ai_operation_conversations WHERE id=%s AND state='active' FOR UPDATE",(session['id'],))
-            if not cur.fetchone():raise DomainError('会话已归档，摘要未应用',409)
+            if not cur.fetchone():raise DomainError(model_text('natural_history.e816a58b31c9'),409)
             current=latest(cur,session['id'])
-            if (current['id'] if current else None)!=(previous['id'] if previous else None):raise DomainError('摘要版本变化，未覆盖其他结果',409)
+            if (current['id'] if current else None)!=(previous['id'] if previous else None):raise DomainError(model_text('natural_history.646a5c3a817d'),409)
             cur.execute('SELECT id,content_hash FROM ai_operation_chat_turns WHERE conversation_id=%s AND id IN ('+','.join(['%s']*len(rows))+') ORDER BY id',tuple([session['id'],*[r['id'] for r in rows]]))
-            if [(r['id'],r['content_hash']) for r in cur.fetchall()]!=[(r['id'],r['content_hash']) for r in rows]:raise DomainError('摘要原文在生成期间变化，未应用旧源结果',409)
-            cur.execute("UPDATE ai_operation_chat_summaries SET status='ready',summary_text=%s,summary_hash=%s,usage_json=%s,message='历史问答压缩完成',completed_at=UTC_TIMESTAMP(3) WHERE id=%s AND status='registered'",(value,digest(value),dumps(usage),sid))
+            if [(r['id'],r['content_hash']) for r in cur.fetchall()]!=[(r['id'],r['content_hash']) for r in rows]:raise DomainError(model_text('natural_history.ef0257d03dee'),409)
+            cur.execute(model_text('natural_history.94c42b296dfd'),(value,digest(value),dumps(usage),sid))
         return {'summary_id':str(sid),**usage}
     except Exception as error:
         code=error.code if isinstance(error,plan_provider.Failure) else 'unknown'
         usage=(error.usage or usage) if isinstance(error,plan_provider.Failure) else usage
-        message=str(error) if isinstance(error,(DomainError,plan_provider.Failure)) else '摘要回执未知，保留旧摘要及原文，不自动重复收费'
+        message=str(error) if isinstance(error,(DomainError,plan_provider.Failure)) else model_text('natural_history.96e8ee2ad10e')
         with plan_store.transaction(True) as cur:
             cur.execute("UPDATE ai_operation_chat_summaries SET status=%s,usage_json=%s,message=%s,completed_at=UTC_TIMESTAMP(3) WHERE id=%s AND status='registered'",('unknown' if code=='unknown' else 'failed',dumps(usage),message[:500],sid))
         billable = (usage or {}).get('billable',True)
@@ -187,7 +189,7 @@ def describe(sid):
         last['id']=str(last['id']);raw=last.pop('usage_json');last['usage']=json.loads(raw) if raw else None
     return {'summary_id':str(row['id']) if row else None,'summary':row['summary_text'] if row else '',
             'covered_turn_id':str(row['covered_turn_id']) if row else None,'recent_turns':count,'last_attempt':last,
-            'note':'长期上下文只有原问题、最终回答及其摘要；工具过程和资料不进入下一次续聊。超限压缩可能额外计费。'}
+            'note':model_text('natural_history.598d6bf341c1')}
 
 
 def search(sid,query,offset,limit,max_bytes=96000):
@@ -201,5 +203,5 @@ def search(sid,query,offset,limit,max_bytes=96000):
     requested=len(rows);rows=fit(rows,max(0,max_bytes-1500))
     return {'rows':rows,'total':count,'returned':len(rows),'offset':offset,'has_more':offset+len(rows)<count,
             'byte_limited':len(rows)<requested,'next_offset':offset+len(rows) if rows and offset+len(rows)<count else None,
-            'reason':'单条完整问答超过当前预算，请在页面查看原文' if requested and not rows else None,
-            'note':'原问题与最终回答不是执行事实；单条超限时请在页面查看原文'}
+            'reason':model_text('natural_history.4ceb170c8c29') if requested and not rows else None,
+            'note':model_text('natural_history.2e57ed9461a7')}
